@@ -18,12 +18,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut flip_h = false;
     let mut flip_v = false;
     let mut no_crop = false;
+    let mut negative_stage = false;
 
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "--flip-h" => flip_h = true,
             "--flip-v" => flip_v = true,
             "--no-crop" => no_crop = true,
+            "--negative" => negative_stage = true,
             _ => positional.push(argument),
         }
     }
@@ -87,7 +89,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     trace_tail(&negative);
 
-    encode::encode(&positive, output)?;
+    encode::encode(
+        &if negative_stage {
+            // The negative itself is worth writing out, since a RAW file cannot be
+            // opened in the usual viewers: this is the scan as captured.
+            negative
+        } else {
+            positive
+        },
+        output,
+    )?;
     println!("wrote {output}");
     Ok(())
 }
