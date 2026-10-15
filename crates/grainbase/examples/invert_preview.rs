@@ -17,11 +17,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
     let mut flip_h = false;
     let mut flip_v = false;
+    let mut no_crop = false;
 
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "--flip-h" => flip_h = true,
             "--flip-v" => flip_v = true,
+            "--no-crop" => no_crop = true,
             _ => positional.push(argument),
         }
     }
@@ -41,6 +43,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut negative = scan.linear;
 
+    if flip_h {
+        negative = negative.flipped_horizontal();
+        println!("mirrored left to right");
+    }
+    if flip_v {
+        negative = negative.flipped_vertical();
+        println!("mirrored top to bottom");
+    }
+
+    // Orientation first, then the frame: the frame is a property of the film, and
+    // rotating the scan does not move it relative to the picture.
     if let Some(frame) = geometry::find(&negative) {
         println!(
             "frame: centre {:.0},{:.0}  size {:.0}x{:.0}  skew {:.4} rad ({:.2} deg)",
@@ -51,17 +64,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             frame.skew,
             frame.skew.to_degrees()
         );
+        if !no_crop {
+            negative = geometry::apply(&negative, &frame);
+            println!("cropped to {}x{}", negative.width, negative.height);
+        }
     }
-    trace_min_channel(&negative);
 
-    if flip_h {
-        negative = negative.flipped_horizontal();
-        println!("mirrored left to right");
-    }
-    if flip_v {
-        negative = negative.flipped_vertical();
-        println!("mirrored top to bottom");
-    }
+    trace_min_channel(&negative);
 
     let base = FilmBase::detect(&negative, film_base::DEFAULT_PERCENTILE);
     println!(
