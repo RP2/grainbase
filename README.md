@@ -4,8 +4,8 @@ A headless command-line tool that converts camera-scanned film negatives (color 
 
 Status: **pre-alpha.** No implementation yet.
 
-[![ci](https://github.com/RP2/grainbase/actions/workflows/ci.yml/badge.svg)](https://github.com/RP2/grainbase/actions/workflows/ci.yml)
-[![codeql](https://github.com/RP2/grainbase/actions/workflows/codeql.yml/badge.svg)](https://github.com/RP2/grainbase/actions/workflows/codeql.yml)
+[![ci](https://github.com/RP2/grainbase/actions/workflows/ci.yml/badge.svg?branch=main&event=push)](https://github.com/RP2/grainbase/actions/workflows/ci.yml?query=branch%3Amain+event%3Apush)
+[![codeql](https://github.com/RP2/grainbase/actions/workflows/codeql.yml/badge.svg?branch=main&event=push)](https://github.com/RP2/grainbase/actions/workflows/codeql.yml?query=branch%3Amain+event%3Apush)
 
 ## License
 

@@ -130,15 +130,43 @@ pub fn decode(path: impl AsRef<Path>) -> Result<Scan, Error> {
         model: raw.model.clone(),
     };
 
+    let orientation = raw.orientation;
+
     let intermediate = catch_unwind(AssertUnwindSafe(|| {
         RawDevelop::new_with(DEVELOP_STEPS).develop_intermediate(&raw)
     }))
     .map_err(|_| Error::Panicked)?
     .map_err(|err| Error::Failed(err.to_string()))?;
 
-    let linear = to_linear(intermediate, &meta)?;
+    let linear = orient(to_linear(intermediate, &meta)?, orientation);
 
     Ok(Scan { linear, meta })
+}
+
+/// Applies the orientation recorded in the file.
+///
+/// A camera on a copy stand is commonly held inverted or rotated relative to the
+/// film, and the capture records that in its orientation tag. Ignoring the tag is
+/// why a scan can arrive upside down or mirrored. `rawler` parses it; applying it
+/// is the caller's job.
+///
+/// The EXIF values that swap the axes are expressed here as a transpose followed
+/// by the flips, which is the order the tests pin down. `rawler`'s `to_flips`
+/// helper is not used anywhere else in that crate, so it does not define an order
+/// of its own.
+fn orient(image: LinearImage, orientation: rawler::decoders::Orientation) -> LinearImage {
+    let (transpose, flip_horizontal, flip_vertical) = orientation.to_flips();
+    let mut oriented = image;
+    if transpose {
+        oriented = oriented.transposed();
+    }
+    if flip_horizontal {
+        oriented = oriented.flipped_horizontal();
+    }
+    if flip_vertical {
+        oriented = oriented.flipped_vertical();
+    }
+    oriented
 }
 
 /// Converts rawler's develop output into the engine's image type.
@@ -213,5 +241,71 @@ mod tests {
     fn a_directory_is_an_error_not_a_panic() {
         let result = decode(std::env::temp_dir());
         assert!(result.is_err(), "expected an error for a directory");
+    }
+
+    /// A 3x2 image whose red channel is `1..=6`, for checking orientation.
+    fn numbered() -> LinearImage {
+        let data = (1..=6u16).flat_map(|v| [f32::from(v), 0.0, 0.0]).collect();
+        LinearImage::new(3, 2, data).expect("well-formed")
+    }
+
+    fn reds(image: &LinearImage) -> Vec<f32> {
+        image.data.as_chunks::<3>().0.iter().map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn every_exif_orientation_is_handled() {
+        use rawler::decoders::Orientation;
+
+        // Pinned so the transform order cannot drift. Each case is the
+        // composition of rawler's flags: transpose, then flips.
+        let cases = [
+            (Orientation::Normal, (3, 2), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            (
+                Orientation::HorizontalFlip,
+                (3, 2),
+                [3.0, 2.0, 1.0, 6.0, 5.0, 4.0],
+            ),
+            (
+                Orientation::Rotate180,
+                (3, 2),
+                [6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+            ),
+            (
+                Orientation::VerticalFlip,
+                (3, 2),
+                [4.0, 5.0, 6.0, 1.0, 2.0, 3.0],
+            ),
+        ];
+
+        for (orientation, (width, height), expected) in cases {
+            let oriented = orient(numbered(), orientation);
+            assert_eq!(
+                (oriented.width, oriented.height),
+                (width, height),
+                "{orientation:?} changed the dimensions"
+            );
+            assert_eq!(reds(&oriented).as_slice(), expected, "{orientation:?}");
+        }
+    }
+
+    #[test]
+    fn orientations_that_swap_the_axes_do_swap_them() {
+        use rawler::decoders::Orientation;
+
+        for orientation in [
+            Orientation::Rotate90,
+            Orientation::Rotate270,
+            Orientation::Transpose,
+            Orientation::Transverse,
+        ] {
+            let oriented = orient(numbered(), orientation);
+            assert_eq!(
+                (oriented.width, oriented.height),
+                (2, 3),
+                "{orientation:?} should swap the axes"
+            );
+            assert_eq!(oriented.data.len(), 18, "{orientation:?}");
+        }
     }
 }

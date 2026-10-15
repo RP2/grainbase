@@ -8,6 +8,7 @@
 
 pub mod decode;
 pub mod image;
+pub mod pipeline;
 
 pub use decode::decode;
 pub use decode::{Scan, ScanMeta};

@@ -70,6 +70,96 @@ impl LinearImage {
             data,
         })
     }
+
+    /// Derives a new image by transforming each pixel.
+    ///
+    /// Dimensions and the sample-count invariant are preserved by construction,
+    /// so deriving beats building a [`LinearImage`] field-by-field. Pixel order
+    /// is row-major, left to right, top to bottom.
+    #[must_use]
+    pub fn map_rgb(&self, mut f: impl FnMut([f32; 3]) -> [f32; 3]) -> Self {
+        let (pixels, _remainder) = self.data.as_chunks::<3>();
+        let mut data = Vec::with_capacity(self.data.len());
+        for pixel in pixels {
+            data.extend_from_slice(&f(*pixel));
+        }
+        Self {
+            width: self.width,
+            height: self.height,
+            data,
+        }
+    }
+
+    /// Mirrors left to right.
+    ///
+    /// This is the correction for a scan made through the *reverse* face of the
+    /// film: the copy is a mirror image of what the film actually shows.
+    #[must_use]
+    pub fn flipped_horizontal(&self) -> Self {
+        if self.width == 0 || self.height == 0 {
+            return self.clone();
+        }
+        let width = self.width as usize;
+        let mut data = Vec::with_capacity(self.data.len());
+        for row in self.data.as_chunks::<3>().0.chunks_exact(width) {
+            for pixel in row.iter().rev() {
+                data.extend_from_slice(pixel);
+            }
+        }
+        Self {
+            width: self.width,
+            height: self.height,
+            data,
+        }
+    }
+
+    /// Mirrors top to bottom.
+    #[must_use]
+    pub fn flipped_vertical(&self) -> Self {
+        if self.width == 0 || self.height == 0 {
+            return self.clone();
+        }
+        let row_samples = self.width as usize * 3;
+        let mut data = Vec::with_capacity(self.data.len());
+        for row in self.data.chunks_exact(row_samples).rev() {
+            data.extend_from_slice(row);
+        }
+        Self {
+            width: self.width,
+            height: self.height,
+            data,
+        }
+    }
+
+    /// Rotates the image a half turn.
+    ///
+    /// Equivalent to mirroring both axes; dimensions are unchanged.
+    #[must_use]
+    pub fn rotated_180(&self) -> Self {
+        self.flipped_horizontal().flipped_vertical()
+    }
+
+    /// Reflects the image across its main diagonal, swapping width and height.
+    ///
+    /// Half of the EXIF orientation values are only expressible as a transpose
+    /// combined with a flip.
+    #[must_use]
+    pub fn transposed(&self) -> Self {
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let (pixels, _remainder) = self.data.as_chunks::<3>();
+        let mut data = Vec::with_capacity(self.data.len());
+        for column in 0..width {
+            for row in 0..height {
+                data.extend_from_slice(&pixels[row * width + column]);
+            }
+        }
+        Self {
+            width: self.height,
+            height: self.width,
+            data,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -93,5 +183,94 @@ mod tests {
         let err = LinearImage::new(2, 3, vec![0.0; 5]).unwrap_err();
         assert_eq!(err.expected, 18);
         assert_eq!(err.samples, 5);
+    }
+
+    /// A 3x2 image whose red channel is `1..=6`, for checking index arithmetic.
+    fn numbered() -> LinearImage {
+        let data = (1..=6u16)
+            .flat_map(|value| [f32::from(value), 0.0, 0.0])
+            .collect();
+        LinearImage::new(3, 2, data).expect("well-formed")
+    }
+
+    fn reds(image: &LinearImage) -> Vec<f32> {
+        image.data.as_chunks::<3>().0.iter().map(|p| p[0]).collect()
+    }
+
+    #[test]
+    fn horizontal_flip_reverses_each_row_only() {
+        // rows are [1 2 3] and [4 5 6]
+        assert_eq!(
+            reds(&numbered().flipped_horizontal()),
+            [3.0, 2.0, 1.0, 6.0, 5.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn vertical_flip_reverses_the_row_order_only() {
+        assert_eq!(
+            reds(&numbered().flipped_vertical()),
+            [4.0, 5.0, 6.0, 1.0, 2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn a_half_turn_reverses_everything() {
+        assert_eq!(
+            reds(&numbered().rotated_180()),
+            [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn flipping_twice_is_the_identity() {
+        let image = numbered();
+        assert_eq!(
+            reds(&image.flipped_horizontal().flipped_horizontal()),
+            reds(&image)
+        );
+        assert_eq!(
+            reds(&image.flipped_vertical().flipped_vertical()),
+            reds(&image)
+        );
+        assert_eq!(reds(&image.rotated_180().rotated_180()), reds(&image));
+    }
+
+    #[test]
+    fn flip_preserves_dimensions_and_the_invariant() {
+        for flipped in [
+            numbered().flipped_horizontal(),
+            numbered().flipped_vertical(),
+            numbered().rotated_180(),
+        ] {
+            assert_eq!((flipped.width, flipped.height), (3, 2));
+            assert_eq!(flipped.data.len(), 18);
+        }
+    }
+
+    #[test]
+    fn transpose_swaps_the_axes() {
+        // 1 2 3        1 4
+        // 4 5 6   ->   2 5
+        //              3 6
+        let transposed = numbered().transposed();
+        assert_eq!((transposed.width, transposed.height), (2, 3));
+        assert_eq!(reds(&transposed), [1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn transposing_twice_is_the_identity() {
+        let image = numbered();
+        let twice = image.transposed().transposed();
+        assert_eq!((twice.width, twice.height), (3, 2));
+        assert_eq!(reds(&twice), reds(&image));
+    }
+
+    #[test]
+    fn a_zero_width_image_can_be_flipped() {
+        // chunks_exact(0) panics, so the degenerate case needs an explicit guard.
+        let empty = LinearImage::new(0, 4, Vec::new()).expect("well-formed");
+        assert_eq!(empty.flipped_horizontal().width, 0);
+        assert_eq!(empty.flipped_vertical().height, 4);
     }
 }
