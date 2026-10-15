@@ -9,7 +9,13 @@ members = [
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.99"
+# The OLDEST toolchain we support, not the newest. Lowering this is a
+# compatibility promise; raising it is a breaking change for users on older
+# Rust. The binding constraint is rawler, which declares 1.89 (edition 2024
+# itself needs 1.85). Declaring today's stable here would make any runner one
+# release behind fail outright, which is not a support policy.
+# CI verifies this floor with `cargo hack check --rust-version`.
+rust-version = "1.89"
 license = "AGPL-3.0-or-later"
 
 # Workspace-wide lints. Each crate must opt in with [lints] workspace = true

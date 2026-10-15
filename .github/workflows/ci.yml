@@ -77,9 +77,11 @@ jobs:
       - run: cargo doc --workspace --no-deps --all-features
 
   # --- 5. MSRV ----------------------------------------------------------------
-  # `cargo hack check --rust-version` validates that every target in the
-  # workspace compiles against the MSRV declared in `rust-toolchain.toml`
-  # (the `rust-version` field set on the workspace packages).
+  # `cargo hack check --rust-version` validates that every target compiles
+  # against the `rust-version` floor declared in the workspace `Cargo.toml`
+  # (`[workspace.package]`). That field is the OLDEST supported toolchain, not
+  # the newest: `rust-toolchain.toml` pins what we DEVELOP on, Cargo.toml
+  # declares what we SUPPORT.
   msrv:
     name: msrv
     runs-on: ubuntu-latest

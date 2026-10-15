@@ -44,19 +44,21 @@ unused-allowed-license = "warn"
 [licenses.private]
 ignore = true
 
-# Scoped exception for the LGPL-2.1 dependency planned for the next unit:
-# `rawler` (ADR 0001). Deliberately commented out until it is actually in the
-# dependency graph — an exception for an absent crate cannot be verified, and
-# cargo-deny flags it as `license-exception-not-encountered`.
+# Scoped exception for the LGPL-2.1 dependency `rawler` (ADR 0001).
 #
-# TODO(U1): when adding rawler, uncomment this and set the SPDX id to exactly
-# what rawler declares. cargo-deny matches GNU identifiers pedantically, so
-# `LGPL-2.1-only` and `LGPL-2.1-or-later` are different licenses and the bare
-# `LGPL-2.1` form is deprecated. Check rawler's Cargo.toml before enabling.
+# rawler 0.8.0 declares the DEPRECATED bare identifier `license = "LGPL-2.1"`
+# in its Cargo.toml, not `LGPL-2.1-only`. cargo-deny matches GNU identifiers
+# pedantically, so the string below must be the exact one rawler uses — using
+# `LGPL-2.1-only` here does NOT match. Verified against rawler 0.8.0.
 #
-# [[licenses.exceptions]]
-# crate = "rawler"
-# allow = ["LGPL-2.1-only"]
+# Semantically `LGPL-2.1` means "2.1 only". LGPL-2.1 permits linking into an
+# AGPL-3.0 work provided the combined terms allow the user to modify the work
+# and reverse-engineer for debugging; AGPL does. The practical relink route in
+# Rust is shipping full source, which this project already does. Re-check on
+# every rawler bump: the string may change to a non-deprecated form.
+[[licenses.exceptions]]
+crate = "rawler"
+allow = ["LGPL-2.1"]
 
 # ---------------------------------------------------------------------------
 # [bans] — duplicate and wildcard version control.
