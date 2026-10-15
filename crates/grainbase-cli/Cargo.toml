@@ -9,6 +9,10 @@ rust-version.workspace = true
 [[bin]]
 name = "grainbase"
 path = "src/main.rs"
+# No rustdoc for the binary. Its name matches the engine library's crate name,
+# which makes cargo emit an "output filename collision" warning for the doc
+# build (rust-lang/cargo#6313). This is a thin adapter; its docs add nothing.
+doc = false
 
 [lints]
 workspace = true

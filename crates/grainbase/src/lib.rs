@@ -1,5 +1,14 @@
-//! Engine for converting camera-scanned film negatives into positives.
+//! The grainbase engine.
 //!
-//! This library is the core of grainbase: it owns all the image-processing
-//! behaviour and makes no assumptions about any front-end. The `grainbase-cli`
-//! binary is a thin adapter over it.
+//! Converts camera-scanned film negatives into finished positives.
+//!
+//! The engine performs no I/O beyond reading the scan it is handed, and carries
+//! no front-end assumptions: the CLI is a thin adapter over this library, and
+//! tests cross the same seams its callers do.
+
+pub mod decode;
+pub mod image;
+
+pub use decode::decode;
+pub use decode::{Scan, ScanMeta};
+pub use image::LinearImage;
