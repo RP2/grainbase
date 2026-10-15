@@ -19,6 +19,54 @@ use crate::pipeline::{IDENTITY, Settings};
 /// Format version, so an old profile can be rejected rather than misread.
 pub const VERSION: u32 = 1;
 
+/// How a profile's numbers were arrived at.
+///
+/// Mandatory provenance (ADR 0006). A hand-tuned profile is not wrong, but it
+/// must say so: a consumer is entitled to weigh a number against how it was
+/// produced, and a library of unlabelled numbers is worse than no library.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Method {
+    /// Built-in neutral defaults. Nothing was fitted.
+    #[default]
+    Neutral,
+    /// Fitted from paired scans on a known rig.
+    Fitted,
+    /// Derived from published spectral data rather than measured.
+    Derived,
+    /// Adjusted by hand until it looked right.
+    Tuned,
+}
+
+impl fmt::Display for Method {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Neutral => "neutral",
+            Self::Fitted => "fitted",
+            Self::Derived => "derived",
+            Self::Tuned => "tuned",
+        })
+    }
+}
+
+impl Method {
+    /// Parses a method keyword, rejecting unknown spellings.
+    fn parse(line: usize, key: &str, value: &str) -> Result<Self, ParseError> {
+        match value {
+            "neutral" => Ok(Self::Neutral),
+            "fitted" => Ok(Self::Fitted),
+            "derived" => Ok(Self::Derived),
+            "tuned" => Ok(Self::Tuned),
+            other => Err(ParseError::BadValue {
+                line,
+                key: key.to_owned(),
+                reason: format!(
+                    "`{other}` is not a method (expected neutral, fitted, derived or tuned)"
+                ),
+            }),
+        }
+    }
+}
+
 /// A fitted calibration profile.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Profile {
@@ -28,6 +76,11 @@ pub struct Profile {
     /// whole scanning setup, not the film, so the same stock can need different
     /// values on a different rig.
     pub camera: String,
+    /// How these numbers were arrived at.
+    pub method: Method,
+    /// Frames the fit used. A fit from three frames and one from sixty are not
+    /// equally trustworthy, and should not look identical.
+    pub frames: u32,
     /// The fitted conversion settings.
     pub settings: Settings,
 }
@@ -108,6 +161,8 @@ impl fmt::Display for Profile {
         writeln!(f, "version = {VERSION}")?;
         writeln!(f, "film = {}", quote(&self.film))?;
         writeln!(f, "camera = {}", quote(&self.camera))?;
+        writeln!(f, "method = {}", self.method)?;
+        writeln!(f, "frames = {}", self.frames)?;
         writeln!(f, "density_max = {:.6} {:.6} {:.6}", max[0], max[1], max[2])?;
         writeln!(f, "# Rows are output channels, columns are dye densities.")?;
         writeln!(
@@ -139,6 +194,8 @@ impl Profile {
         let mut version = None;
         let mut film = None;
         let mut camera = None;
+        let mut method = None;
+        let mut frames = None;
         let mut density_max = None;
         let mut crosstalk = None;
 
@@ -161,6 +218,8 @@ impl Profile {
                 "version" => version = Some(parse_u32(line, key, value)?),
                 "film" => film = Some(unquote(line, key, value)?),
                 "camera" => camera = Some(unquote(line, key, value)?),
+                "method" => method = Some(Method::parse(line, key, value)?),
+                "frames" => frames = Some(parse_u32(line, key, value)?),
                 "density_max" => density_max = Some(parse_floats::<3>(line, key, value)?),
                 "crosstalk" => {
                     let flat = parse_floats::<9>(line, key, value)?;
@@ -187,6 +246,8 @@ impl Profile {
         Ok(Self {
             film: film.ok_or(ParseError::MissingKey { key: "film" })?,
             camera: camera.ok_or(ParseError::MissingKey { key: "camera" })?,
+            method: method.ok_or(ParseError::MissingKey { key: "method" })?,
+            frames: frames.ok_or(ParseError::MissingKey { key: "frames" })?,
             settings: Settings {
                 density_max: density_max.ok_or(ParseError::MissingKey { key: "density_max" })?,
                 crosstalk: crosstalk.ok_or(ParseError::MissingKey { key: "crosstalk" })?,
@@ -282,6 +343,8 @@ mod tests {
         Profile {
             film: "Portra 400".to_owned(),
             camera: "Sony ILCE-6000".to_owned(),
+            method: Method::Fitted,
+            frames: 12,
             settings: Settings {
                 density_max: [1.85, 1.92, 1.74],
                 crosstalk: [[1.0, 0.05, 0.02], [0.03, 1.0, 0.04], [0.01, 0.02, 1.0]],
@@ -312,6 +375,7 @@ mod tests {
     #[test]
     fn comments_and_blank_lines_are_ignored() {
         let text = "# a comment\n\nversion = 1\n\n# another\nfilm = \"x\"\ncamera = \"y\"\n\
+                    method = fitted\nframes = 3\n\
                     density_max = 1 2 3\ncrosstalk = 1 0 0 0 1 0 0 0 1\n";
         assert!(Profile::parse(text).is_ok());
     }
@@ -343,11 +407,59 @@ mod tests {
 
     #[test]
     fn a_missing_required_key_is_reported() {
-        let text = "version = 1\nfilm = \"x\"\ncamera = \"y\"\ndensity_max = 1 2 3\n";
+        let text = "version = 1\nfilm = \"x\"\ncamera = \"y\"\nmethod = fitted\nframes = 3\n\
+                    density_max = 1 2 3\n";
         assert_eq!(
             Profile::parse(text),
             Err(ParseError::MissingKey { key: "crosstalk" })
         );
+    }
+
+    #[test]
+    fn provenance_is_required_and_not_defaulted() {
+        // ADR 0006: a profile must say how its numbers were produced. Silently
+        // assuming a method would let a guess pass as a measurement.
+        for (omit, key) in [("method", "method"), ("frames", "frames")] {
+            let mut lines = vec![
+                "version = 1".to_owned(),
+                "film = \"x\"".to_owned(),
+                "camera = \"y\"".to_owned(),
+                "method = fitted".to_owned(),
+                "frames = 3".to_owned(),
+                "density_max = 1 2 3".to_owned(),
+                "crosstalk = 1 0 0 0 1 0 0 0 1".to_owned(),
+            ];
+            lines.retain(|line| !line.starts_with(omit));
+
+            assert_eq!(
+                Profile::parse(&lines.join("\n")),
+                Err(ParseError::MissingKey { key }),
+                "omitting {omit} should be reported, not defaulted"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_method_is_rejected() {
+        let text = "version = 1\nfilm = \"x\"\ncamera = \"y\"\nmethod = vibes\nframes = 3\n\
+                    density_max = 1 2 3\ncrosstalk = 1 0 0 0 1 0 0 0 1\n";
+        assert!(matches!(
+            Profile::parse(text),
+            Err(ParseError::BadValue { line: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn the_built_in_default_declares_itself_unfitted() {
+        assert_eq!(Profile::default().method, Method::Neutral);
+        assert_eq!(Profile::default().frames, 0);
+    }
+
+    #[test]
+    fn provenance_survives_a_round_trip() {
+        let parsed = Profile::parse(&sample().to_string()).expect("should parse");
+        assert_eq!(parsed.method, Method::Fitted);
+        assert_eq!(parsed.frames, 12);
     }
 
     #[test]
