@@ -21,13 +21,6 @@
 use crate::image::LinearImage;
 use crate::pipeline::{FilmBase, film_base};
 
-/// Samples at or above this are bare light through a hole, not film at all.
-///
-/// Excluded before the threshold is chosen, or the holes dominate the split and
-/// the result separates "film" from "holes" instead of "picture" from "clear
-/// film".
-const HOLE_LEVEL: f32 = 0.30;
-
 /// A row needs at least this share of picture pixels to count toward the extent,
 /// which skips the ragged corners where two edges meet.
 const MIN_COVERAGE: f32 = 0.25;
@@ -39,9 +32,6 @@ const EDGE_MARGIN_DENOMINATOR: usize = 20; // 5%
 /// Largest tilt treated as genuine. Beyond this it is not a crooked scan, it is a
 /// frame found wrongly, and rotating by it would wreck the picture.
 const MAX_SKEW: f32 = 0.20; // radians, about 11 degrees
-
-/// Bins used to build the histogram the threshold is chosen from.
-const BINS: usize = 256;
 
 /// A pixel coordinate as a float.
 ///
@@ -614,7 +604,7 @@ mod tests {
 
         let threshold = picture_threshold(&image).expect("two populations");
         assert!(
-            threshold < HOLE_LEVEL,
+            threshold < CLEAR_FILM * 0.9,
             "the holes should be excluded from the split, got threshold {threshold}"
         );
 
