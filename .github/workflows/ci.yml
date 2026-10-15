@@ -1,6 +1,10 @@
 name: ci
 
 # Triggers: every push to main, every pull request (any branch).
+#
+# Add `[skip ci]` to a commit message to skip this on that push: GitHub honours
+# it for push and pull_request events. Useful for work-in-progress pushes where
+# you already ran the checks locally.
 on:
   push:
     branches: [main]
@@ -10,52 +14,41 @@ on:
 # then opt jobs back in only when they need to write (none of these do).
 permissions: {}
 
-# Cancel superseded runs on the same ref. For pull requests github.head_ref
-# is set; for ad-hoc builds fall back to the run id, which is already unique.
+# Cancel superseded runs on the same ref, so pushing twice in a row does not
+# leave the first run burning a runner to no purpose.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
-# Jobs run in declared order. Each job is independent so failures surface
-# earliest rather than after a long fan-out.
 jobs:
-  # --- 1. Formatting -----------------------------------------------------------
-  fmt:
-    name: fmt
+  # --- Static checks -----------------------------------------------------------
+  # One job, not four. fmt, clippy and doc share a checkout, a toolchain and a
+  # warm cache, and none of them is slow enough to be worth a separate runner.
+  # `--keep-going` style separation buys clearer signals at 4x the setup cost,
+  # which is the wrong trade while this is pre-alpha.
+  check:
+    name: check
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      RUSTDOCFLAGS: -D warnings
+      # Promotes any rustc warning to an error. The clippy line deliberately
+      # does NOT use `-- -D warnings`, which would invalidate the build cache.
+      CARGO_BUILD_WARNINGS: deny
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - run: cargo fmt --all -- --check
-
-  # --- 2. Clippy ---------------------------------------------------------------
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-        with:
-          # The action's `build-warnings: deny` default promotes any rustc
-          # warning to a build error. Crucially we do NOT add `-- -D warnings`
-          # on the clippy line — `-D warnings` invalidates Cargo's build cache.
-          components: clippy
       - run: cargo clippy --workspace --all-targets --all-features
+      - run: cargo doc --workspace --no-deps --all-features
 
-  # --- 3. Tests ---------------------------------------------------------------
+  # --- Tests -------------------------------------------------------------------
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: test
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
@@ -63,25 +56,10 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
       - run: cargo test --workspace --locked
 
-  # --- 4. Docs ----------------------------------------------------------------
-  docs:
-    name: doc
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    env:
-      RUSTDOCFLAGS: -D warnings
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-      - run: cargo doc --workspace --no-deps --all-features
-
-  # --- 5. MSRV ----------------------------------------------------------------
-  # `cargo hack check --rust-version` validates that every target compiles
-  # against the `rust-version` floor declared in the workspace `Cargo.toml`
-  # (`[workspace.package]`). That field is the OLDEST supported toolchain, not
-  # the newest: `rust-toolchain.toml` pins what we DEVELOP on, Cargo.toml
-  # declares what we SUPPORT.
+  # --- MSRV --------------------------------------------------------------------
+  # Separate because it needs a different toolchain: `rust-toolchain.toml` pins
+  # what we DEVELOP on, while `rust-version` in Cargo.toml declares the oldest
+  # toolchain we SUPPORT.
   msrv:
     name: msrv
     runs-on: ubuntu-latest
@@ -90,8 +68,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
         with:
           tool: cargo-hack
       - run: cargo hack check --rust-version --workspace --all-targets --ignore-private

@@ -1,0 +1,32 @@
+name: platforms
+
+# Cross-platform tests, deliberately NOT on every push.
+#
+# macOS runners are slow and this project has no release yet, so paying that
+# cost on every push buys little. Running them weekly and on demand still
+# catches path handling and case-sensitivity bugs before a release does.
+#
+# Move `test` back into ci.yml when there is something to ship, so release
+# builds are gated on every platform.
+on:
+  schedule:
+    # Mondays 05:00 UTC.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - run: cargo test --workspace --locked

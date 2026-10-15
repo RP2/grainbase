@@ -1,14 +1,13 @@
 name: codeql
 
-# Push to main, every PR, and a weekly refresh so newly disclosed queries
-# and updated packs are applied without an explicit code change.
+# Push to main and a weekly refresh, but NOT on every pull request: CodeQL is by
+# far the slowest thing here, and it hunts for the kind of latent bug that tends
+# to survive a round of review anyway. Weekly plus every merge is enough.
 on:
   push:
     branches: [main]
-  pull_request:
   schedule:
-    # Mondays 14:20 UTC — staggered away from the cargo-deny weekly run
-    # to avoid hammering the actions minutes budget.
+    # Mondays 14:20 UTC — staggered away from the other scheduled runs.
     - cron: "20 14 * * 1"
 
 permissions: {}

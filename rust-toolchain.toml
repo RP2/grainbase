@@ -1,3 +1,13 @@
 [toolchain]
-channel = "stable"
+# Pinned to an exact patch, deliberately.
+#
+# With clippy's pedantic group enabled and warnings denied, a new Rust release
+# can turn CI red without a single line of code changing: new lints land every
+# six weeks. Pinning makes the build reproducible and turns upgrades into a
+# deliberate act rather than a surprise. Dependabot watches this file, so bumps
+# still arrive as reviewable PRs.
+#
+# This is the DEVELOPMENT toolchain. The SUPPORTED floor is `rust-version` in
+# Cargo.toml, which CI verifies separately by building the workspace on it.
+channel = "1.99.0"
 components = ["rustfmt", "clippy"]
