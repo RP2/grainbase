@@ -168,7 +168,7 @@ pub fn run(job: &Job) -> Report {
     // Deterministic order, so the sampling below is reproducible.
     inputs.sort();
 
-    let base = roll_base(&inputs, job.crop);
+    let base = roll_base(&inputs);
 
     let outcomes = inputs
         .par_iter()
@@ -216,7 +216,19 @@ fn cropped(image: LinearImage, crop: bool) -> LinearImage {
     }
 }
 
-/// Decodes one frame, crops it, inverts it, and writes the positive.
+/// Decodes one frame, measures its base, crops it, inverts it, and writes the
+/// positive.
+///
+/// The base is measured **before** the crop, which is the opposite of what the
+/// ordering intuition suggests and was learned the hard way. Cropping keeps the
+/// picture and discards the rebate — and the rebate *is* the clear film the base
+/// is measured from. Measure it after cropping and there is no clear film left, so
+/// the detector falls back to a percentile of the picture itself and the colour
+/// goes wrong.
+///
+/// The crop still precedes inversion, which is what the ordering was about: a
+/// picture-versus-picture measurement is fine, whereas the *hole* handling that
+/// the base needs is a property of the whole sensor area.
 ///
 /// When `base` is `None` the frame measures its own, which is what a single frame
 /// run does.
@@ -232,17 +244,19 @@ pub fn convert_frame(
     crop: bool,
 ) -> Result<(), Error> {
     let scan = decode::decode(input)?;
-    let linear = cropped(scan.linear, crop);
+    let uncropped = scan.linear;
 
-    // Measured only when the caller has no roll-level base to supply.
+    // Measured only when the caller has no roll-level base to supply, and always
+    // on the uncropped frame.
     let measured;
     let base = if let Some(base) = base {
         base
     } else {
-        measured = FilmBase::detect(&linear, film_base::DEFAULT_PERCENTILE);
+        measured = FilmBase::detect(&uncropped, film_base::DEFAULT_PERCENTILE);
         &measured
     };
 
+    let linear = cropped(uncropped, crop);
     let positive = pipeline::invert(&linear, base, settings);
 
     if let Some(parent) = output.parent() {
@@ -258,7 +272,7 @@ pub fn convert_frame(
 /// taken, so one odd frame — a blank, a very dense night shot — cannot set the
 /// base for the whole roll. Returns `None` when nothing could be sampled, and
 /// callers then fall back to measuring per frame.
-fn roll_base(inputs: &[PathBuf], crop: bool) -> Option<FilmBase> {
+fn roll_base(inputs: &[PathBuf]) -> Option<FilmBase> {
     if inputs.len() <= 1 {
         // Nothing to pool, and one frame is its own best estimate.
         return None;
@@ -271,8 +285,12 @@ fn roll_base(inputs: &[PathBuf], crop: bool) -> Option<FilmBase> {
         .take(BASE_SAMPLE)
         .filter_map(|input| {
             let scan = decode::decode(input).ok()?;
-            let linear = cropped(scan.linear, crop);
-            Some(FilmBase::detect(&linear, film_base::DEFAULT_PERCENTILE))
+            // Never cropped here either: the rebate the crop discards is the clear
+            // film the base is measured from.
+            Some(FilmBase::detect(
+                &scan.linear,
+                film_base::DEFAULT_PERCENTILE,
+            ))
         })
         .collect();
 
