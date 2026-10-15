@@ -112,6 +112,16 @@ const MAX_DENSITY: f32 = 10.0;
 
 /// Optical density of one sample relative to the film base.
 fn density_of(value: f32, base: f32) -> f32 {
+    // `decode` rejects non-finite samples, so anything else arriving here is a bug
+    // in the caller rather than bad data. This is worth stating because the
+    // arithmetic below is only accidentally safe against NaN: `f32::min` returns
+    // the non-NaN operand, so a NaN would come out of here as MAX_DENSITY, which
+    // renders as a white pixel with nothing reporting a problem.
+    debug_assert!(
+        value.is_finite() && base.is_finite(),
+        "decode guarantees finite samples"
+    );
+
     // Guarded rather than trusted: a zero base would make the whole frame NaN,
     // and one bad frame must not poison a batch.
     let base = base.max(f32::MIN_POSITIVE);

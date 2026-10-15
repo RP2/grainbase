@@ -217,13 +217,45 @@ fn exif_orientation(path: &Path) -> Option<u16> {
     u16::try_from(value).ok().filter(|v| (1..=8).contains(v))
 }
 
+/// Rejects a decoded image that contains non-finite samples.
+///
+/// `rawler` is permeable to NaN, and not only by accident: several of its decoders
+/// emit `NAN` as a sentinel for an unknown white balance, the guard that catches
+/// that tests **only channel 0**, its matrix pseudo-inverse has no singular check,
+/// and its black-level division does not check that white exceeds black. The
+/// three-argument `clip` in `imgop` that does handle NaN has no call sites.
+///
+/// When it happens it is a whole-frame condition rather than a speckle — a bad
+/// white-balance coefficient multiplies every pixel — so there is nothing sensible
+/// to patch. Patching would also mean inventing values, and a frame we cannot
+/// vouch for is better refused than guessed at. Contrast the cropped-frame rule:
+/// no output beats wrong output.
+///
+/// # Errors
+///
+/// Returns [`Error::Failed`] naming the count, so a report says why rather than
+/// leaving a blank frame to be puzzled over.
+fn ensure_finite(samples: &[f32]) -> Result<(), Error> {
+    let bad = samples.iter().filter(|sample| !sample.is_finite()).count();
+    if bad == 0 {
+        return Ok(());
+    }
+    Err(Error::Failed(format!(
+        "decoder produced {bad} non-finite samples of {}; the frame is not usable \
+         (rawler's white balance, colour matrix, or black level)",
+        samples.len()
+    )))
+}
+
 /// Converts rawler's develop output into the engine's image type.
 fn to_linear(intermediate: Intermediate, meta: &ScanMeta) -> Result<LinearImage, Error> {
     match intermediate {
         Intermediate::ThreeColor(image) => {
             let width = dimension(image.width, "width")?;
             let height = dimension(image.height, "height")?;
-            LinearImage::new(width, height, image.into_flatten()).map_err(Error::Malformed)
+            let samples = image.into_flatten();
+            ensure_finite(&samples)?;
+            LinearImage::new(width, height, samples).map_err(Error::Malformed)
         }
         // Reached only for a monochrome sensor, or a four-color CFA. Neither is
         // a color-negative scan; say so rather than guessing at a conversion.
@@ -421,5 +453,35 @@ mod tests {
         let path = temp_file("garbage-orientation.tif", b"not a tiff at all");
         assert_eq!(exif_orientation(&path), None);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn finite_samples_are_accepted() {
+        assert!(ensure_finite(&[0.0, 0.5, 1.0, -2.0]).is_ok());
+        assert!(ensure_finite(&[]).is_ok());
+    }
+
+    #[test]
+    fn non_finite_samples_are_rejected() {
+        // A whole-frame condition in practice: a single bad white-balance
+        // coefficient multiplies every pixel. There is nothing sensible to patch.
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(
+                ensure_finite(&[0.5, bad, 0.5]).is_err(),
+                "{bad} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_count_of_bad_samples_is_named_in_the_error() {
+        let samples = [f32::NAN, 0.5, f32::NAN, f32::INFINITY];
+        let message = ensure_finite(&samples)
+            .expect_err("should be refused")
+            .to_string();
+        assert!(
+            message.contains('3'),
+            "expected the count 3, got: {message}"
+        );
     }
 }
