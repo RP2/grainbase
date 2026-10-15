@@ -35,7 +35,7 @@ pub enum FilmMode {
 }
 
 /// What to convert, and where to put it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Job {
     /// Folder of scans. Treated as one roll.
     pub input: PathBuf,
@@ -43,6 +43,8 @@ pub struct Job {
     pub output: PathBuf,
     /// Which film the scans are.
     pub mode: FilmMode,
+    /// Conversion settings. Neutral unless a calibration profile was loaded.
+    pub settings: Settings,
 }
 
 /// What happened to one frame.
@@ -181,7 +183,7 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
         return Outcome::Skipped(output);
     }
 
-    match convert_frame(input, &output, base) {
+    match convert_frame(input, &output, &job.settings, base) {
         Ok(()) => Outcome::Converted(output),
         Err(err) => Outcome::Failed(input.to_path_buf(), err.to_string()),
     }
@@ -195,7 +197,12 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
 /// # Errors
 ///
 /// Propagates decode, encode, and output-directory failures.
-pub fn convert_frame(input: &Path, output: &Path, base: Option<&FilmBase>) -> Result<(), Error> {
+pub fn convert_frame(
+    input: &Path,
+    output: &Path,
+    settings: &Settings,
+    base: Option<&FilmBase>,
+) -> Result<(), Error> {
     let scan = decode::decode(input)?;
 
     // Measured only when the caller has no roll-level base to supply.
@@ -207,7 +214,7 @@ pub fn convert_frame(input: &Path, output: &Path, base: Option<&FilmBase>) -> Re
         &measured
     };
 
-    let positive = pipeline::invert(&scan.linear, base, &Settings::default());
+    let positive = pipeline::invert(&scan.linear, base, settings);
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -408,6 +415,7 @@ mod tests {
             input: dir.clone(),
             output: dir.join("out"),
             mode: FilmMode::ColorNegative,
+            settings: Settings::default(),
         });
 
         assert!(report.outcomes.is_empty(), "got {:?}", report.outcomes);
@@ -434,6 +442,7 @@ mod tests {
             input: PathBuf::from("/nonexistent/grainbase-roll"),
             output: PathBuf::from("/tmp/grainbase-out"),
             mode: FilmMode::ColorNegative,
+            settings: Settings::default(),
         });
 
         assert_eq!(report.failures().len(), 1);
