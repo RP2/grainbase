@@ -29,64 +29,105 @@ use crate::image::LinearImage;
 /// Density mapped to the positive's white point by default, in log10 units.
 ///
 /// A real negative's density range depends on the film stock, the exposure, and
-/// the capture. This is a fixed, deterministic starting point; the grade and
-/// look units are where per-frame and per-stock behavior belongs.
+/// the capture. This is a fixed, deterministic starting point, and the value a
+/// fitted calibration profile replaces.
 pub const DEFAULT_DENSITY_MAX: f32 = 2.0;
 
 /// Tuning for the conversion core.
+///
+/// This is the shape a fitted calibration profile fills in. Every field here is
+/// something measurable from paired scans, and every default is a neutral
+/// starting point rather than a tuned value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
-    /// Density treated as the positive's white point, in log10 units.
+    /// Density at which each channel reaches the positive's white point.
     ///
-    /// Lower values increase contrast and clip highlights sooner.
-    pub density_max: f32,
+    /// Per channel, and that is the point: the negative's three dye layers
+    /// develop to slightly different contrasts. Any per-channel error grows
+    /// linearly with density, so it is invisible in the midtones you balanced
+    /// with and worst in the shadows — the classic residual shadow cast. One
+    /// shared value cannot express that correction.
+    pub density_max: [f32; 3],
+
+    /// Dye crosstalk correction, applied to density before it is scaled.
+    ///
+    /// Film dyes are not spectrally pure and a Bayer sensor's channels overlap,
+    /// so each channel sees a mix of all three dye densities. Correcting that is
+    /// a linear operation *in density*, not in linear light, because secondary
+    /// absorptions are approximately linear in the other layers' densities.
+    /// Identity means no correction.
+    pub crosstalk: [[f32; 3]; 3],
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            density_max: DEFAULT_DENSITY_MAX,
+            density_max: [DEFAULT_DENSITY_MAX; 3],
+            crosstalk: IDENTITY,
         }
     }
 }
 
+/// The identity matrix: leaves density untouched.
+pub const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
 /// Neutralises the film base and inverts a negative into a positive.
 ///
-/// Each channel is divided by the base, converted to optical density, and
-/// scaled so the base becomes black and [`Settings::density_max`] becomes
-/// white. Because the base is divided out per channel, an orange mask becomes a
-/// neutral black instead of an orange cast.
+/// Each channel is divided by the base, converted to optical density, corrected
+/// for dye crosstalk, and scaled so the base becomes black and
+/// [`Settings::density_max`] becomes white. Because the base is divided out per
+/// channel, an orange mask becomes a neutral black instead of an orange cast.
 ///
 /// Output samples are in `0.0..=1.0`. The transform is pure and deterministic.
 #[must_use]
 pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> LinearImage {
     // A zero or negative setting would divide by zero or invert the contrast.
-    let density_max = settings.density_max.max(f32::MIN_POSITIVE);
+    let density_max = settings
+        .density_max
+        .map(|value| value.max(f32::MIN_POSITIVE));
+    let crosstalk = settings.crosstalk;
 
     image.map_rgb(|[red, green, blue]| {
+        let density = [
+            density_of(red, base.transmittance[0]),
+            density_of(green, base.transmittance[1]),
+            density_of(blue, base.transmittance[2]),
+        ];
+        let corrected = mix(crosstalk, density);
         [
-            invert_channel(red, base.transmittance[0], density_max),
-            invert_channel(green, base.transmittance[1], density_max),
-            invert_channel(blue, base.transmittance[2], density_max),
+            (corrected[0] / density_max[0]).clamp(0.0, 1.0),
+            (corrected[1] / density_max[1]).clamp(0.0, 1.0),
+            (corrected[2] / density_max[2]).clamp(0.0, 1.0),
         ]
     })
 }
 
-/// One channel of [`invert`].
-fn invert_channel(value: f32, base: f32, density_max: f32) -> f32 {
-    // Guarded rather than trusted: a zero base would make the whole frame
-    // NaN, and one bad frame must not poison a batch.
+/// Density beyond which a sample is simply opaque.
+///
+/// A real negative tops out near 3 log10; 10 is safely past anything physical
+/// while keeping the arithmetic finite. Without a bound, a fully opaque sample
+/// (`transmittance == 0`) yields infinity, and the crosstalk step then computes
+/// `0.0 * infinity`, which is NaN and would poison the whole frame.
+const MAX_DENSITY: f32 = 10.0;
+
+/// Optical density of one sample relative to the film base.
+fn density_of(value: f32, base: f32) -> f32 {
+    // Guarded rather than trusted: a zero base would make the whole frame NaN,
+    // and one bad frame must not poison a batch.
     let base = base.max(f32::MIN_POSITIVE);
 
-    // Clamped at 1.0 so that a pixel brighter than the base (dust, a light
-    // leak, a specular highlight) reads as zero density instead of turning into
-    // a negative density and then a negative positive.
+    // Clamped at 1.0 so that a pixel brighter than the base (dust, a light leak,
+    // a specular highlight) reads as zero density instead of turning into a
+    // negative density and then a negative positive.
     let transmittance = (value / base).clamp(0.0, 1.0);
 
-    // Zero transmittance is infinite density, which clamps to white below.
-    let density = -transmittance.log10();
+    // Zero transmittance is infinite density, hence the bound.
+    (-transmittance.log10()).min(MAX_DENSITY)
+}
 
-    (density / density_max).clamp(0.0, 1.0)
+/// Applies a 3x3 matrix to a vector: `matrix * vector`, rows dotted with it.
+fn mix(matrix: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
+    matrix.map(|row| row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2])
 }
 
 #[cfg(test)]
@@ -203,9 +244,61 @@ mod tests {
     #[test]
     fn a_zero_density_ceiling_does_not_produce_nan() {
         let source = image(&[[0.5, 0.5, 0.5]]);
-        let settings = Settings { density_max: 0.0 };
+        let settings = Settings {
+            density_max: [0.0; 3],
+            ..Settings::default()
+        };
         let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
         assert!(result.data.iter().all(|channel| channel.is_finite()));
+    }
+
+    #[test]
+    fn one_shared_ceiling_is_the_default_across_channels() {
+        assert_eq!(Settings::default().density_max, [DEFAULT_DENSITY_MAX; 3]);
+    }
+
+    #[test]
+    fn a_channel_saturates_sooner_with_a_lower_ceiling() {
+        // Same density, different ceilings: the lower ceiling reaches white first.
+        let source = image(&[[0.1, 0.1, 0.1]]);
+        let settings = Settings {
+            density_max: [2.0, 1.0, 0.5],
+            ..Settings::default()
+        };
+        let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
+
+        // density = -log10(0.1) = 1.0
+        assert!((result.data[0] - 0.5).abs() < 1e-6, "got {:?}", result.data);
+        assert!((result.data[1] - 1.0).abs() < 1e-6, "got {:?}", result.data);
+        assert!((result.data[2] - 1.0).abs() < 1e-6, "got {:?}", result.data);
+    }
+
+    #[test]
+    fn the_identity_crosstalk_matrix_changes_nothing() {
+        let source = image(&[[0.1, 0.2, 0.3]]);
+        let neutral = Settings::default();
+        assert_eq!(neutral.crosstalk, IDENTITY);
+
+        let with_identity = invert(&source, &base([1.0, 1.0, 1.0]), &neutral);
+        let without_any = invert(&source, &base([1.0, 1.0, 1.0]), &Settings::default());
+        assert_eq!(with_identity.data, without_any.data);
+    }
+
+    #[test]
+    fn crosstalk_mixes_density_between_channels() {
+        // Red density leaking entirely into green: the red positive falls, the
+        // green one rises to where red was.
+        let source = image(&[[0.1, 1.0, 1.0]]);
+        let settings = Settings {
+            crosstalk: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+            ..Settings::default()
+        };
+        let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
+
+        // red density = -log10(0.1) = 1.0, green and blue are 0.
+        assert!((result.data[0] - 0.0).abs() < 1e-6, "got {:?}", result.data);
+        assert!((result.data[1] - 0.5).abs() < 1e-6, "got {:?}", result.data);
+        assert!((result.data[2] - 0.0).abs() < 1e-6, "got {:?}", result.data);
     }
 
     #[test]
