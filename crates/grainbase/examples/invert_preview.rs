@@ -11,7 +11,7 @@
 
 use grainbase::decode;
 use grainbase::pipeline::{self, FilmBase, Settings, film_base, percentile};
-use grainbase::{LinearImage, encode};
+use grainbase::{LinearImage, encode, geometry};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
@@ -41,6 +41,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let mut negative = scan.linear;
 
+    if let Some(frame) = geometry::find(&negative) {
+        println!(
+            "frame: centre {:.0},{:.0}  size {:.0}x{:.0}  skew {:.4} rad ({:.2} deg)",
+            frame.center[0],
+            frame.center[1],
+            frame.size[0],
+            frame.size[1],
+            frame.skew,
+            frame.skew.to_degrees()
+        );
+    }
+    trace_min_channel(&negative);
+
     if flip_h {
         negative = negative.flipped_horizontal();
         println!("mirrored left to right");
@@ -68,6 +81,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     encode::encode(&positive, output)?;
     println!("wrote {output}");
     Ok(())
+}
+
+/// Traces the distribution of the least channel.
+///
+/// The frame's boundary is between clear film (rebate, sprocket band, holes) and
+/// exposed film, so the threshold has to sit in a much narrower band than
+/// "light versus film" suggests. This is how that band gets chosen from data
+/// rather than guessed.
+fn trace_min_channel(image: &LinearImage) {
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+
+    // Where are the bad samples, if any? The answer says which stage produced
+    // them: a border ring points at demosaic edge handling, scattered points at
+    // sensor defects or arithmetic.
+    let width = image.width as usize;
+    let mut bad = 0usize;
+    let mut first_bad = None;
+    let mut last_bad = None;
+    for (index, pixel) in pixels.iter().enumerate() {
+        if pixel.iter().all(|channel| channel.is_finite()) {
+            continue;
+        }
+        bad += 1;
+        let (row, column) = (index / width, index % width);
+        first_bad.get_or_insert((row, column));
+        last_bad = Some((row, column));
+    }
+    println!("non-finite samples: {bad} of {} pixels", pixels.len());
+    if let (Some(first), Some(last)) = (first_bad, last_bad) {
+        println!("  first at row {}, column {}", first.0, first.1);
+        println!("  last  at row {}, column {}", last.0, last.1);
+    }
+
+    let mut values: Vec<f32> = pixels
+        .iter()
+        .map(|p| p[0].min(p[1]).min(p[2]))
+        .filter(|value| value.is_finite())
+        .collect();
+    values.sort_unstable_by(f32::total_cmp);
+
+    println!("--- least-channel distribution ---");
+    for percentile in [50.0f32, 90.0, 95.0, 99.0, 99.5, 99.9, 99.99, 100.0] {
+        let value = percentile::value_at_sorted(&values, percentile).unwrap_or(f32::NAN);
+        println!("  p{percentile:<6} {value:.4}");
+    }
 }
 
 /// Traces the upper tail of the green channel, where the film/non-film

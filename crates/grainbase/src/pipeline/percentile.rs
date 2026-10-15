@@ -42,7 +42,7 @@ fn rank(len: usize, percentile: f32) -> Option<usize> {
     Some(scaled)
 }
 
-/// `len - 1` scaled by `percentile`.
+/// `len - 1` scaled by `percentile`, clamped into range.
 ///
 /// Split out so the casts carry one explanation rather than three.
 #[expect(
@@ -50,13 +50,16 @@ fn rank(len: usize, percentile: f32) -> Option<usize> {
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "percentile is clamped to 0.0..=100.0, so the scaled rank is \
-              finite, non-negative, and bounded by len - 1; and a rank only \
-              needs to be accurate to the nearest sample, so converting a \
-              counts-sized usize to f32 and back cannot pick the wrong one"
+              finite, non-negative, and bounded by len - 1"
 )]
 fn scaled_rank(len: usize, percentile: f32) -> usize {
     let rank = (len.saturating_sub(1) as f32 * (percentile / 100.0)).round();
-    rank as usize
+
+    // The clamp is not redundant. `len - 1` does not survive the trip through
+    // f32: at 24 million samples it rounds *up*, so the top percentile asked for
+    // index 24_000_000 in a 24_000_000-element slice and got nothing. One sample
+    // out of range is all it takes to turn a maximum into a missing value.
+    (rank as usize).min(len.saturating_sub(1))
 }
 
 #[cfg(test)]
@@ -100,5 +103,37 @@ mod tests {
         let mut values = vec![1.0, f32::NAN, 3.0];
         let value = value_at(&mut values, 100.0).expect("non-empty");
         assert!(value.is_finite() || value.is_nan());
+    }
+
+    #[test]
+    fn the_top_rank_never_runs_past_the_end() {
+        // The bug this pins: `len - 1` does not survive f32. At 24 million
+        // samples it rounds up to exactly 24 million, and the top percentile
+        // then asked for an index one past the last element.
+        for len in [
+            1,
+            2,
+            10,
+            1_000,
+            1_000_000,
+            16_777_217,
+            24_000_000,
+            usize::MAX / 4,
+        ] {
+            for percentile in [99.0, 99.9, 99.99, 100.0] {
+                let rank = scaled_rank(len, percentile);
+                assert!(rank < len, "len {len} at p{percentile} gave rank {rank}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_maximum_is_reachable_at_the_top_percentile() {
+        // A regression guard for the same bug at a size that is cheap to test:
+        // the largest value must come back, not a missing value.
+        let mut values: Vec<f32> = (0..10_000).map(|i| f32::from(i as u16)).collect();
+        values.push(99_999.0);
+        let top = value_at(&mut values, 100.0).expect("there is a maximum");
+        assert_eq!(top, 99_999.0);
     }
 }

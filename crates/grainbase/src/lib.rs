@@ -9,6 +9,7 @@
 pub mod decode;
 pub mod driver;
 pub mod encode;
+pub mod geometry;
 pub mod image;
 pub mod pipeline;
 pub mod profile;
