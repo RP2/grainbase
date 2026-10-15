@@ -11,6 +11,7 @@ pub mod driver;
 pub mod encode;
 pub mod image;
 pub mod pipeline;
+pub mod profile;
 
 pub use decode::decode;
 pub use decode::{Scan, ScanMeta};
