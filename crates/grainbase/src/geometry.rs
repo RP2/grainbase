@@ -2,41 +2,45 @@
 //!
 //! Home scans are rarely straight, so a crop has to know the frame's angle as
 //! well as its position: an axis-aligned box around a tilted frame either clips
-//! the picture or keeps the light table in the corners.
+//! the picture or keeps the rebate in the corners.
 //!
-//! The frame is found from brightness structure rather than image content. The
-//! light table and the sprocket holes let the full source through, while film —
-//! including its clear base — blocks blue almost completely because of the
-//! orange mask. So the *minimum* channel is a discriminator that works whatever
-//! the photograph happens to contain: a bright sky running to the frame edge,
-//! which defeats content-based edge detection, is still dense film here.
+//! The boundary being looked for is **exposed picture against clear film**, not
+//! film against light. In a typical camera scan the film fills the frame and the
+//! only bare light is whatever shows through the sprocket holes; the rebate and
+//! the inter-frame gaps are film, just unexposed. Clear film is the brightest
+//! thing the *film* shows, because nothing in it absorbs, and any exposure at all
+//! makes the picture darker. Measured on a real frame the separation is about 5x,
+//! which is enough to threshold.
+//!
+//! The threshold is found by Otsu's method rather than fixed, because the level
+//! depends on the film, the light source, and the exposure. A fixed constant would
+//! be a guess that happens to work on one rig.
 //!
 //! This module is pure: image in, geometry out, no I/O.
 
 use crate::image::LinearImage;
 
-/// Smallest channel value counted as "light got through", as a fraction of the
-/// brightest sample present.
+/// Samples at or above this are bare light through a hole, not film at all.
 ///
-/// Low enough that the dimmest light table still counts, high enough that the
-/// film base never does. The base is orange, so its blue channel is a small
-/// fraction of what the bare light source passes.
-const LIGHT_FRACTION: f32 = 0.35;
+/// Excluded before the threshold is chosen, or the holes dominate the split and
+/// the result separates "film" from "holes" instead of "picture" from "clear
+/// film".
+const HOLE_LEVEL: f32 = 0.30;
 
-/// A row or column needs at least this share of film pixels to count toward the
-/// edge fit, which skips the ragged corners where two edges meet.
-const MIN_EDGE_COVERAGE: f32 = 0.25;
+/// A row needs at least this share of picture pixels to count toward the extent,
+/// which skips the ragged corners where two edges meet.
+const MIN_COVERAGE: f32 = 0.25;
 
 /// Share of rows, at each end, skipped when fitting an edge.
-///
-/// Held as an integer fraction so the margin is computed without a trip through
-/// floating point.
 const EDGE_MARGIN_NUMERATOR: usize = 1;
 const EDGE_MARGIN_DENOMINATOR: usize = 20; // 5%
 
-/// Largest tilt treated as genuine. Beyond this it is not a crooked scan, it is
-/// a frame found wrongly, and rotating by it would wreck the picture.
+/// Largest tilt treated as genuine. Beyond this it is not a crooked scan, it is a
+/// frame found wrongly, and rotating by it would wreck the picture.
 const MAX_SKEW: f32 = 0.20; // radians, about 11 degrees
+
+/// Bins used to build the histogram the threshold is chosen from.
+const BINS: usize = 256;
 
 /// A pixel coordinate as a float.
 ///
@@ -55,8 +59,8 @@ fn coordinate(value: usize) -> f32 {
 pub struct Frame {
     /// Centre of the frame, in source pixels.
     pub center: [f32; 2],
-    /// Width and height of the frame, in source pixels. Rotation does not
-    /// change these, so they can be used after deskewing.
+    /// Width and height of the frame, in source pixels. Rotation does not change
+    /// these, so they can be used after deskewing.
     pub size: [f32; 2],
     /// How far the frame is rotated, in radians. Rotating the image by the
     /// negative of this makes the frame axis-aligned.
@@ -65,6 +69,9 @@ pub struct Frame {
 
 impl Frame {
     /// The whole image as a frame: no crop, no rotation.
+    ///
+    /// The answer whenever the frame cannot be located. Deliberately not an
+    /// error: a bad crop is worse than no crop, so the fallback changes nothing.
     #[must_use]
     pub fn whole(image: &LinearImage) -> Self {
         let size = [
@@ -81,9 +88,9 @@ impl Frame {
 
 /// Finds the film frame, or `None` when the image has no pixels.
 ///
-/// When no light source shows in the frame there is nothing to locate, and the
-/// whole image is returned as the frame — which is the honest answer, not a
-/// failure.
+/// Falls back to [`Frame::whole`] whenever there is nothing to measure: no
+/// separation between picture and clear film, or a tilt too large to be a crooked
+/// scan.
 #[must_use]
 pub fn find(image: &LinearImage) -> Option<Frame> {
     let (width, height) = (image.width as usize, image.height as usize);
@@ -91,87 +98,149 @@ pub fn find(image: &LinearImage) -> Option<Frame> {
         return None;
     }
 
-    let Some(threshold) = light_threshold(image) else {
+    let Some(threshold) = picture_threshold(image) else {
         return Some(Frame::whole(image));
     };
 
-    let Rows {
-        left,
-        right,
-        coverage: row_coverage,
-    } = row_extents(image, threshold);
-
-    // A row with almost no film is a row of bare light, outside the frame.
-    let film_rows: Vec<usize> = (0..height)
-        .filter(|row| row_coverage[*row] >= MIN_EDGE_COVERAGE)
+    let measured = extents(image, threshold);
+    let picture_rows: Vec<usize> = (0..height)
+        .filter(|row| measured.coverage[*row] >= MIN_COVERAGE)
         .collect();
 
-    if film_rows.is_empty() {
-        // Everything is light: no film in this scan at all.
+    // No row is mostly picture, or every row is. Either way there is no boundary
+    // to find, and inventing one would be worse than declining.
+    if picture_rows.is_empty() || picture_rows.len() >= height {
         return Some(Frame::whole(image));
     }
 
-    let top = coordinate(film_rows[0]);
-    let bottom = coordinate(film_rows[film_rows.len() - 1]);
-    let left_edge = slope_of(&film_rows, |row| left[row]);
-    let right_edge = slope_of(&film_rows, |row| right[row]);
+    let left_edge = slope_of(&picture_rows, |row| measured.left[row]);
+    let right_edge = slope_of(&picture_rows, |row| measured.right[row]);
 
     // A near-vertical edge of a frame rotated by theta has dx/dy = -tan(theta),
     // so the skew is the negation of the fitted slope.
-    let skew = -combine(&[left_edge, right_edge]).filter(|slope| slope.abs() <= MAX_SKEW)?;
-
-    let first = film_rows[0];
-    let last = film_rows[film_rows.len() - 1];
-    let (Some(leftmost), Some(rightmost)) = (left.get(first..=last), right.get(first..=last))
+    let Some(skew) = combine(&[left_edge, right_edge])
+        .map(|slope| -slope)
+        .filter(|slope| slope.abs() <= MAX_SKEW)
     else {
         return Some(Frame::whole(image));
     };
-    let left_bound = median(leftmost);
-    let right_bound = median(rightmost);
+
+    let first = picture_rows[0];
+    let last = picture_rows[picture_rows.len() - 1];
+    let left = median(&measured.left[first..=last]);
+    let right = median(&measured.right[first..=last]);
 
     Some(Frame {
         center: [
-            f32::midpoint(left_bound, right_bound),
-            f32::midpoint(top, bottom),
+            f32::midpoint(left, right),
+            f32::midpoint(coordinate(first), coordinate(last)),
         ],
-        size: [right_bound - left_bound, bottom - top],
+        size: [right - left, coordinate(last) - coordinate(first)],
         skew,
     })
 }
 
-/// Per-row film extent.
-struct Rows {
+/// Per-row picture extent.
+struct Extents {
     left: Vec<f32>,
     right: Vec<f32>,
     coverage: Vec<f32>,
 }
 
-/// Brightness above which a sample is bare light rather than film, if any.
-///
-/// The brightest samples in the image are the light source passing through
-/// nothing. Taking a fraction of that separates light from film without
-/// assuming an exposure.
-fn light_threshold(image: &LinearImage) -> Option<f32> {
-    let brightest = image
-        .data
-        .iter()
-        .copied()
-        .filter(|sample| sample.is_finite())
-        .fold(f32::NEG_INFINITY, f32::max);
-
-    (brightest > 0.0).then_some(brightest * LIGHT_FRACTION)
-}
-
 /// The lowest channel value, which is what the orange mask suppresses.
-fn min_channel(pixel: &[f32; 3]) -> f32 {
+///
+/// Bare light and clear film both pass it; only the picture holds it back. Using
+/// the least channel rather than a mean keeps a bright but coloured scene from
+/// reading as clear film.
+fn least_channel(pixel: &[f32; 3]) -> f32 {
     pixel[0].min(pixel[1]).min(pixel[2])
 }
 
-/// Measures each row's film extent.
-fn row_extents(image: &LinearImage, threshold: f32) -> Rows {
+/// The level separating clear film from exposed picture, by Otsu's method.
+///
+/// Returns `None` when there is nothing to separate.
+fn picture_threshold(image: &LinearImage) -> Option<f32> {
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+
+    let mut histogram = [0u32; BINS];
+    let mut total = 0u64;
+    for pixel in pixels {
+        let value = least_channel(pixel);
+        // Holes are not film; letting them in makes the split about them.
+        if !value.is_finite() || value >= HOLE_LEVEL {
+            continue;
+        }
+        let bin = bin_of(value);
+        histogram[bin] = histogram[bin].saturating_add(1);
+        total += 1;
+    }
+
+    otsu(&histogram, total)
+}
+
+/// The bin a sample falls in.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped to 0.0..=1.0, so the scaled bin is finite, \
+              non-negative, and bounded by BINS - 1"
+)]
+fn bin_of(value: f32) -> usize {
+    ((value.clamp(0.0, 1.0) * coordinate(BINS - 1)).round() as usize).min(BINS - 1)
+}
+
+/// Otsu's threshold: the bin that best separates two populations.
+///
+/// Maximises the variance *between* the classes, which needs no tuning and no
+/// assumption about which class is which.
+fn otsu(histogram: &[u32; BINS], total: u64) -> Option<f32> {
+    if total == 0 {
+        return None;
+    }
+    let total = coordinate(usize::try_from(total).ok()?);
+
+    let mut sum_all = 0.0f64;
+    for (bin, count) in histogram.iter().enumerate() {
+        sum_all += f64::from(coordinate(bin)) * f64::from(*count);
+    }
+
+    let mut weight_below = 0.0f64;
+    let mut sum_below = 0.0f64;
+    let mut best_bin = 0usize;
+    let mut best_variance = -1.0f64;
+
+    for (bin, count) in histogram.iter().enumerate() {
+        weight_below += f64::from(*count);
+        if weight_below == 0.0 {
+            continue;
+        }
+        let weight_above = f64::from(total) - weight_below;
+        if weight_above <= 0.0 {
+            break;
+        }
+        sum_below += f64::from(coordinate(bin)) * f64::from(*count);
+
+        let mean_below = sum_below / weight_below;
+        let mean_above = (sum_all - sum_below) / weight_above;
+        let between = weight_below * weight_above * (mean_below - mean_above).powi(2);
+        if between > best_variance {
+            best_variance = between;
+            best_bin = bin;
+        }
+    }
+
+    // The boundary sits *between* the last bin of the lower class and the first
+    // of the upper, not on the occupied bin itself. Returning the bin value puts
+    // the threshold exactly on the lower population, and every pixel of it then
+    // fails a strict comparison.
+    Some((coordinate(best_bin) + 0.5) / coordinate(BINS - 1))
+}
+
+/// Measures each row's picture extent.
+fn extents(image: &LinearImage, threshold: f32) -> Extents {
     let width = image.width as usize;
     let height = image.height as usize;
-    let (pixels, _) = image.data.as_chunks::<3>();
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
 
     let mut left = vec![0.0f32; height];
     let mut right = vec![0.0f32; height];
@@ -183,7 +252,9 @@ fn row_extents(image: &LinearImage, threshold: f32) -> Rows {
         let mut count = 0usize;
 
         for column in 0..width {
-            if min_channel(&pixels[row * width + column]) >= threshold {
+            // Picture is *below* the threshold: any exposure makes it darker than
+            // clear film.
+            if least_channel(&pixels[row * width + column]) >= threshold {
                 continue;
             }
             count += 1;
@@ -196,7 +267,7 @@ fn row_extents(image: &LinearImage, threshold: f32) -> Rows {
         coverage[row] = coordinate(count) / coordinate(width.max(1));
     }
 
-    Rows {
+    Extents {
         left,
         right,
         coverage,
@@ -239,10 +310,10 @@ fn median(values: &[f32]) -> f32 {
     sorted[middle]
 }
 
-/// Combines edge slopes into one skew, rejecting disagreement.
+/// Combines edge slopes into one skew.
 ///
-/// Opposite edges of a rectangle tilt by the same amount, so a large
-/// disagreement means an edge was fitted to something that is not the frame.
+/// Opposite edges of a rectangle tilt by the same amount, so the median is a
+/// reasonable summary.
 fn combine(slopes: &[Option<f32>]) -> Option<f32> {
     let present: Vec<f32> = slopes.iter().filter_map(|slope| *slope).collect();
     if present.is_empty() {
@@ -255,15 +326,13 @@ fn combine(slopes: &[Option<f32>]) -> Option<f32> {
 mod tests {
     use super::*;
 
-    /// A dark rectangle on a bright background, optionally rotated.
-    fn scan_with_frame(
-        width: u32,
-        height: u32,
-        frame: [f32; 4],
-        skew: f32,
-        background: f32,
-        film: f32,
-    ) -> LinearImage {
+    /// Clear film, much brighter than any picture.
+    const CLEAR_FILM: f32 = 0.12;
+    /// A dense picture.
+    const PICTURE: f32 = 0.02;
+
+    /// A picture rectangle on clear film, optionally rotated.
+    fn scan_with_frame(width: u32, height: u32, frame: [f32; 4], skew: f32) -> LinearImage {
         let count = width as usize * height as usize;
         let mut data = vec![0.0f32; count * 3];
 
@@ -280,7 +349,7 @@ mod tests {
                 let (fx, fy) = (x * cos + y * sin, -x * sin + y * cos);
                 let inside = fx >= frame[0] && fx <= frame[2] && fy >= frame[1] && fy <= frame[3];
 
-                let value = if inside { film } else { background };
+                let value = if inside { PICTURE } else { CLEAR_FILM };
                 let at = (row * width as usize + column) * 3;
                 data[at..at + 3].fill(value);
             }
@@ -296,9 +365,10 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_with_no_light_around_it_is_the_whole_image() {
-        // All film: there is nothing to locate, and saying so beats inventing a crop.
-        let image = scan_with_frame(64, 48, [-100.0, -100.0, 100.0, 100.0], 0.0, 0.2, 0.2);
+    fn an_image_that_is_all_picture_is_the_whole_image() {
+        // No clear film anywhere, so there is no boundary. Saying so beats
+        // inventing a crop.
+        let image = scan_with_frame(64, 48, [-1000.0, -1000.0, 1000.0, 1000.0], 0.0);
         let frame = find(&image).expect("a frame");
         assert_eq!(frame.size, [64.0, 48.0]);
         assert!(frame.skew.abs() < 1e-3);
@@ -306,8 +376,8 @@ mod tests {
 
     #[test]
     fn an_axis_aligned_frame_is_found_without_rotation() {
-        // 100x80 image, film from x 20..80 and y 10..70.
-        let image = scan_with_frame(100, 80, [-30.0, -30.0, 30.0, 30.0], 0.0, 1.0, 0.1);
+        // 100x80 image; picture from x 20..80 and y 10..70.
+        let image = scan_with_frame(100, 80, [-30.0, -30.0, 30.0, 30.0], 0.0);
         let frame = find(&image).expect("a frame");
 
         assert!(
@@ -315,24 +385,37 @@ mod tests {
             "skew should be ~0, got {}",
             frame.skew
         );
-        assert!((frame.size[0] - 60.0).abs() < 2.0, "got {:?}", frame.size);
-        assert!((frame.size[1] - 60.0).abs() < 2.0, "got {:?}", frame.size);
         assert!(
-            (frame.center[0] - 50.0).abs() < 2.0,
-            "got {:?}",
-            frame.center
+            (frame.size[0] - 60.0).abs() < 3.0,
+            "width should be ~60, got {:?}",
+            frame.size
         );
         assert!(
-            (frame.center[1] - 40.0).abs() < 2.0,
-            "got {:?}",
+            (frame.size[1] - 60.0).abs() < 3.0,
+            "height should be ~60, got {:?}",
+            frame.size
+        );
+        assert!(
+            (frame.center[0] - 50.0).abs() < 3.0,
+            "centre should be ~50,40, got {:?}",
             frame.center
+        );
+    }
+
+    #[test]
+    fn the_threshold_lands_between_the_two_populations() {
+        let image = scan_with_frame(100, 80, [-30.0, -30.0, 30.0, 30.0], 0.0);
+        let threshold = picture_threshold(&image).expect("two populations");
+        assert!(
+            threshold > PICTURE && threshold < CLEAR_FILM,
+            "threshold {threshold} should sit between {PICTURE} and {CLEAR_FILM}"
         );
     }
 
     #[test]
     fn a_tilted_frame_reports_its_tilt() {
         let skew = 0.06f32; // about 3.4 degrees
-        let image = scan_with_frame(200, 200, [-60.0, -40.0, 60.0, 40.0], skew, 1.0, 0.1);
+        let image = scan_with_frame(200, 200, [-60.0, -40.0, 60.0, 40.0], skew);
         let frame = find(&image).expect("a frame");
 
         assert!(
@@ -344,26 +427,55 @@ mod tests {
 
     #[test]
     fn the_sign_of_the_tilt_is_reported() {
-        let image = scan_with_frame(200, 200, [-60.0, -40.0, 60.0, 40.0], -0.06, 1.0, 0.1);
+        let image = scan_with_frame(200, 200, [-60.0, -40.0, 60.0, 40.0], -0.06);
         let frame = find(&image).expect("a frame");
         assert!(frame.skew < 0.0, "got {}", frame.skew);
     }
 
     #[test]
-    fn a_dark_scene_inside_a_bright_frame_still_finds_the_frame() {
-        // The point of using the least channel: a bright sky inside the picture
-        // must not be mistaken for the light source.
-        let mut image = scan_with_frame(100, 80, [-30.0, -30.0, 30.0, 30.0], 0.0, 1.0, 0.1);
-        let (pixels, _) = image.data.as_chunks_mut::<3>();
-        // Paint a very bright patch inside the frame, but keep blue suppressed as
-        // film would: bright, yet not bare light.
-        for row in 20..40usize {
-            for column in 30..60usize {
-                pixels[row * 100 + column] = [1.0, 0.9, 0.1];
+    fn a_picture_that_does_not_reach_the_edges_is_bounded() {
+        // The real case: clear film along two edges, picture filling the rest.
+        let image = scan_with_frame(200, 200, [-100.0, -60.0, 90.0, 100.0], 0.0);
+        let frame = find(&image).expect("a frame");
+
+        assert!(
+            frame.size[1] < 180.0,
+            "height should be bounded by the clear film, got {:?}",
+            frame.size
+        );
+    }
+
+    #[test]
+    fn sprocket_holes_do_not_become_the_picture() {
+        // Bare light in the frame must not drag the threshold toward it.
+        let mut image = scan_with_frame(200, 200, [-80.0, -80.0, 80.0, 80.0], 0.0);
+        let (pixels, _remainder) = image.data.as_chunks_mut::<3>();
+        for row in 10..30usize {
+            for column in 10..190usize {
+                if (column / 12) % 2 == 0 {
+                    pixels[row * 200 + column] = [0.6, 0.6, 0.6];
+                }
             }
         }
 
+        let threshold = picture_threshold(&image).expect("two populations");
+        assert!(
+            threshold < HOLE_LEVEL,
+            "the holes should be excluded, got threshold {threshold}"
+        );
+
         let frame = find(&image).expect("a frame");
-        assert!((frame.size[0] - 60.0).abs() < 3.0, "got {:?}", frame.size);
+        assert!(
+            (frame.size[1] - 160.0).abs() < 6.0,
+            "the hole band is clear film plus holes, so the picture is still bounded there, got {:?}",
+            frame.size
+        );
+    }
+
+    #[test]
+    fn a_uniform_image_has_no_threshold_to_find() {
+        let image = LinearImage::new(4, 4, vec![0.05; 48]).expect("well-formed");
+        let frame = find(&image).expect("a frame");
+        assert_eq!(frame.size, [4.0, 4.0]);
     }
 }

@@ -126,6 +126,62 @@ fn trace_min_channel(image: &LinearImage) {
         let value = percentile::value_at_sorted(&values, percentile).unwrap_or(f32::NAN);
         println!("  p{percentile:<6} {value:.4}");
     }
+
+    println!("--- least channel by row band (top to bottom) ---");
+    for band in 0..20 {
+        let row = band * (image.height as usize / 20);
+        println!("  row {:>5}  {:.4}", row, band_mean(image, band, 20, true));
+    }
+
+    println!("--- least channel by column band (left to right) ---");
+    for band in 0..20 {
+        let column = band * (image.width as usize / 20);
+        println!(
+            "  col {:>5}  {:.4}",
+            column,
+            band_mean(image, band, 20, false)
+        );
+    }
+}
+
+/// Mean least channel over one twentieth of the image, by row or by column.
+///
+/// Clear film sits at the top of the film's range and the picture below it, so
+/// this shows where the rebate and the sprocket bands actually are — which is not
+/// something to guess at.
+fn band_mean(image: &LinearImage, band: usize, bands: usize, by_row: bool) -> f32 {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+
+    let (outer, inner) = if by_row {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let start = band * (outer / bands);
+    let end = ((band + 1) * (outer / bands)).min(outer);
+
+    let mut sum = 0.0f32;
+    let mut count = 0usize;
+    for a in start..end {
+        for b in 0..inner {
+            let (row, column) = if by_row { (a, b) } else { (b, a) };
+            let pixel = &pixels[row * width + column];
+            sum += pixel[0].min(pixel[1]).min(pixel[2]);
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return f32::NAN;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a diagnostic mean over a whole band"
+    )]
+    let count = count as f32;
+    sum / count
 }
 
 /// Traces the upper tail of the green channel, where the film/non-film
