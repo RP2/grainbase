@@ -28,11 +28,27 @@ const LIGHT_FRACTION: f32 = 0.35;
 const MIN_EDGE_COVERAGE: f32 = 0.25;
 
 /// Share of rows, at each end, skipped when fitting an edge.
-const EDGE_MARGIN: f32 = 0.05;
+///
+/// Held as an integer fraction so the margin is computed without a trip through
+/// floating point.
+const EDGE_MARGIN_NUMERATOR: usize = 1;
+const EDGE_MARGIN_DENOMINATOR: usize = 20; // 5%
 
 /// Largest tilt treated as genuine. Beyond this it is not a crooked scan, it is
 /// a frame found wrongly, and rotating by it would wreck the picture.
 const MAX_SKEW: f32 = 0.20; // radians, about 11 degrees
+
+/// A pixel coordinate as a float.
+///
+/// Exact for anything that can be held in memory: `f32` represents integers
+/// exactly up to 2^24, which is sixteen million pixels along one axis.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a coordinate beyond 2^24 on one axis is not a photograph"
+)]
+fn coordinate(value: usize) -> f32 {
+    value as f32
+}
 
 /// The film frame: a rectangle, possibly rotated.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,7 +67,10 @@ impl Frame {
     /// The whole image as a frame: no crop, no rotation.
     #[must_use]
     pub fn whole(image: &LinearImage) -> Self {
-        let size = [image.width as f32, image.height as f32];
+        let size = [
+            coordinate(image.width as usize),
+            coordinate(image.height as usize),
+        ];
         Self {
             center: [size[0] / 2.0, size[1] / 2.0],
             size,
@@ -92,8 +111,8 @@ pub fn find(image: &LinearImage) -> Option<Frame> {
         return Some(Frame::whole(image));
     }
 
-    let top = film_rows[0] as f32;
-    let bottom = film_rows[film_rows.len() - 1] as f32;
+    let top = coordinate(film_rows[0]);
+    let bottom = coordinate(film_rows[film_rows.len() - 1]);
     let left_edge = slope_of(&film_rows, |row| left[row]);
     let right_edge = slope_of(&film_rows, |row| right[row]);
 
@@ -111,7 +130,10 @@ pub fn find(image: &LinearImage) -> Option<Frame> {
     let right_bound = median(rightmost);
 
     Some(Frame {
-        center: [(left_bound + right_bound) / 2.0, (top + bottom) / 2.0],
+        center: [
+            f32::midpoint(left_bound, right_bound),
+            f32::midpoint(top, bottom),
+        ],
         size: [right_bound - left_bound, bottom - top],
         skew,
     })
@@ -169,16 +191,9 @@ fn row_extents(image: &LinearImage, threshold: f32) -> Rows {
             last = Some(column);
         }
 
-        left[row] = first.unwrap_or(0) as f32;
-        right[row] = last.unwrap_or(width.saturating_sub(1)) as f32;
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a coverage fraction only needs enough precision to compare \
-                      against a quarter"
-        )]
-        {
-            coverage[row] = count as f32 / width.max(1) as f32;
-        }
+        left[row] = coordinate(first.unwrap_or(0));
+        right[row] = coordinate(last.unwrap_or(width.saturating_sub(1)));
+        coverage[row] = coordinate(count) / coordinate(width.max(1));
     }
 
     Rows {
@@ -196,17 +211,19 @@ fn slope_of(rows: &[usize], position: impl Fn(usize) -> f32) -> Option<f32> {
     if count < 8 {
         return None;
     }
-    let margin = ((count as f32 * EDGE_MARGIN) as usize).max(1);
+    // Integer arithmetic: a count-to-float round trip is exactly the kind of
+    // precision loss that bit the percentile code.
+    let margin = (count * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR).max(1);
     let middle = &rows[margin..count - margin];
 
-    let n = middle.len() as f32;
-    let mean_row = middle.iter().map(|row| *row as f32).sum::<f32>() / n;
+    let n = coordinate(middle.len());
+    let mean_row = middle.iter().map(|row| coordinate(*row)).sum::<f32>() / n;
     let mean_position = middle.iter().map(|row| position(*row)).sum::<f32>() / n;
 
     let mut covariance = 0.0f32;
     let mut variance = 0.0f32;
     for row in middle {
-        let dy = *row as f32 - mean_row;
+        let dy = coordinate(*row) - mean_row;
         covariance += dy * (position(*row) - mean_position);
         variance += dy * dy;
     }
@@ -250,12 +267,15 @@ mod tests {
         let count = width as usize * height as usize;
         let mut data = vec![0.0f32; count * 3];
 
-        let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
+        let (cx, cy) = (
+            coordinate(width as usize) / 2.0,
+            coordinate(height as usize) / 2.0,
+        );
         let (cos, sin) = (skew.cos(), skew.sin());
 
         for row in 0..height as usize {
             for column in 0..width as usize {
-                let (x, y) = (column as f32 - cx, row as f32 - cy);
+                let (x, y) = (coordinate(column) - cx, coordinate(row) - cy);
                 // Into frame-local coordinates.
                 let (fx, fy) = (x * cos + y * sin, -x * sin + y * cos);
                 let inside = fx >= frame[0] && fx <= frame[2] && fy >= frame[1] && fy <= frame[3];

@@ -131,7 +131,7 @@ mod tests {
     fn the_maximum_is_reachable_at_the_top_percentile() {
         // A regression guard for the same bug at a size that is cheap to test:
         // the largest value must come back, not a missing value.
-        let mut values: Vec<f32> = (0..10_000).map(|i| f32::from(i as u16)).collect();
+        let mut values: Vec<f32> = (0..10_000u16).map(f32::from).collect();
         values.push(99_999.0);
         let top = value_at(&mut values, 100.0).expect("there is a maximum");
         assert_eq!(top, 99_999.0);
