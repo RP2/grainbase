@@ -12,6 +12,8 @@ use std::{fs, io};
 
 use rayon::prelude::*;
 
+use crate::geometry;
+use crate::image::LinearImage;
 use crate::pipeline::{self, FilmBase, Settings, film_base};
 use crate::{decode, encode};
 
@@ -45,6 +47,12 @@ pub struct Job {
     pub mode: FilmMode,
     /// Conversion settings. Neutral unless a calibration profile was loaded.
     pub settings: Settings,
+    /// Whether to locate the film frame and crop to it.
+    ///
+    /// Cropping is a judgement, so it is a setting rather than something baked in:
+    /// turning it off gives the raw frame back, and sources are never modified, so
+    /// the decision is always reversible.
+    pub crop: bool,
 }
 
 /// What happened to one frame.
@@ -160,7 +168,7 @@ pub fn run(job: &Job) -> Report {
     // Deterministic order, so the sampling below is reproducible.
     inputs.sort();
 
-    let base = roll_base(&inputs);
+    let base = roll_base(&inputs, job.crop);
 
     let outcomes = inputs
         .par_iter()
@@ -183,16 +191,35 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
         return Outcome::Skipped(output);
     }
 
-    match convert_frame(input, &output, &job.settings, base) {
+    match convert_frame(input, &output, &job.settings, base, job.crop) {
         Ok(()) => Outcome::Converted(output),
         Err(err) => Outcome::Failed(input.to_path_buf(), err.to_string()),
     }
 }
 
-/// Decodes one frame, inverts it, and writes the positive.
+/// Crops to the film frame, when asked and when one can be found.
 ///
-/// When `base` is `None` the frame measures its own, which is what a single
-/// frame run does.
+/// Runs before anything measures the film base, and that order is the point: a
+/// base measured over the whole sensor includes the sprocket holes and whatever
+/// bare light is about, and those are not film. Measuring them measures the light
+/// source.
+///
+/// Anything ambiguous leaves the image alone. A bad crop is worse than no crop,
+/// and an underexposed frame has weaker edges.
+fn cropped(image: LinearImage, crop: bool) -> LinearImage {
+    if !crop {
+        return image;
+    }
+    match geometry::find(&image) {
+        Some(frame) => geometry::apply(&image, &frame),
+        None => image,
+    }
+}
+
+/// Decodes one frame, crops it, inverts it, and writes the positive.
+///
+/// When `base` is `None` the frame measures its own, which is what a single frame
+/// run does.
 ///
 /// # Errors
 ///
@@ -202,19 +229,21 @@ pub fn convert_frame(
     output: &Path,
     settings: &Settings,
     base: Option<&FilmBase>,
+    crop: bool,
 ) -> Result<(), Error> {
     let scan = decode::decode(input)?;
+    let linear = cropped(scan.linear, crop);
 
     // Measured only when the caller has no roll-level base to supply.
     let measured;
     let base = if let Some(base) = base {
         base
     } else {
-        measured = FilmBase::detect(&scan.linear, film_base::DEFAULT_PERCENTILE);
+        measured = FilmBase::detect(&linear, film_base::DEFAULT_PERCENTILE);
         &measured
     };
 
-    let positive = pipeline::invert(&scan.linear, base, settings);
+    let positive = pipeline::invert(&linear, base, settings);
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -229,7 +258,7 @@ pub fn convert_frame(
 /// taken, so one odd frame — a blank, a very dense night shot — cannot set the
 /// base for the whole roll. Returns `None` when nothing could be sampled, and
 /// callers then fall back to measuring per frame.
-fn roll_base(inputs: &[PathBuf]) -> Option<FilmBase> {
+fn roll_base(inputs: &[PathBuf], crop: bool) -> Option<FilmBase> {
     if inputs.len() <= 1 {
         // Nothing to pool, and one frame is its own best estimate.
         return None;
@@ -242,10 +271,8 @@ fn roll_base(inputs: &[PathBuf]) -> Option<FilmBase> {
         .take(BASE_SAMPLE)
         .filter_map(|input| {
             let scan = decode::decode(input).ok()?;
-            Some(FilmBase::detect(
-                &scan.linear,
-                film_base::DEFAULT_PERCENTILE,
-            ))
+            let linear = cropped(scan.linear, crop);
+            Some(FilmBase::detect(&linear, film_base::DEFAULT_PERCENTILE))
         })
         .collect();
 
@@ -416,6 +443,7 @@ mod tests {
             output: dir.join("out"),
             mode: FilmMode::ColorNegative,
             settings: Settings::default(),
+            crop: true,
         });
 
         assert!(report.outcomes.is_empty(), "got {:?}", report.outcomes);
@@ -443,6 +471,7 @@ mod tests {
             output: PathBuf::from("/tmp/grainbase-out"),
             mode: FilmMode::ColorNegative,
             settings: Settings::default(),
+            crop: true,
         });
 
         assert_eq!(report.failures().len(), 1);

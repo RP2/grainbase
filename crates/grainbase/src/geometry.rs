@@ -322,6 +322,173 @@ fn combine(slopes: &[Option<f32>]) -> Option<f32> {
     Some(median(&present))
 }
 
+/// Tilt below which rotating costs more than it corrects.
+///
+/// At 0.001 rad across a 6000-pixel frame the drift is about three pixels, and a
+/// straight integer crop is preferable to resampling the whole picture for it.
+const NEGLIGIBLE_SKEW: f32 = 0.001;
+
+/// Applies a frame: deskews when needed, then crops.
+///
+/// A negligible tilt takes the straight crop path, which resamples nothing. That
+/// matters because resampling is the only step here that alters pixels, and grain
+/// does not survive being interpolated more than once.
+///
+/// The result is always a rectangle. Nothing here modifies the source image, and
+/// the caller can always ask for the uncropped frame instead, so the decision is
+/// reversible.
+#[must_use]
+pub fn apply(image: &LinearImage, frame: &Frame) -> LinearImage {
+    let cropped = if frame.skew.abs() < NEGLIGIBLE_SKEW {
+        crop(image, frame)
+    } else {
+        deskew_and_crop(image, frame)
+    };
+
+    if cropped.width == 0 || cropped.height == 0 {
+        image.clone()
+    } else {
+        cropped
+    }
+}
+
+/// The integer rectangle a frame covers, clamped to the image.
+fn crop_bounds(image: &LinearImage, frame: &Frame) -> (usize, usize, usize, usize) {
+    let width = image.width as usize;
+    let height = image.height as usize;
+
+    let half = [frame.size[0] / 2.0, frame.size[1] / 2.0];
+    let x0 = frame.center[0] - half[0];
+    let y0 = frame.center[1] - half[1];
+    let x1 = frame.center[0] + half[0];
+    let y1 = frame.center[1] + half[1];
+
+    (
+        floor_to_usize(x0).min(width),
+        floor_to_usize(y0).min(height),
+        ceil_to_usize(x1).min(width),
+        ceil_to_usize(y1).min(height),
+    )
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a frame coordinate: the value is a position within the image, so it \
+              fits usize once floored, and negatives clamp to zero"
+)]
+fn floor_to_usize(value: f32) -> usize {
+    if value <= 0.0 {
+        return 0;
+    }
+    value.floor() as usize
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a frame coordinate: the value is a position within the image, so it \
+              fits usize once ceiled, and negatives clamp to zero"
+)]
+fn ceil_to_usize(value: f32) -> usize {
+    if value <= 0.0 {
+        return 0;
+    }
+    value.ceil() as usize
+}
+
+/// Copies the frame's rectangle out, resampling nothing.
+fn crop(image: &LinearImage, frame: &Frame) -> LinearImage {
+    let (x0, y0, x1, y1) = crop_bounds(image, frame);
+    let (out_width, out_height) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    let width = image.width as usize;
+
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+    let mut data = Vec::with_capacity(out_width * out_height * 3);
+    for row in y0..y1 {
+        for column in x0..x1 {
+            data.extend_from_slice(&pixels[row * width + column]);
+        }
+    }
+
+    LinearImage::new(
+        u32::try_from(out_width).unwrap_or(image.width),
+        u32::try_from(out_height).unwrap_or(image.height),
+        data,
+    )
+    .unwrap_or_else(|_| image.clone())
+}
+
+/// Rotates the frame upright and copies it out.
+///
+/// Maps each output pixel back into the source, which is the direction that
+/// leaves no gaps: every output pixel gets a source sample, rather than every
+/// source pixel being scattered somewhere.
+fn deskew_and_crop(image: &LinearImage, frame: &Frame) -> LinearImage {
+    let out_width = frame.size[0].round().max(1.0);
+    let out_height = frame.size[1].round().max(1.0);
+    let (out_w, out_h) = (as_usize(out_width), as_usize(out_height));
+
+    let (sin, cos) = frame.skew.sin_cos();
+    let (half_w, half_h) = (out_width / 2.0, out_height / 2.0);
+    let (cx, cy) = (frame.center[0], frame.center[1]);
+
+    let mut data = Vec::with_capacity(out_w * out_h * 3);
+    for row in 0..out_h {
+        for column in 0..out_w {
+            let dx = coordinate(column) + 0.5 - half_w;
+            let dy = coordinate(row) + 0.5 - half_h;
+            // Inverse of "rotate the image by -skew".
+            let sx = cx + cos * dx - sin * dy;
+            let sy = cy + sin * dx + cos * dy;
+            data.extend_from_slice(&sample(image, sx, sy));
+        }
+    }
+
+    LinearImage::new(
+        u32::try_from(out_w).unwrap_or(image.width),
+        u32::try_from(out_h).unwrap_or(image.height),
+        data,
+    )
+    .unwrap_or_else(|_| image.clone())
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "an output dimension: already rounded and bounded below by 1"
+)]
+fn as_usize(value: f32) -> usize {
+    value as usize
+}
+
+/// Bilinear sample, clamping to the edge outside the image.
+fn sample(image: &LinearImage, x: f32, y: f32) -> [f32; 3] {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+
+    let clamp_x = |v: f32| v.clamp(0.0, coordinate(width.saturating_sub(1)));
+    let clamp_y = |v: f32| v.clamp(0.0, coordinate(height.saturating_sub(1)));
+    let (x, y) = (clamp_x(x), clamp_y(y));
+
+    let x0 = floor_to_usize(x);
+    let y0 = floor_to_usize(y);
+    let x1 = (x0 + 1).min(width.saturating_sub(1));
+    let y1 = (y0 + 1).min(height.saturating_sub(1));
+    let (fx, fy) = (x - coordinate(x0), y - coordinate(y0));
+
+    let mut out = [0.0f32; 3];
+    for (channel, slot) in out.iter_mut().enumerate() {
+        let top =
+            pixels[y0 * width + x0][channel] * (1.0 - fx) + pixels[y0 * width + x1][channel] * fx;
+        let bottom =
+            pixels[y1 * width + x0][channel] * (1.0 - fx) + pixels[y1 * width + x1][channel] * fx;
+        *slot = top * (1.0 - fy) + bottom * fy;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +644,97 @@ mod tests {
         let image = LinearImage::new(4, 4, vec![0.05; 48]).expect("well-formed");
         let frame = find(&image).expect("a frame");
         assert_eq!(frame.size, [4.0, 4.0]);
+    }
+
+    /// Share of pixels that read as clear film rather than picture.
+    fn clear_film_share(image: &LinearImage) -> f32 {
+        let (pixels, _remainder) = image.data.as_chunks::<3>();
+        let clear = pixels
+            .iter()
+            .filter(|pixel| least_channel(pixel) > f32::midpoint(PICTURE, CLEAR_FILM))
+            .count();
+        coordinate(clear) / coordinate(pixels.len().max(1))
+    }
+
+    #[test]
+    fn an_axis_aligned_crop_extracts_the_frame() {
+        let image = scan_with_frame(100, 80, [-30.0, -30.0, 30.0, 30.0], 0.0);
+        let frame = find(&image).expect("a frame");
+        let cropped = apply(&image, &frame);
+
+        assert_eq!((cropped.width, cropped.height), (60, 60));
+        assert_eq!(
+            clear_film_share(&cropped),
+            0.0,
+            "a clean crop holds only picture"
+        );
+    }
+
+    #[test]
+    fn cropping_resamples_nothing_when_there_is_no_tilt() {
+        // The whole point of the straight path: grain does not survive being
+        // interpolated, so an untilted crop must copy pixels exactly.
+        let image = scan_with_frame(100, 80, [-30.0, -30.0, 30.0, 30.0], 0.0);
+        let frame = find(&image).expect("a frame");
+        let cropped = apply(&image, &frame);
+
+        for sample in &cropped.data {
+            assert!(
+                (*sample - PICTURE).abs() < 1e-9,
+                "expected an exact copy, got {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn deskewing_a_tilted_frame_removes_the_clear_film() {
+        // The decisive test for the rotation direction. An absolute bound alone
+        // would be brittle, because the crop is deliberately a pixel or two
+        // generous — clipping the picture is worse than keeping a sliver of rebate.
+        // So the comparison is against the same frame rotated the wrong way.
+        let image = scan_with_frame(240, 240, [-90.0, -70.0, 90.0, 70.0], 0.08);
+        let frame = find(&image).expect("a frame");
+        assert!(frame.skew.abs() > NEGLIGIBLE_SKEW, "this frame is tilted");
+
+        let deskewed = clear_film_share(&apply(&image, &frame));
+        let flipped = clear_film_share(&apply(
+            &image,
+            &Frame {
+                skew: -frame.skew,
+                ..frame
+            },
+        ));
+
+        assert!(
+            deskewed * 2.0 < flipped,
+            "the correct rotation left {deskewed} clear film and the wrong one \
+             {flipped}; they should differ substantially"
+        );
+        assert!(
+            deskewed < 0.05,
+            "deskew left {deskewed} of the frame as film"
+        );
+    }
+
+    #[test]
+    fn an_untilted_frame_cropped_from_a_tilted_image_still_reads_as_picture() {
+        // Not every scan needs deskewing; this pins that a frame found with a tiny
+        // tilt still crops to the picture.
+        let image = scan_with_frame(240, 240, [-90.0, -70.0, 90.0, 70.0], 0.0);
+        let frame = find(&image).expect("a frame");
+        let cropped = apply(&image, &frame);
+        assert!(clear_film_share(&cropped) < 0.02);
+    }
+
+    #[test]
+    fn an_empty_frame_leaves_the_image_alone() {
+        let image = scan_with_frame(64, 48, [-10.0, -10.0, 10.0, 10.0], 0.0);
+        let empty = Frame {
+            center: [32.0, 24.0],
+            size: [0.0, 0.0],
+            skew: 0.0,
+        };
+        let result = apply(&image, &empty);
+        assert_eq!((result.width, result.height), (64, 48));
     }
 }

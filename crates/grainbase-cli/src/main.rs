@@ -31,6 +31,13 @@ struct Cli {
     /// Calibration profile to apply. Without one, neutral defaults are used.
     #[arg(long)]
     profile: Option<PathBuf>,
+
+    /// Do not crop to the film frame.
+    ///
+    /// Cropping is a judgement, so it can be switched off. Sources are never
+    /// modified, so this only changes what the output contains.
+    #[arg(long)]
+    no_crop: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -63,6 +70,7 @@ fn main() -> ExitCode {
         output: cli.out,
         mode: cli.mode.into(),
         settings,
+        crop: !cli.no_crop,
     });
 
     println!(
