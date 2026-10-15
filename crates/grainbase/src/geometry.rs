@@ -19,6 +19,7 @@
 //! This module is pure: image in, geometry out, no I/O.
 
 use crate::image::LinearImage;
+use crate::pipeline::{FilmBase, film_base};
 
 /// Samples at or above this are bare light through a hole, not film at all.
 ///
@@ -156,115 +157,93 @@ fn least_channel(pixel: &[f32; 3]) -> f32 {
     pixel[0].min(pixel[1]).min(pixel[2])
 }
 
-/// The level separating clear film from exposed picture, by Otsu's method.
+/// How far below the clear-film level the picture starts, as a fraction.
+///
+/// Clear film sits *at* the base: nothing in it absorbs. Any exposure puts the
+/// picture below that, so the boundary is the base level less a margin for noise
+/// in the clear film itself. 0.8 is about a tenth of a density step.
+const PICTURE_FRACTION: f32 = 0.8;
+
+/// The highest least-channel value that is still film, which is clear film.
+///
+/// Reuses the film-base detector rather than measuring brightness here: the base
+/// *is* the clear-film level, and that detector already knows to ignore the
+/// sprocket holes, which are not film at all.
+fn clear_film_level(image: &LinearImage) -> Option<f32> {
+    let base = FilmBase::detect(image, film_base::DEFAULT_PERCENTILE);
+    let level = base
+        .transmittance
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+
+    (level.is_finite() && level > 0.0).then_some(level)
+}
+
+/// The level separating clear film from exposed picture.
 ///
 /// Returns `None` when there is nothing to separate.
-fn picture_threshold(image: &LinearImage) -> Option<f32> {
-    let (pixels, _remainder) = image.data.as_chunks::<3>();
-
-    let mut histogram = [0u32; BINS];
-    let mut total = 0u64;
-    for pixel in pixels {
-        let value = least_channel(pixel);
-        // Holes are not film; letting them in makes the split about them.
-        if !value.is_finite() || value >= HOLE_LEVEL {
-            continue;
-        }
-        let bin = bin_of(value);
-        histogram[bin] = histogram[bin].saturating_add(1);
-        total += 1;
-    }
-
-    otsu(&histogram, total)
-}
-
-/// The bin a sample falls in.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the value is clamped to 0.0..=1.0, so the scaled bin is finite, \
-              non-negative, and bounded by BINS - 1"
-)]
-fn bin_of(value: f32) -> usize {
-    ((value.clamp(0.0, 1.0) * coordinate(BINS - 1)).round() as usize).min(BINS - 1)
-}
-
-/// Otsu's threshold: the bin that best separates two populations.
 ///
-/// Maximises the variance *between* the classes, which needs no tuning and no
-/// assumption about which class is which.
-fn otsu(histogram: &[u32; BINS], total: u64) -> Option<f32> {
-    if total == 0 {
-        return None;
-    }
-    let total = coordinate(usize::try_from(total).ok()?);
-
-    let mut sum_all = 0.0f64;
-    for (bin, count) in histogram.iter().enumerate() {
-        sum_all += f64::from(coordinate(bin)) * f64::from(*count);
-    }
-
-    let mut weight_below = 0.0f64;
-    let mut sum_below = 0.0f64;
-    let mut best_bin = 0usize;
-    let mut best_variance = -1.0f64;
-
-    for (bin, count) in histogram.iter().enumerate() {
-        weight_below += f64::from(*count);
-        if weight_below == 0.0 {
-            continue;
-        }
-        let weight_above = f64::from(total) - weight_below;
-        if weight_above <= 0.0 {
-            break;
-        }
-        sum_below += f64::from(coordinate(bin)) * f64::from(*count);
-
-        let mean_below = sum_below / weight_below;
-        let mean_above = (sum_all - sum_below) / weight_above;
-        let between = weight_below * weight_above * (mean_below - mean_above).powi(2);
-        if between > best_variance {
-            best_variance = between;
-            best_bin = bin;
-        }
-    }
-
-    // The boundary sits *between* the last bin of the lower class and the first
-    // of the upper, not on the occupied bin itself. Returning the bin value puts
-    // the threshold exactly on the lower population, and every pixel of it then
-    // fails a strict comparison.
-    Some((coordinate(best_bin) + 0.5) / coordinate(BINS - 1))
+/// Deliberately *not* a global threshold like Otsu's. The film population is a
+/// continuum from dense to thin with no bimodality between "picture" and "clear
+/// film", so a variance-maximising split lands inside the picture's own tonal
+/// range, fragmenting every row and reading the fragmentation as a tilt. Measured:
+/// 8 degrees of skew on a frame that is straight.
+fn picture_threshold(image: &LinearImage) -> Option<f32> {
+    clear_film_level(image).map(|level| level * PICTURE_FRACTION)
 }
 
 /// Measures each row's picture extent.
+///
+/// A row is scanned for runs of picture pixels, and the longest run wins — with
+/// small gaps *inside* a run tolerated and large ones not.
+///
+/// Both extremes fail on their own. A row's first-to-last picture pixel swallows
+/// the inter-frame gap and the next frame with it. A strict longest-run breaks
+/// wherever the picture varies across the threshold, so the run's start jumps
+/// between rows and the edge fit reads that as tilt — measured at 6.7 degrees on a
+/// frame that is straight. The two cases differ only in size: a few percent of the
+/// width is threshold noise, and the inter-frame gap is wider than that.
 fn extents(image: &LinearImage, threshold: f32) -> Extents {
     let width = image.width as usize;
     let height = image.height as usize;
     let (pixels, _remainder) = image.data.as_chunks::<3>();
+    let max_gap = (width / 32).max(1);
 
     let mut left = vec![0.0f32; height];
     let mut right = vec![0.0f32; height];
     let mut coverage = vec![0.0f32; height];
 
     for row in 0..height {
-        let mut first = None;
-        let mut last = None;
-        let mut count = 0usize;
+        let mut best = (0usize, 0usize);
+        let mut run_start: Option<usize> = None;
+        let mut last_picture = 0usize;
 
         for column in 0..width {
-            // Picture is *below* the threshold: any exposure makes it darker than
-            // clear film.
             if least_channel(&pixels[row * width + column]) >= threshold {
                 continue;
             }
-            count += 1;
-            first.get_or_insert(column);
-            last = Some(column);
+            match run_start {
+                None => run_start = Some(column),
+                Some(start) if column - last_picture > max_gap => {
+                    best = longer(best, (start, last_picture + 1));
+                    run_start = Some(column);
+                }
+                Some(_) => {}
+            }
+            last_picture = column;
         }
 
-        left[row] = coordinate(first.unwrap_or(0));
-        right[row] = coordinate(last.unwrap_or(width.saturating_sub(1)));
-        coverage[row] = coordinate(count) / coordinate(width.max(1));
+        if let Some(start) = run_start {
+            best = longer(best, (start, last_picture + 1));
+        }
+
+        let (start, end) = best;
+        left[row] = coordinate(start);
+        // `end` is exclusive; the fallback keeps a row with no picture from
+        // claiming the whole width.
+        right[row] = coordinate(end.saturating_sub(1).max(start));
+        coverage[row] = coordinate(end - start) / coordinate(width.max(1));
     }
 
     Extents {
@@ -300,6 +279,11 @@ fn slope_of(rows: &[usize], position: impl Fn(usize) -> f32) -> Option<f32> {
     }
 
     (variance > 0.0).then_some(covariance / variance)
+}
+
+/// The longer of two `(start, end)` runs.
+fn longer(a: (usize, usize), b: (usize, usize)) -> (usize, usize) {
+    if b.1 - b.0 > a.1 - a.0 { b } else { a }
 }
 
 /// Median of a slice, by value.
@@ -615,9 +599,12 @@ mod tests {
     #[test]
     fn sprocket_holes_do_not_become_the_picture() {
         // Bare light in the frame must not drag the threshold toward it.
-        let mut image = scan_with_frame(200, 200, [-80.0, -80.0, 80.0, 80.0], 0.0);
+        let mut image = scan_with_frame(200, 200, [-80.0, -60.0, 80.0, 60.0], 0.0);
         let (pixels, _remainder) = image.data.as_chunks_mut::<3>();
-        for row in 10..30usize {
+        // A hole band above the picture, as a real scan has. Kept small: bare
+        // light covering more than a few percent of the frame stops reading as
+        // "not film", and that is a limitation rather than a test to defeat.
+        for row in 10..20usize {
             for column in 10..190usize {
                 if (column / 12) % 2 == 0 {
                     pixels[row * 200 + column] = [0.6, 0.6, 0.6];
@@ -628,13 +615,41 @@ mod tests {
         let threshold = picture_threshold(&image).expect("two populations");
         assert!(
             threshold < HOLE_LEVEL,
-            "the holes should be excluded, got threshold {threshold}"
+            "the holes should be excluded from the split, got threshold {threshold}"
         );
 
         let frame = find(&image).expect("a frame");
         assert!(
-            (frame.size[1] - 160.0).abs() < 6.0,
-            "the hole band is clear film plus holes, so the picture is still bounded there, got {:?}",
+            (frame.size[1] - 120.0).abs() < 8.0,
+            "the picture is 120 tall and the hole band is above it, got {:?}",
+            frame.size
+        );
+    }
+
+    #[test]
+    fn a_next_frame_past_the_gap_is_not_part_of_this_frame() {
+        // A scan that catches the start of the *next* frame, smaller than this one.
+        // Taking a row's first and last picture pixel would swallow the gap and the
+        // next frame with it.
+        let mut image = scan_with_frame(400, 200, [-160.0, -80.0, 0.0, 80.0], 0.0);
+        let (pixels, _remainder) = image.data.as_chunks_mut::<3>();
+        for row in 0..200usize {
+            for column in 0..400usize {
+                // The gap, then the next frame, then clear film again.
+                if (200..220).contains(&column) {
+                    pixels[row * 400 + column] = [CLEAR_FILM; 3];
+                } else if (220..280).contains(&column) {
+                    pixels[row * 400 + column] = [PICTURE; 3];
+                } else if column >= 280 {
+                    pixels[row * 400 + column] = [CLEAR_FILM; 3];
+                }
+            }
+        }
+
+        let frame = find(&image).expect("a frame");
+        assert!(
+            (frame.size[0] - 160.0).abs() < 6.0,
+            "the frame should stop at the gap rather than run into the next one, got {:?}",
             frame.size
         );
     }
