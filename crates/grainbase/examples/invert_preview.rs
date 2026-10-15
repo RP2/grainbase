@@ -9,9 +9,9 @@
 //! `encode` unit writes 16-bit color-managed output, and the `look` unit owns
 //! grading. Keep it around for eyeballing conversion changes before those land.
 
-use grainbase::LinearImage;
 use grainbase::decode;
 use grainbase::pipeline::{self, FilmBase, Settings, film_base, percentile};
+use grainbase::{LinearImage, encode};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
@@ -65,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     trace_tail(&negative);
 
-    to_rgb8(&positive).save(output)?;
+    encode::encode(&positive, output)?;
     println!("wrote {output}");
     Ok(())
 }
@@ -223,34 +223,4 @@ fn stats(samples: &[f32]) -> (f32, f32, f32) {
     let mut values = samples.to_vec();
     let median = percentile::value_at(&mut values, 50.0).unwrap_or(f32::NAN);
     (min, median, max)
-}
-
-/// Encodes linear light for display: sRGB transfer, then 8-bit quantisation.
-fn to_rgb8(image: &LinearImage) -> image::RgbImage {
-    let mut buffer = image::RgbImage::new(image.width, image.height);
-    for (pixel, sample) in buffer.pixels_mut().zip(image.data.as_chunks::<3>().0) {
-        *pixel = image::Rgb([
-            to_srgb8(sample[0]),
-            to_srgb8(sample[1]),
-            to_srgb8(sample[2]),
-        ]);
-    }
-    buffer
-}
-
-/// The IEC 61966-2-1 sRGB transfer function, then a byte.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the encoded value is clamped to 0.0..=1.0 before scaling, so the \
-              byte is in range"
-)]
-fn to_srgb8(linear: f32) -> u8 {
-    let clamped = linear.clamp(0.0, 1.0);
-    let encoded = if clamped <= 0.003_130_8 {
-        12.92 * clamped
-    } else {
-        1.055 * clamped.powf(1.0 / 2.4) - 0.055
-    };
-    (encoded * 255.0).round() as u8
 }
