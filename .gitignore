@@ -4,7 +4,7 @@
 # ---------------------------------------------------------------------------
 # This repository is PUBLIC. Nothing below may ever be committed here.
 # scripts/leak-guard.sh enforces the same rules on staged content; this file
-# is the first line of defence so mistakes are never staged in the first place.
+# is the first line of defense so mistakes are never staged in the first place.
 # ---------------------------------------------------------------------------
 
 # Camera RAW and editable image files. The photographer's originals and

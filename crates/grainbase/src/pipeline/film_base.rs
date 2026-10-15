@@ -9,7 +9,7 @@
 //! holes are gaps, and the light table or the holder can show around the frame.
 //! Those are brighter than the orange-masked base, because no mask is in the
 //! way. Measure them and you have measured the light source, which shows up as a
-//! colour cast no amount of grading will remove, because the mask is still
+//! color cast no amount of grading will remove, because the mask is still
 //! there, unneutralised.
 
 use crate::image::LinearImage;
@@ -21,7 +21,7 @@ use super::percentile;
 /// Used when the frame gives no reason to think anything bright is not film.
 pub const DEFAULT_PERCENTILE: f32 = 99.5;
 
-/// Ratio between neighbouring samples in the sorted upper tail that marks the
+/// Ratio between neighboring samples in the sorted upper tail that marks the
 /// boundary between two populations.
 ///
 /// A sprocket hole against clear film is a step, not a slope.
@@ -63,7 +63,7 @@ impl FilmBase {
 
     /// Estimates the base from a single image.
     ///
-    /// Each channel is measured independently, so a base with a colour cast (an
+    /// Each channel is measured independently, so a base with a color cast (an
     /// orange mask) is measured as such rather than averaged into neutrality.
     ///
     /// An image with no pixels has no base to measure; this returns
@@ -118,11 +118,11 @@ struct Cliff {
 
 /// Finds the steepest segment of the sorted upper tail.
 ///
-/// Compares values a fixed *rank distance* apart rather than neighbours. A sharp
+/// Compares values a fixed *rank distance* apart rather than neighbors. A sharp
 /// transition squeezed into a narrow slice of the distribution is spread across
-/// many sorted samples, so each neighbouring step is tiny and a neighbour test
+/// many sorted samples, so each neighboring step is tiny and a neighbor test
 /// cannot see it. On a real scan the film/non-film step covered 0.05% of samples:
-/// a 3.3x change in value, a 1.009x change between neighbours.
+/// a 3.3x change in value, a 1.009x change between neighbors.
 fn bright_cliff(samples: &[f32]) -> Option<Cliff> {
     let len = samples.len();
     let last = len.checked_sub(1)?;

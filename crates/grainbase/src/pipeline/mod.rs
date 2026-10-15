@@ -4,7 +4,7 @@
 //! so results can be golden-tested. This is the primary seam for conversion
 //! quality.
 //!
-//! A colour negative is a positive printed through a mask. Its film base is the
+//! A color negative is a positive printed through a mask. Its film base is the
 //! unexposed, clear part, and it is the *brightest* thing in a scan. In the
 //! finished positive that same area is black, because unexposed film means no
 //! exposure. So the model is:
@@ -30,7 +30,7 @@ use crate::image::LinearImage;
 ///
 /// A real negative's density range depends on the film stock, the exposure, and
 /// the capture. This is a fixed, deterministic starting point; the grade and
-/// look units are where per-frame and per-stock behaviour belongs.
+/// look units are where per-frame and per-stock behavior belongs.
 pub const DEFAULT_DENSITY_MAX: f32 = 2.0;
 
 /// Tuning for the conversion core.
@@ -125,7 +125,7 @@ mod tests {
     }
 
     #[test]
-    fn a_level_one_density_below_the_base_becomes_mid_grey() {
+    fn a_level_one_density_below_the_base_becomes_mid_gray() {
         // density = -log10(0.1) = 1.0, and density_max = 2.0.
         let source = image(&[[0.1, 0.1, 0.1]]);
         let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings());
@@ -148,7 +148,7 @@ mod tests {
     fn an_orange_mask_becomes_neutral_black() {
         // A strongly masked base, and a patch that is the base scaled by a
         // constant: the same neutral density in every channel, which must come
-        // out as neutral grey rather than orange.
+        // out as neutral gray rather than orange.
         let base_transmittance = [0.90, 0.60, 0.25];
         let scaled = base_transmittance.map(|channel| channel * 0.5);
 

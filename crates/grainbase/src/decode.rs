@@ -14,7 +14,7 @@ use crate::image::{LinearImage, SampleCountMismatch};
 /// Development steps handed to rawler.
 ///
 /// `WhiteBalance`, `Calibrate`, and `SRgb` are deliberately excluded. The first
-/// two apply the camera's white balance and its camera-to-output colour matrix;
+/// two apply the camera's white balance and its camera-to-output color matrix;
 /// the third applies sRGB gamma. Film-base neutralisation needs the orange mask
 /// to stay a per-channel scale, which only holds *before* any rendering is baked
 /// in, so the decoder stops at demosaicing and cropping and hands back
@@ -30,7 +30,7 @@ const DEVELOP_STEPS: &[ProcessingStep] = &[
 /// A decoded scan: pixels plus the capture metadata that travels with them.
 #[derive(Debug, Clone)]
 pub struct Scan {
-    /// Linear-light RGB in the camera's own colour space.
+    /// Linear-light RGB in the camera's own color space.
     pub linear: LinearImage,
     /// Capture metadata read from the file.
     pub meta: ScanMeta,
@@ -104,7 +104,7 @@ impl std::error::Error for Error {
 
 /// Decodes one camera RAW scan into linear-light RGB.
 ///
-/// No white balance, colour matrix, or gamma is applied: the development steps
+/// No white balance, color matrix, or gamma is applied: the development steps
 /// stop at demosaicing and cropping, so the result is camera-space linear
 /// light, ready for film-base neutralisation.
 ///
@@ -167,7 +167,7 @@ pub fn decode(path: impl AsRef<Path>) -> Result<Scan, Error> {
 /// deliberately rather than having it applied silently. Frame-derived orientation
 /// is the real answer; see the orientation ticket.
 ///
-/// Unrecognised values leave the image alone.
+/// Unrecognized values leave the image alone.
 #[must_use]
 pub fn apply_exif_orientation(image: LinearImage, orientation: Option<u16>) -> LinearImage {
     let Some(value) = orientation else {
@@ -216,8 +216,8 @@ fn to_linear(intermediate: Intermediate, meta: &ScanMeta) -> Result<LinearImage,
             let height = dimension(image.height, "height")?;
             LinearImage::new(width, height, image.into_flatten()).map_err(Error::Malformed)
         }
-        // Reached only for a monochrome sensor, or a four-colour CFA. Neither is
-        // a colour-negative scan; say so rather than guessing at a conversion.
+        // Reached only for a monochrome sensor, or a four-color CFA. Neither is
+        // a color-negative scan; say so rather than guessing at a conversion.
         Intermediate::Monochrome(_) => Err(Error::Unsupported {
             make: meta.make.clone(),
             model: meta.model.clone(),
@@ -226,7 +226,7 @@ fn to_linear(intermediate: Intermediate, meta: &ScanMeta) -> Result<LinearImage,
         Intermediate::FourColor(_) => Err(Error::Unsupported {
             make: meta.make.clone(),
             model: meta.model.clone(),
-            detail: "four-colour sensor pattern".to_owned(),
+            detail: "four-color sensor pattern".to_owned(),
         }),
     }
 }

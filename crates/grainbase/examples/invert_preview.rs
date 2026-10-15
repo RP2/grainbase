@@ -6,7 +6,7 @@
 //!
 //! This is an inspection aid, not the engine's encoder. It applies display gamma
 //! and 8-bit quantisation, neither of which belongs to the engine: the real
-//! `encode` unit writes 16-bit colour-managed output, and the `look` unit owns
+//! `encode` unit writes 16-bit color-managed output, and the `look` unit owns
 //! grading. Keep it around for eyeballing conversion changes before those land.
 
 use grainbase::LinearImage;
@@ -14,7 +14,7 @@ use grainbase::decode;
 use grainbase::pipeline::{self, FilmBase, Settings, film_base, percentile};
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 
-/// Decodes with rawler's white balance and camera colour matrix included, which
+/// Decodes with rawler's white balance and camera color matrix included, which
 /// `decode` omits on purpose. Experiment only — see the `--calibrated` flag.
 fn decode_calibrated(path: &str) -> Result<LinearImage, Box<dyn std::error::Error>> {
     let raw = rawler::decode_file(path)?;
@@ -62,10 +62,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut negative = if calibrated {
-        // EXPERIMENT: rawler's white balance and camera-to-output colour matrix,
+        // EXPERIMENT: rawler's white balance and camera-to-output color matrix,
         // which `decode` deliberately omits. Kept to measure what the matrix buys
         // before changing the engine's decision.
-        println!("using rawler's white balance and colour matrix");
+        println!("using rawler's white balance and color matrix");
         decode_calibrated(input)?
     } else {
         let scan = decode::decode(input)?;
@@ -133,12 +133,12 @@ fn trace_tail(negative: &LinearImage) {
 /// are not film: sprocket holes, the light table, or the holder.
 ///
 /// Those are brighter than the orange-masked base, so if they are in frame the
-/// percentile lands on them and the "base" becomes the light source's colour.
-/// Measuring the centre only should land on film.
+/// percentile lands on them and the "base" becomes the light source's color.
+/// Measuring the center only should land on film.
 fn diagnose_base(negative: &LinearImage) {
     let full = FilmBase::detect(negative, film_base::DEFAULT_PERCENTILE);
-    let centre = FilmBase::detect(
-        &centre_fraction(negative, 0.5),
+    let center = FilmBase::detect(
+        &center_fraction(negative, 0.5),
         film_base::DEFAULT_PERCENTILE,
     );
 
@@ -155,8 +155,8 @@ fn diagnose_base(negative: &LinearImage) {
         full.transmittance[0], full.transmittance[1], full.transmittance[2]
     );
     println!(
-        "  centre 50% base  R {:.4}  G {:.4}  B {:.4}",
-        centre.transmittance[0], centre.transmittance[1], centre.transmittance[2]
+        "  center 50% base  R {:.4}  G {:.4}  B {:.4}",
+        center.transmittance[0], center.transmittance[1], center.transmittance[2]
     );
 
     // If the two disagree in *ratio*, the full-frame estimate is not looking at
@@ -167,10 +167,10 @@ fn diagnose_base(negative: &LinearImage) {
             base.transmittance[2] / base.transmittance[1].max(f32::MIN_POSITIVE),
         ]
     };
-    let (full_ratio, centre_ratio) = (ratio(&full), ratio(&centre));
+    let (full_ratio, center_ratio) = (ratio(&full), ratio(&center));
     println!(
-        "  R/G B/G  full {:.3} {:.3}   centre {:.3} {:.3}",
-        full_ratio[0], full_ratio[1], centre_ratio[0], centre_ratio[1]
+        "  R/G B/G  full {:.3} {:.3}   center {:.3} {:.3}",
+        full_ratio[0], full_ratio[1], center_ratio[0], center_ratio[1]
     );
 }
 
@@ -182,7 +182,7 @@ fn diagnose_base(negative: &LinearImage) {
     reason = "a diagnostic crop: the axis lengths of a real scan are far below \
               f32's exact-integer range, and fraction is a small positive"
 )]
-fn centre_fraction(image: &LinearImage, fraction: f32) -> LinearImage {
+fn center_fraction(image: &LinearImage, fraction: f32) -> LinearImage {
     let width = image.width as usize;
     let height = image.height as usize;
     let crop_width = ((width as f32 * fraction) as usize).min(width);
@@ -208,7 +208,7 @@ fn centre_fraction(image: &LinearImage, fraction: f32) -> LinearImage {
 
 /// Prints the numbers that say whether the conversion did anything sensible.
 ///
-/// The per-channel spread is the one that matters for colour: the film base is
+/// The per-channel spread is the one that matters for color: the film base is
 /// divided out per channel, so a *neutral* frame should come back with three
 /// channel means that agree. A persistent spread is a cast, and this is how much.
 fn report(label: &str, image: &LinearImage, base: &FilmBase) {
