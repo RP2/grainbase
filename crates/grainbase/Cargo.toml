@@ -13,3 +13,4 @@ workspace = true
 kamadak-exif = "0.6.1"
 png = "0.18.1"
 rawler = "0.8.0"
+rayon = "1.12.0"

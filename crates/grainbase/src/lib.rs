@@ -7,6 +7,7 @@
 //! tests cross the same seams its callers do.
 
 pub mod decode;
+pub mod driver;
 pub mod encode;
 pub mod image;
 pub mod pipeline;
