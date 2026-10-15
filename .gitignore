@@ -1,1 +1,38 @@
+# /target
 /target
+
+# ---------------------------------------------------------------------------
+# This repository is PUBLIC. Nothing below may ever be committed here.
+# scripts/leak-guard.sh enforces the same rules on staged content; this file
+# is the first line of defence so mistakes are never staged in the first place.
+# ---------------------------------------------------------------------------
+
+# Camera RAW and editable image files. The photographer's originals and
+# third-party lab scans live in the private sibling repo, never here.
+*.arw
+*.dng
+*.cr2
+*.cr3
+*.nef
+*.nrw
+*.rw2
+*.raf
+*.orf
+*.pef
+*.srw
+*.tif
+*.tiff
+*.psd
+
+# Private planning material: specification, plan, ADRs, glossary, design map,
+# strategy, market analysis.
+/docs/adr/
+/docs/specs/
+/docs/strategy/
+/docs/wayfinder/
+/CONTEXT.md
+
+# Local environment and tooling.
+.env
+.env.*
+!.env.example

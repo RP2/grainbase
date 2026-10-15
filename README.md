@@ -14,8 +14,4 @@ AGPL-3.0. See [`LICENSE`](LICENSE).
 ## Development
 
 The full `just check` is the one command to run before pushing — it runs formatting, clippy,
-tests, and a `-D warnings` doc build. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for prerequisites
-and the conventional-commit style.
-
-Specification, plan, architecture decisions, design map, and research live in a sibling private
-repository (`../grainbase-private`). See [`AGENTS.md`](AGENTS.md).
+tests, and a `-D warnings` doc build. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for prerequisites and the conventional-commit style.
