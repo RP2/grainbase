@@ -4,3 +4,24 @@ members = [
     "crates/grainbase",
     "crates/grainbase-cli",
 ]
+
+# Shared package metadata. Members inherit these so a single edit propagates.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+license = "AGPL-3.0-or-later"
+
+# Workspace-wide lints. Each crate must opt in with [lints] workspace = true
+# because Cargo does not inherit lints implicitly.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = "warn"
+
+# Internal crates are declared here so members depend on them by name and the
+# version is pinned. A bare `path` dependency is a wildcard and `cargo deny`
+# rejects it; the version also makes the crates publishable later.
+[workspace.dependencies]
+grainbase = { path = "crates/grainbase", version = "0.0.0" }

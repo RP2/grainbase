@@ -1,18 +1,95 @@
 name: ci
 
+# Triggers: every push to main, every pull request (any branch).
 on:
   push:
+    branches: [main]
   pull_request:
 
+# Workflow-scoped defaults: lock permissions down to the read-only floor,
+# then opt jobs back in only when they need to write (none of these do).
+permissions: {}
+
+# Cancel superseded runs on the same ref. For pull requests github.head_ref
+# is set; for ad-hoc builds fall back to the run id, which is already unique.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+# Jobs run in declared order. Each job is independent so failures surface
+# earliest rather than after a long fan-out.
 jobs:
-  ci:
+  # --- 1. Formatting -----------------------------------------------------------
+  fmt:
+    name: fmt
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # --- 2. Clippy ---------------------------------------------------------------
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+        with:
+          # The action's `build-warnings: deny` default promotes any rustc
+          # warning to a build error. Crucially we do NOT add `-- -D warnings`
+          # on the clippy line — `-D warnings` invalidates Cargo's build cache.
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --all-features
+
+  # --- 3. Tests ---------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - run: cargo test --workspace --locked
+
+  # --- 4. Docs ----------------------------------------------------------------
+  docs:
+    name: doc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - run: cargo doc --workspace --no-deps --all-features
+
+  # --- 5. MSRV ----------------------------------------------------------------
+  # `cargo hack check --rust-version` validates that every target in the
+  # workspace compiles against the MSRV declared in `rust-toolchain.toml`
+  # (the `rust-version` field set on the workspace packages).
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2.0.0
+      - name: Install cargo-hack
+        uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-hack
+      - run: cargo hack check --rust-version --workspace --all-targets --ignore-private

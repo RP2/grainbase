@@ -1,0 +1,47 @@
+name: codeql
+
+# Push to main, every PR, and a weekly refresh so newly disclosed queries
+# and updated packs are applied without an explicit code change.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Mondays 14:20 UTC — staggered away from the cargo-deny weekly run
+    # to avoid hammering the actions minutes budget.
+    - cron: "20 14 * * 1"
+
+permissions: {}
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    # security-events: write is required so the action can upload SARIF.
+    # contents: read is the minimum for checkout.
+    permissions:
+      security-events: write
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Rust. CodeQL supports `build-mode: none` for Rust out of the box
+          # (along with C/C++, C#, Java) — confirmed via:
+          #   https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning
+          #   https://docs.github.com/en/code-security/how-tos/find-and-fix-code-vulnerabilities/manage-your-configuration/codeql-for-compiled-languages
+          # The init action uses the plural `languages` input per
+          # codeql-action/init/action.yml (v4.39.0).
+          - language: rust
+            build-mode: none
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@48870fdd6b42ee6474ec4207209ff87609271a5e # v4.39.0
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@48870fdd6b42ee6474ec4207209ff87609271a5e # v4.39.0
+        with:
+          category: "/language:${{ matrix.language }}"

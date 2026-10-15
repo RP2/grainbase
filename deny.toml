@@ -1,0 +1,82 @@
+# cargo-deny configuration for grainbase.
+# Reference schema: https://embarkstudios.github.io/cargo-deny/
+
+# ---------------------------------------------------------------------------
+# [advisories] — RustSec vulnerability database.
+# ---------------------------------------------------------------------------
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Transitive advisories are reported by default; keep that surface visible.
+ignore = []
+
+# ---------------------------------------------------------------------------
+# [licenses] — deny by default, allow only the listed set.
+# The list is permissive but bounded: every crate must declare an explicit,
+# SPDX-style license the way cargo-deny can match. Add new exceptions here,
+# not as blanket ignores.
+# ---------------------------------------------------------------------------
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "0BSD",
+    "Zlib",
+    "CC0-1.0",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "AGPL-3.0",
+    "AGPL-3.0-or-later",
+]
+confidence-threshold = 0.8
+# Warn on allow-listed-but-unused licenses so we can prune the list over time.
+unused-allowed-license = "warn"
+
+# Workspace members are not published and therefore have no published SPDX
+# license string for cargo-deny to match. Suppress the per-crate check.
+[licenses.private]
+ignore = true
+
+# Scoped exception for the LGPL-2.1 dependency planned for the next unit:
+# `rawler` (ADR 0001). Deliberately commented out until it is actually in the
+# dependency graph — an exception for an absent crate cannot be verified, and
+# cargo-deny flags it as `license-exception-not-encountered`.
+#
+# TODO(U1): when adding rawler, uncomment this and set the SPDX id to exactly
+# what rawler declares. cargo-deny matches GNU identifiers pedantically, so
+# `LGPL-2.1-only` and `LGPL-2.1-or-later` are different licenses and the bare
+# `LGPL-2.1` form is deprecated. Check rawler's Cargo.toml before enabling.
+#
+# [[licenses.exceptions]]
+# crate = "rawler"
+# allow = ["LGPL-2.1-only"]
+
+# ---------------------------------------------------------------------------
+# [bans] — duplicate and wildcard version control.
+# ---------------------------------------------------------------------------
+[bans]
+multiple-versions = "warn"   # Promote to "deny" once the tree is unique.
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+deny = []
+skip = []
+skip-tree = []
+
+# ---------------------------------------------------------------------------
+# [sources] — only first-party code and crates.io.
+# ---------------------------------------------------------------------------
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

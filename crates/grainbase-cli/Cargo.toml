@@ -1,13 +1,17 @@
 [package]
 name = "grainbase-cli"
-version = "0.0.0"
-edition = "2024"
 description = "Command-line adapter for the grainbase film-negative conversion engine."
-license = "AGPL-3.0-or-later"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "grainbase"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
-grainbase = { path = "../grainbase" }
+grainbase = { workspace = true }

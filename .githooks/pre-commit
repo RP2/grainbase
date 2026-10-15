@@ -1,0 +1,10 @@
+#!/bin/sh
+# pre-commit hook: keep formatting consistent.
+# Fast: one cargo invocation per commit.
+set -e
+
+# Resolve to the repo root so this works from any subdirectory.
+GIT_ROOT="$(git rev-parse --show-toplevel)"
+cd "$GIT_ROOT"
+
+cargo fmt --all -- --check

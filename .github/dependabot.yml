@@ -1,0 +1,28 @@
+version: 2
+
+# Keep it minimal: weekly digest of Cargo and GitHub-Actions updates.
+# Cargo updates for non-major versions are grouped into a single PR so
+# review load stays bounded; major upgrades arrive individually.
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    # Roll the whole workspace forward in one PR when possible.
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      minor-and-patch:
+        patterns: ["*"]
+        update-types:
+          - "minor"
+          - "patch"

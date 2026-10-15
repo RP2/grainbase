@@ -1,0 +1,36 @@
+name: supply-chain
+
+# Supply-chain and license scanning. `cargo deny check` runs:
+#  - on every push to main,
+#  - on PRs that touch Cargo manifests or the lockfile,
+#  - and on a weekly cadence so advisories and license changes are caught
+#    even when no code changes.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "**/Cargo.lock"
+      - "deny.toml"
+  schedule:
+    # Tuesdays 06:30 UTC — a day after CodeQL and well before peak hours.
+    - cron: "30 6 * * 2"
+
+permissions: {}
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The action wraps a Docker image with cargo-deny pre-installed;
+      # no rust-toolchain step is required.
+      - uses: EmbarkStudios/cargo-deny-action@c3bbe7e4e3f7baeee1a3dd9aec0a3b2aded580fb # v2.1.1
+        with:
+          arguments: ""
+          command-arguments: ""
+          log-level: warn
