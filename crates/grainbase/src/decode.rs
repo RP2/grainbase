@@ -13,24 +13,33 @@ use crate::image::{LinearImage, SampleCountMismatch};
 
 /// Development steps handed to rawler.
 ///
-/// `WhiteBalance`, `Calibrate`, and `SRgb` are deliberately excluded. The first
-/// two apply the camera's white balance and its camera-to-output color matrix;
-/// the third applies sRGB gamma. Film-base neutralisation needs the orange mask
-/// to stay a per-channel scale, which only holds *before* any rendering is baked
-/// in, so the decoder stops at demosaicing and cropping and hands back
-/// camera-space linear light.
+/// `SRgb` is the only default step excluded: it applies sRGB gamma, and the
+/// pipeline needs linear light.
+///
+/// `WhiteBalance` and `Calibrate` are *included*. The camera matrix describes the
+/// sensor's response to scene light, and a negative's per-channel transmittance is
+/// linear in that light, so the matrix belongs before inversion — this is what
+/// darktable's negadoctor and the abpy method both do. Measured on the a6000
+/// fixture it also produces the physically correct orange-mask signature (base
+/// red highest, blue lowest), which camera space does not.
+///
+/// Including it does not weaken film-base neutralisation: a linear transform maps
+/// the mask, which is constant across the frame, to another per-channel constant,
+/// so dividing it out still works.
 const DEVELOP_STEPS: &[ProcessingStep] = &[
     ProcessingStep::Rescale,
     ProcessingStep::Demosaic,
     ProcessingStep::FujiRotate,
     ProcessingStep::CropActiveArea,
+    ProcessingStep::WhiteBalance,
+    ProcessingStep::Calibrate,
     ProcessingStep::CropDefault,
 ];
 
 /// A decoded scan: pixels plus the capture metadata that travels with them.
 #[derive(Debug, Clone)]
 pub struct Scan {
-    /// Linear-light RGB in the camera's own color space.
+    /// Linear-light RGB in the camera's white-balanced color space.
     pub linear: LinearImage,
     /// Capture metadata read from the file.
     pub meta: ScanMeta,
@@ -102,11 +111,11 @@ impl std::error::Error for Error {
     }
 }
 
-/// Decodes one camera RAW scan into linear-light RGB.
+/// Decodes one camera RAW scan into linear-light sRGB.
 ///
-/// No white balance, color matrix, or gamma is applied: the development steps
-/// stop at demosaicing and cropping, so the result is camera-space linear
-/// light, ready for film-base neutralisation.
+/// The camera's white balance and color matrix are applied, so the result is in a
+/// defined color space and can be tagged honestly on output. No gamma is applied:
+/// the result is linear light, ready for film-base neutralisation.
 ///
 /// # Errors
 ///

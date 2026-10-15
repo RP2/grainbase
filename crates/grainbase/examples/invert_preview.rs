@@ -12,73 +12,34 @@
 use grainbase::LinearImage;
 use grainbase::decode;
 use grainbase::pipeline::{self, FilmBase, Settings, film_base, percentile};
-use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
-
-/// Decodes with rawler's white balance and camera color matrix included, which
-/// `decode` omits on purpose. Experiment only — see the `--calibrated` flag.
-fn decode_calibrated(path: &str) -> Result<LinearImage, Box<dyn std::error::Error>> {
-    let raw = rawler::decode_file(path)?;
-    let steps = [
-        ProcessingStep::Rescale,
-        ProcessingStep::Demosaic,
-        ProcessingStep::FujiRotate,
-        ProcessingStep::CropActiveArea,
-        ProcessingStep::WhiteBalance,
-        ProcessingStep::Calibrate,
-        ProcessingStep::CropDefault,
-    ];
-    let developed = RawDevelop::new_with(&steps).develop_intermediate(&raw)?;
-
-    match developed {
-        Intermediate::ThreeColor(image) => {
-            let width = u32::try_from(image.width)?;
-            let height = u32::try_from(image.height)?;
-            Ok(LinearImage::new(width, height, image.into_flatten())?)
-        }
-        _ => Err("calibrated decode produced a non-three-channel image".into()),
-    }
-}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut positional = Vec::new();
     let mut flip_h = false;
     let mut flip_v = false;
-    let mut calibrated = false;
 
     for argument in std::env::args().skip(1) {
         match argument.as_str() {
             "--flip-h" => flip_h = true,
             "--flip-v" => flip_v = true,
-            "--calibrated" => calibrated = true,
             _ => positional.push(argument),
         }
     }
 
     let [input, output] = positional.as_slice() else {
-        return Err(
-            "usage: invert_preview <scan.raw> <out.png> [--flip-h] [--flip-v] [--calibrated]"
-                .into(),
-        );
+        return Err("usage: invert_preview <scan.raw> <out.png> [--flip-h] [--flip-v]".into());
     };
 
-    let mut negative = if calibrated {
-        // EXPERIMENT: rawler's white balance and camera-to-output color matrix,
-        // which `decode` deliberately omits. Kept to measure what the matrix buys
-        // before changing the engine's decision.
-        println!("using rawler's white balance and color matrix");
-        decode_calibrated(input)?
-    } else {
-        let scan = decode::decode(input)?;
-        println!(
-            "decoded {}x{} from {} {} (EXIF orientation {:?})",
-            scan.linear.width,
-            scan.linear.height,
-            scan.meta.make,
-            scan.meta.model,
-            scan.meta.orientation
-        );
-        scan.linear
-    };
+    let scan = decode::decode(input)?;
+    println!(
+        "decoded {}x{} from {} {} (EXIF orientation {:?})",
+        scan.linear.width,
+        scan.linear.height,
+        scan.meta.make,
+        scan.meta.model,
+        scan.meta.orientation
+    );
+    let mut negative = scan.linear;
 
     if flip_h {
         negative = negative.flipped_horizontal();

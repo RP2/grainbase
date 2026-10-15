@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-/// A linear-light RGB image in the camera's own color space.
+/// A linear-light RGB image in the camera's white-balanced color space.
 ///
 /// Samples are interleaved RGB `f32` values, `width * height * 3` of them.
 /// Straight out of decoding they are nominally in `0.0..=1.0`; later pipeline
