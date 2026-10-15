@@ -1,9 +1,12 @@
 //! Decoding a scan file into linear-light pixels.
 
 use std::fmt;
+use std::fs::File;
+use std::io::BufReader;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
+use rawler::decoders::Orientation;
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 
 use crate::image::{LinearImage, SampleCountMismatch};
@@ -43,6 +46,14 @@ pub struct ScanMeta {
     pub make: String,
     /// Camera model, as recorded in the file.
     pub model: String,
+    /// The EXIF orientation value (1-8) that was applied to the decoded pixels,
+    /// or `None` when the file carried no valid orientation tag.
+    ///
+    /// Recorded rather than swallowed because the tag describes how the *camera*
+    /// was held, which is not necessarily how the *film* should end up. A copy
+    /// rig can be inverted or rotated relative to the film, so a caller may need
+    /// to override this. See the orientation ticket.
+    pub orientation: Option<u16>,
 }
 
 /// Why a scan could not be decoded.
@@ -125,12 +136,13 @@ pub fn decode(path: impl AsRef<Path>) -> Result<Scan, Error> {
         Err(err) => return Err(Error::Failed(err.to_string())),
     };
 
+    let orientation = exif_orientation(path);
+
     let meta = ScanMeta {
         make: raw.make.clone(),
         model: raw.model.clone(),
+        orientation,
     };
-
-    let orientation = raw.orientation;
 
     let intermediate = catch_unwind(AssertUnwindSafe(|| {
         RawDevelop::new_with(DEVELOP_STEPS).develop_intermediate(&raw)
@@ -138,24 +150,31 @@ pub fn decode(path: impl AsRef<Path>) -> Result<Scan, Error> {
     .map_err(|_| Error::Panicked)?
     .map_err(|err| Error::Failed(err.to_string()))?;
 
-    let linear = orient(to_linear(intermediate, &meta)?, orientation);
+    let linear = to_linear(intermediate, &meta)?;
 
     Ok(Scan { linear, meta })
 }
 
-/// Applies the orientation recorded in the file.
+/// Applies an EXIF orientation value to a decoded image.
 ///
-/// A camera on a copy stand is commonly held inverted or rotated relative to the
-/// film, and the capture records that in its orientation tag. Ignoring the tag is
-/// why a scan can arrive upside down or mirrored. `rawler` parses it; applying it
-/// is the caller's job.
+/// Deliberately **not** applied by [`decode`]. The tag describes how the *camera*
+/// was held, which is not the same as how the *film* should end up: a copy-rig
+/// camera points down at the film, and an orientation sensor has no reliable "up"
+/// in that position, so it reports a meaningless value. On the maintainer's rig
+/// the tag says "rotate 270" while the frame is correctly landscape.
 ///
-/// The EXIF values that swap the axes are expressed here as a transpose followed
-/// by the flips, which is the order the tests pin down. `rawler`'s `to_flips`
-/// helper is not used anywhere else in that crate, so it does not define an order
-/// of its own.
-fn orient(image: LinearImage, orientation: rawler::decoders::Orientation) -> LinearImage {
-    let (transpose, flip_horizontal, flip_vertical) = orientation.to_flips();
+/// Kept here, tested, so a caller that knows its own rig can apply it
+/// deliberately rather than having it applied silently. Frame-derived orientation
+/// is the real answer; see the orientation ticket.
+///
+/// Unrecognised values leave the image alone.
+#[must_use]
+pub fn apply_exif_orientation(image: LinearImage, orientation: Option<u16>) -> LinearImage {
+    let Some(value) = orientation else {
+        return image;
+    };
+    let (transpose, flip_horizontal, flip_vertical) = Orientation::from_u16(value).to_flips();
+
     let mut oriented = image;
     if transpose {
         oriented = oriented.transposed();
@@ -167,6 +186,26 @@ fn orient(image: LinearImage, orientation: rawler::decoders::Orientation) -> Lin
         oriented = oriented.flipped_vertical();
     }
     oriented
+}
+
+/// The EXIF orientation value from the file, if it carries a valid one.
+///
+/// Read separately rather than taken from the decoded image: `rawler` parses EXIF
+/// but hardcodes `RawImage::orientation` to `Normal` with a `TODO fixme`, so that
+/// field is always `Normal` and cannot be trusted.
+fn exif_orientation(path: &Path) -> Option<u16> {
+    let file = File::open(path).ok()?;
+    let exif = exif::Reader::new()
+        .read_from_container(&mut BufReader::new(file))
+        .ok()?;
+    let value = exif
+        .get_field(exif::Tag::Orientation, exif::In::PRIMARY)?
+        .value
+        .get_uint(0)?;
+
+    // 1..=8 are the defined values; anything else is treated as absent rather
+    // than guessed at.
+    u16::try_from(value).ok().filter(|v| (1..=8).contains(v))
 }
 
 /// Converts rawler's develop output into the engine's image type.
@@ -254,58 +293,124 @@ mod tests {
     }
 
     #[test]
-    fn every_exif_orientation_is_handled() {
-        use rawler::decoders::Orientation;
-
+    fn every_exif_orientation_value_is_handled() {
         // Pinned so the transform order cannot drift. Each case is the
         // composition of rawler's flags: transpose, then flips.
         let cases = [
-            (Orientation::Normal, (3, 2), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            (
-                Orientation::HorizontalFlip,
-                (3, 2),
-                [3.0, 2.0, 1.0, 6.0, 5.0, 4.0],
-            ),
-            (
-                Orientation::Rotate180,
-                (3, 2),
-                [6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
-            ),
-            (
-                Orientation::VerticalFlip,
-                (3, 2),
-                [4.0, 5.0, 6.0, 1.0, 2.0, 3.0],
-            ),
+            (1u16, (3, 2), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            (2, (3, 2), [3.0, 2.0, 1.0, 6.0, 5.0, 4.0]),
+            (3, (3, 2), [6.0, 5.0, 4.0, 3.0, 2.0, 1.0]),
+            (4, (3, 2), [4.0, 5.0, 6.0, 1.0, 2.0, 3.0]),
         ];
 
-        for (orientation, (width, height), expected) in cases {
-            let oriented = orient(numbered(), orientation);
+        for (value, (width, height), expected) in cases {
+            let oriented = apply_exif_orientation(numbered(), Some(value));
             assert_eq!(
                 (oriented.width, oriented.height),
                 (width, height),
-                "{orientation:?} changed the dimensions"
+                "EXIF {value} changed the dimensions"
             );
-            assert_eq!(reds(&oriented).as_slice(), expected, "{orientation:?}");
+            assert_eq!(reds(&oriented).as_slice(), expected, "EXIF {value}");
         }
     }
 
     #[test]
     fn orientations_that_swap_the_axes_do_swap_them() {
-        use rawler::decoders::Orientation;
-
-        for orientation in [
-            Orientation::Rotate90,
-            Orientation::Rotate270,
-            Orientation::Transpose,
-            Orientation::Transverse,
-        ] {
-            let oriented = orient(numbered(), orientation);
+        for value in [5u16, 6, 7, 8] {
+            let oriented = apply_exif_orientation(numbered(), Some(value));
             assert_eq!(
                 (oriented.width, oriented.height),
                 (2, 3),
-                "{orientation:?} should swap the axes"
+                "EXIF {value} should swap the axes"
             );
-            assert_eq!(oriented.data.len(), 18, "{orientation:?}");
+            assert_eq!(oriented.data.len(), 18, "EXIF {value}");
         }
+    }
+
+    #[test]
+    fn applying_no_orientation_leaves_the_image_alone() {
+        let image = numbered();
+        let untouched = apply_exif_orientation(image.clone(), None);
+        assert_eq!((untouched.width, untouched.height), (3, 2));
+        assert_eq!(reds(&untouched), reds(&image));
+    }
+
+    /// A minimal little-endian TIFF whose only tag is EXIF Orientation.
+    fn tiff_with_orientation(value: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"II");
+        bytes.extend_from_slice(&42u16.to_le_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // offset of the first IFD
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // one entry
+        bytes.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        bytes.extend_from_slice(&3u16.to_le_bytes()); // type SHORT
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // count
+        bytes.extend_from_slice(&value.to_le_bytes()); // value
+        bytes.extend_from_slice(&0u16.to_le_bytes()); // padding
+        bytes.extend_from_slice(&0u32.to_le_bytes()); // no next IFD
+        bytes
+    }
+
+    #[test]
+    fn reads_every_orientation_value_from_the_file() {
+        for value in 1..=8u16 {
+            let path = temp_file("orientation.tif", &tiff_with_orientation(value));
+            assert_eq!(
+                exif_orientation(&path),
+                Some(value),
+                "EXIF value {value} did not survive the round trip"
+            );
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn orientation_values_map_to_the_expected_transform() {
+        use rawler::decoders::Orientation;
+
+        let expected = [
+            (1u16, Orientation::Normal),
+            (2, Orientation::HorizontalFlip),
+            (3, Orientation::Rotate180),
+            (4, Orientation::VerticalFlip),
+            (5, Orientation::Transpose),
+            (6, Orientation::Rotate90),
+            (7, Orientation::Transverse),
+            (8, Orientation::Rotate270),
+        ];
+
+        for (value, orientation) in expected {
+            assert_eq!(
+                Orientation::from_u16(value),
+                orientation,
+                "EXIF value {value} mapped wrongly"
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_orientation_is_absent_rather_than_guessed() {
+        let path = temp_file("bad-orientation.tif", &tiff_with_orientation(99));
+        assert_eq!(exif_orientation(&path), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_file_without_the_tag_has_no_orientation() {
+        let path = temp_file("no-orientation.tif", b"II*\0\x08\0\0\0\0\0\0\0\0\0\0\0");
+        assert_eq!(exif_orientation(&path), None);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_missing_or_garbage_file_has_no_orientation_rather_than_an_error() {
+        assert_eq!(
+            exif_orientation(Path::new("/nonexistent/grainbase.arw")),
+            None
+        );
+
+        let path = temp_file("garbage-orientation.tif", b"not a tiff at all");
+        assert_eq!(exif_orientation(&path), None);
+        let _ = fs::remove_file(&path);
     }
 }

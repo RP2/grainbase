@@ -33,8 +33,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let scan = decode::decode(input)?;
     let mut negative = scan.linear;
     println!(
-        "decoded {}x{} from {} {}",
-        negative.width, negative.height, scan.meta.make, scan.meta.model
+        "decoded {}x{} from {} {} (EXIF orientation {:?})",
+        negative.width, negative.height, scan.meta.make, scan.meta.model, scan.meta.orientation
     );
 
     if flip_h {
