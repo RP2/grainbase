@@ -1,0 +1,8 @@
+[package]
+name = "grainbase"
+version = "0.0.0"
+edition = "2024"
+description = "Engine for converting camera-scanned film negatives into positives."
+license = "AGPL-3.0-or-later"
+
+[dependencies]

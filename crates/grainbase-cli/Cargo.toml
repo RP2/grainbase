@@ -1,0 +1,13 @@
+[package]
+name = "grainbase-cli"
+version = "0.0.0"
+edition = "2024"
+description = "Command-line adapter for the grainbase film-negative conversion engine."
+license = "AGPL-3.0-or-later"
+
+[[bin]]
+name = "grainbase"
+path = "src/main.rs"
+
+[dependencies]
+grainbase = { path = "../grainbase" }
