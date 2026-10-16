@@ -102,6 +102,8 @@ impl Profile {
             settings: Settings {
                 density_max: Some([crate::pipeline::DEFAULT_DENSITY_MAX; 3]),
                 density_floor: None,
+                gamma: None,
+                pivot_density: None,
                 crosstalk: crate::pipeline::IDENTITY,
             },
         }
@@ -197,6 +199,12 @@ impl fmt::Display for Profile {
         if let Some([red, green, blue]) = self.settings.density_floor {
             writeln!(f, "density_floor = {red:.6} {green:.6} {blue:.6}")?;
         }
+        if let Some([red, green, blue]) = self.settings.gamma {
+            writeln!(f, "gamma = {red:.6} {green:.6} {blue:.6}")?;
+        }
+        if let Some(pivot) = self.settings.pivot_density {
+            writeln!(f, "pivot_density = {pivot:.6}")?;
+        }
         writeln!(f, "# Rows are output channels, columns are dye densities.")?;
         writeln!(
             f,
@@ -231,6 +239,8 @@ impl Profile {
         let mut frames = None;
         let mut density_max = None;
         let mut density_floor = None;
+        let mut gamma = None;
+        let mut pivot_density = None;
         let mut crosstalk = None;
 
         for (index, raw) in text.lines().enumerate() {
@@ -256,6 +266,8 @@ impl Profile {
                 "frames" => frames = Some(parse_u32(line, key, value)?),
                 "density_max" => density_max = Some(parse_floats::<3>(line, key, value)?),
                 "density_floor" => density_floor = Some(parse_floats::<3>(line, key, value)?),
+                "gamma" => gamma = Some(parse_floats::<3>(line, key, value)?),
+                "pivot_density" => pivot_density = Some(parse_floats::<1>(line, key, value)?[0]),
                 "crosstalk" => {
                     let flat = parse_floats::<9>(line, key, value)?;
                     crosstalk = Some([
@@ -289,6 +301,8 @@ impl Profile {
                     density_max.ok_or(ParseError::MissingKey { key: "density_max" })?,
                 ),
                 density_floor,
+                gamma,
+                pivot_density,
                 crosstalk: crosstalk.ok_or(ParseError::MissingKey { key: "crosstalk" })?,
             },
         })
@@ -387,6 +401,8 @@ mod tests {
             settings: Settings {
                 density_max: Some([1.85, 1.92, 1.74]),
                 density_floor: None,
+                gamma: None,
+                pivot_density: None,
                 crosstalk: [[1.0, 0.05, 0.02], [0.03, 1.0, 0.04], [0.01, 0.02, 1.0]],
             },
         }
@@ -410,6 +426,30 @@ mod tests {
             parsed.settings.crosstalk, IDENTITY,
             "default means no correction"
         );
+    }
+
+    #[test]
+    fn print_curve_terms_round_trip() {
+        let text = "# c\n# a\nversion = 1\nfilm = \"x\"\ncamera = \"y\"\n\
+                    method = fitted\nframes = 3\ndensity_max = 1 2 3\n\
+                    density_floor = 0.1 0.2 0.3\ngamma = 1.2 0.9 1.1\n\
+                    pivot_density = 1.45\ncrosstalk = 1 0 0 0 1 0 0 0 1\n";
+        let parsed = Profile::parse(text).expect("parses");
+        assert_eq!(
+            parsed.settings.gamma,
+            Some([1.2, 0.9, 1.1]),
+            "the curve's per-channel exponents"
+        );
+        assert_eq!(
+            parsed.settings.pivot_density,
+            Some(1.45),
+            "the pivot's density anchor"
+        );
+
+        // And the round trip keeps them.
+        let again = Profile::parse(&parsed.to_string()).expect("round trip");
+        assert_eq!(again.settings.gamma, parsed.settings.gamma);
+        assert_eq!(again.settings.pivot_density, parsed.settings.pivot_density);
     }
 
     #[test]

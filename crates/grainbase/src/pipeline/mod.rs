@@ -20,6 +20,7 @@
 //! logarithmically, so a linear inversion washes out the highlights.
 
 pub mod film_base;
+pub mod fit;
 pub mod percentile;
 
 pub use film_base::FilmBase;
@@ -103,6 +104,30 @@ pub struct Settings {
     /// value. Default is three zeros: no black-point lift, straight inversion.
     pub density_floor: Option<[f32; 3]>,
 
+    /// The print curve's contrast exponent per channel, or `None` for a
+    /// straight line — which is the default render.
+    ///
+    /// The physical print does not map density to reflection linearly: the
+    /// paper's characteristic curve has a toe and a shoulder, and the
+    /// exponent expresses how the midtones bend. A channel exponent above
+    /// `1.0` deepens its shadows (the classic punchy print); below it lifts
+    /// them (a washed, dreamy look — the "am I overexposed?" instinct that is
+    /// really a missing curve term). Per channel, because each dye's
+    /// crossover differs; this is the *fixed* physical print curve, not
+    /// exposure compensation — it changes shape, not placement.
+    pub gamma: Option<[f32; 3]>,
+
+    /// The density a correctly-exposed gray measures at, for the print
+    /// curve's pivot anchor.
+    ///
+    /// Anchors the curve: the pivot density maps to the reference gray
+    /// positive value, both pieces meeting there with continuous slope. This
+    /// is *the stock's* gray-measured density — the maintainer's capture
+    /// protocol fits it per stock (Kodak's generic LAD aims are the fallback
+    /// family value and already the default ceilings). `None` means no
+    /// pivot: no curve was requested, which pairs with `gamma: None`.
+    pub pivot_density: Option<f32>,
+
     /// Dye crosstalk correction, applied to density before it is scaled.
     ///
     /// Film dyes are not spectrally pure and a Bayer sensor's channels overlap,
@@ -122,6 +147,8 @@ impl Default for Settings {
         Self {
             density_max: Some(default_density_max()),
             density_floor: None,
+            gamma: None,
+            pivot_density: None,
             crosstalk: IDENTITY,
         }
     }
@@ -129,6 +156,37 @@ impl Default for Settings {
 
 /// The identity matrix: leaves density untouched.
 pub const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+/// Renders one channel's corrected density through the linear floor/ceiling
+/// map, then through the print curve when one was requested.
+///
+/// The curve is a two-piece power map around the pivot: every piece is a
+/// gamma curve whose value and slope meet at the pivot, so a gray renders at
+/// the reference gray and the toe/shoulder bend around it per channel. The
+/// exponent is taken as `1/gamma`, so a gamma ratio above 1 deepens shadows —
+/// the print-style convention: gamma is the display-facing contrast.
+#[must_use]
+fn render(
+    density: f32,
+    floor: f32,
+    ceiling: f32,
+    curve: Option<&([f32; 3], [f32; 3])>,
+    channel: usize,
+) -> f32 {
+    let linear = ((density - floor) / ceiling).clamp(0.0, 1.0);
+    let Some((pivot, gamma)) = curve else {
+        return linear;
+    };
+
+    let (position, exponent) = (pivot[channel], 1.0 / gamma[channel]);
+    let (pivot_value, above) = (REFERENCE_GRAY_POSITIVE, linear > position);
+    if above {
+        let remaining = (linear - position) / (1.0 - position);
+        pivot_value + (1.0 - pivot_value) * remaining.powf(exponent)
+    } else {
+        pivot_value * (linear / position).powf(exponent)
+    }
+}
 
 /// Neutralises the film base and inverts a negative into a positive.
 ///
@@ -148,6 +206,27 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
     let crosstalk = settings.crosstalk;
     let floor = settings.density_floor.unwrap_or([0.0; 3]);
 
+    // The print curve: only meaningful when both a pivot density and an
+    // exponent are supplied. The pivot's normalized position maps to the
+    // reference gray; the pieces meet there with continuous slope.
+    let curve = match (settings.gamma, settings.pivot_density) {
+        (Some(gamma), Some(pivot)) => {
+            let span = [
+                floor[0] + density_max[0],
+                floor[1] + density_max[1],
+                floor[2] + density_max[2],
+            ];
+            let pivot_normalized = [
+                ((pivot - floor[0]) / (span[0] - floor[0])).clamp(f32::MIN_POSITIVE, 1.0),
+                ((pivot - floor[1]) / (span[1] - floor[1])).clamp(f32::MIN_POSITIVE, 1.0),
+                ((pivot - floor[2]) / (span[2] - floor[2])).clamp(f32::MIN_POSITIVE, 1.0),
+            ];
+            let gamma = gamma.map(|value| value.max(f32::MIN_POSITIVE));
+            Some((pivot_normalized, gamma))
+        }
+        _ => None,
+    };
+
     image.map_rgb(|[red, green, blue]| {
         let density = [
             density_of(red, base.transmittance[0]),
@@ -156,9 +235,9 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
         ];
         let corrected = mix(crosstalk, density);
         [
-            ((corrected[0] - floor[0]) / density_max[0]).clamp(0.0, 1.0),
-            ((corrected[1] - floor[1]) / density_max[1]).clamp(0.0, 1.0),
-            ((corrected[2] - floor[2]) / density_max[2]).clamp(0.0, 1.0),
+            render(corrected[0], floor[0], density_max[0], curve.as_ref(), 0),
+            render(corrected[1], floor[1], density_max[1], curve.as_ref(), 1),
+            render(corrected[2], floor[2], density_max[2], curve.as_ref(), 2),
         ]
     })
 }
