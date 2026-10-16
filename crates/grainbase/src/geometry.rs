@@ -4,30 +4,37 @@
 //! well as its position: an axis-aligned box around a tilted frame either clips
 //! the picture or keeps the rebate in the corners.
 //!
-//! The boundary being looked for is **exposed picture against clear film**, not
-//! film against light. In a typical camera scan the film fills the frame and the
-//! only bare light is whatever shows through the sprocket holes; the rebate and
-//! the inter-frame gaps are film, just unexposed. Clear film is the brightest
-//! thing the *film* shows, because nothing in it absorbs, and any exposure at
-//! all makes the picture darker.
+//! The frame is found from the film's own mechanics first. The sprocket-hole
+//! bands are parts of the strip — bare light through punched holes, reading
+//! several times brighter than anything the film itself can show — and their
+//! projection pins down three things at once: the strip's tilt, the rows the
+//! picture may occupy, and the rebate margin around it. Hole rows never enter
+//! the crop; the picture is never cut deeper than the rebate search allows.
+//! The film's 3:2 aspect supplies the width, and the content's centre
+//! positions it.
 //!
-//! The separation is narrow in practice: on the maintainer's real scan the
-//! thinnest picture area is about 0.028 and clear film is about 0.06, only a 2x
-//! step. A global brightness threshold therefore cannot split the two — the
-//! picture itself spans 0.001–0.06. The information is in the *straightness* and
-//! *local contrast* of the boundary: a frame edge is a long straight line with
-//! clear film on the outside and picture on the inside.
+//! Levels cannot do this alone. On an underexposed frame the rebate and the
+//! picture sit at the same level; on a scan with bright content the picture
+//! and the rebate trade places. Three per-pixel threshold rounds failed on
+//! real scans exactly there before the bands took over the structural work
+//! (measured: dark content at 0.145 against a base of 0.176; pale walls at
+//! rebate level). What levels still do well is *local* verification — a step
+//! across a boundary, a bright fraction in one row — and every threshold in
+//! this module is a geometry bound or a contrast *difference* anchored to the
+//! measured clear-film level, never an absolute brightness cut.
 //!
-//! This module finds those lines: it looks for strong, straight edges, builds
-//! candidate rectangles from pairs of near-vertical and near-horizontal lines,
-//! and keeps only the rectangle whose four edges consistently have clear film
-//! outside and picture inside. Every threshold is on geometry or on a contrast
-//! *difference* across a boundary; there is no absolute brightness threshold.
+//! When no hole band is visible (band-less strips), a line pipeline takes
+//! over: strong straight edges are fit as near-vertical and near-horizontal
+//! lines, and the frame is the rectangle whose four edges consistently read
+//! clear film outside and picture inside. It is the fallback, not the
+//! structure.
 //!
 //! This module is pure: image in, geometry out, no I/O.
 
 use crate::image::LinearImage;
 use crate::pipeline::{FilmBase, film_base};
+
+use std::cmp::Reverse;
 
 /// Largest tilt treated as genuine. Beyond this it is not a crooked scan, it is
 /// a frame found wrongly, and rotating by it would wreck the picture.
@@ -41,17 +48,105 @@ const WORKING_LONG_SIDE: u32 = 1400;
 
 /// Which gradient-magnitude percentile a candidate edge pixel must reach.
 ///
-/// Adaptive: no absolute level. The strongest transitions (sprocket holes
-/// against film, film against the sensor margin) are far brighter than the
-/// frame boundary, so this percentile does not sit anywhere near the top of
-/// the distribution: a fixed p99 of gradient magnitude let the hole-band edges
-/// set the bar, and the picture/rebate boundary — the only boundary this
-/// module exists to find — never entered the candidate set at all, which is
-/// the failure the maintainer saw as the crop keeping the sprocket band.
-/// Measured on the real scan the hole edges reach a gradient around 0.24
-/// while the rebate step runs several times under it but well above grain:
-/// p90 keeps every real boundary while leaving pure grain noise out.
+/// p90 of gradient magnitude: adaptive, no absolute level. High percentiles
+/// put the sprocket-hole transitions above the bar and shut out the weaker —
+/// and only frame-relevant — rebate step (p99 did, in a round the maintainer
+/// saw as the crop keeping the sprocket band; the rebate step measures a few
+/// times under the hole edges, but well above grain).
 const GRADIENT_PERCENTILE: f32 = 0.90;
+
+/// How bright a sample must be to read as bare light, as a multiple of the
+/// clear-film base.
+///
+/// The light table is run neutral (~5500K), so bare light through the holes
+/// is white and its least channel is high — but the hole-to-base *ratio*
+/// still moves between scans (measured 3.4x to 10x) because the base
+/// measurement itself shifts with the roll's content and the light's falloff
+/// at the frame edges. A bar derived from one scan's ratio silently disables
+/// the anchors on the next. Content never gets near the line: exposed film
+/// absorbs in every layer, the rebate is the ceiling at roughly 1.2x the
+/// base, and the 2x bar keeps clear water between holes and anything the
+/// film itself can show.
+const HOLE_BRIGHTNESS: f32 = 2.0;
+
+/// The share of a row's columns that must read as bare light for the row to
+/// belong to a hole band.
+///
+/// About half the columns are holes on band rows, but a band's outer rows
+/// taper with tilt and blur; 8% keeps the whole band while never letting a
+/// row of rebate between two holes qualify on its own.
+const HOLE_ROW_FRACTION: f32 = 0.08;
+
+/// How many dark rows a hole band may straddle in the projection.
+///
+/// The band's rows stay within a couple of pixels of one straight line: tilt
+/// shifts the hole edges across the width by a few rows, never by a pitch.
+const BAND_GAP_TOLERANCE: usize = 3;
+
+/// The least height, in grid rows, for one hole band.
+const MIN_BAND_ROWS: usize = 3;
+
+/// How far the picture may sit from the hole band it faces, as a fraction of
+/// the hole-to-hole span.
+///
+/// Measured at 2.7% on the maintainer's reference scan, whose rebate is a
+/// narrow margin between picture and perforation band. 10% leaves room for
+/// other stocks and framing; more than this and a candidate row range is not
+/// a rebate, it is somewhere else in the picture.
+const REBATE_MAX_FRACTION: f32 = 0.10;
+
+/// Where the picture is placed when its rebate edge cannot be measured, as a
+/// multiple of its hole band's height.
+///
+/// The reference scan measures 1.1 band heights from the band edge to the
+/// picture. A rebate invisible under dark content is placed there: it keeps a
+/// strip of rebate rather than risking the picture, and the bound is
+/// deliberate — hole rows stay out, which is the one failure the maintainer
+/// ruled out, and the picture is never cut by more than the rebate search
+/// allows.
+const REBATE_DEFAULT_FRACTION: f32 = 1.1;
+
+/// Least support, as a share of the grid width, for a rebate edge to count as
+/// measured.
+///
+/// Rebate is clear film — brighter than any exposed area — but only where
+/// exposed content actually sits below the band. Invisible stretches
+/// contribute nothing, and a quarter of the width rules out a scratch.
+const REBATE_SUPPORT_MIN: f32 = 0.25;
+
+/// Smallest step at the rebate→picture boundary, as a fraction of the base.
+///
+/// Rebate is clear film, brighter than any exposed area by at least the
+/// film's color-mask absorption. Measured on dense content the step is a few
+/// percent of the base; 4% clears grain noise (about 2% on these scans)
+/// while staying far below a bright content seam.
+const REBATE_STEP_MIN: f32 = 0.04;
+
+/// Width over height of a full 35mm frame.
+///
+/// Bounding, not asserting: it keeps a candidate rectangle from chaining
+/// across an inter-frame gap into the next frame, where a level-based edge
+/// gate alone would keep walking.
+const FRAME_ASPECT: f32 = 1.5;
+
+/// The content level that separates exposed picture from rebate, as a
+/// fraction of the base, when scanning a row for the picture's horizontal
+/// extent.
+///
+/// An underexposed scan puts dark content arbitrarily close to the rebate
+/// level, so the bar sits just under the base: anything meaningfully darker
+/// than the rebate is picture. Rebate that reads darker than the base then
+/// qualifies too — accepted, because the fallback placement keeps those
+/// strips in the crop, which is the agreed trade — and the median extent
+/// bounds the damage. Bright pixels inside the picture never end a run;
+/// only rebate-level brightness on both sides does.
+const CONTENT_LEVEL_FRACTION: f32 = 0.97;
+
+/// Largest bright gap tolerated inside one content run, in grid columns.
+///
+/// The picture holds highlights, but never rebate-sized ones: a pitch of
+/// dark rebate between two holes does not merge a run across it.
+const CONTENT_GAP_TOLERANCE: usize = 6;
 
 /// Angular resolution of the Hough accumulator, in radians.
 ///
@@ -281,6 +376,34 @@ pub fn find(image: &LinearImage) -> Option<Frame> {
         return Some(Frame::whole(image));
     }
 
+    let src_w = coordinate(width);
+    let src_h = coordinate(height);
+
+    // Hole bands straighten the grid and anchor the frame mechanically.
+    if let Some(coarse) = detect_bands(&gray, base).map(|bands| bands.skew) {
+        let rotated = rotate_gray(&gray, -coarse);
+        let anchored = detect_bands(&rotated, base)
+            .and_then(|bands| band_frame(&rotated, scale, base, &bands));
+        if let Some(second) = anchored {
+            let skew = coarse + second.skew;
+            if skew.abs() <= MAX_SKEW {
+                return Some(map_back(second, coarse, src_w, src_h));
+            }
+        }
+        // The bands were visible but their frame came out unusable: try the
+        // content-based detector on the same straightened grid before
+        // giving up on the crop entirely.
+        let still = detect_frame(&rotated, scale, image.width, image.height, base);
+        if let Some(second) = still {
+            let skew = coarse + second.skew;
+            if skew.abs() <= MAX_SKEW {
+                return Some(map_back(second, coarse, src_w, src_h));
+            }
+        }
+        return Some(Frame::whole(image));
+    }
+
+    // No hole bands: the band-less line pipeline, two passes, as before.
     let Some(first) = detect_frame(&gray, scale, image.width, image.height, base) else {
         return Some(Frame::whole(image));
     };
@@ -296,22 +419,23 @@ pub fn find(image: &LinearImage) -> Option<Frame> {
     if skew.abs() > MAX_SKEW {
         return Some(Frame::whole(image));
     }
+    Some(map_back(second, first.skew, src_w, src_h))
+}
 
-    let src_w = coordinate(width);
-    let src_h = coordinate(height);
-    let (sin, cos) = first.skew.sin_cos();
-    let qx = second.center[0] - src_w / 2.0;
-    let qy = second.center[1] - src_h / 2.0;
-    let center = [
-        src_w / 2.0 + cos * qx - sin * qy,
-        src_h / 2.0 + sin * qx + cos * qy,
-    ];
-
-    Some(Frame {
-        center,
-        size: second.size,
-        skew,
-    })
+/// Maps a frame measured on a straightened grid back into source
+/// coordinates, composing the straightening tilt into `Frame::skew`.
+fn map_back(frame: Frame, coarse_skew: f32, src_w: f32, src_h: f32) -> Frame {
+    let (sin, cos) = coarse_skew.sin_cos();
+    let qx = frame.center[0] - src_w / 2.0;
+    let qy = frame.center[1] - src_h / 2.0;
+    Frame {
+        center: [
+            src_w / 2.0 + cos * qx - sin * qy,
+            src_h / 2.0 + sin * qx + cos * qy,
+        ],
+        size: frame.size,
+        skew: coarse_skew + frame.skew,
+    }
 }
 
 /// Runs the whole detection pipeline on one analysis grid.
@@ -379,6 +503,420 @@ fn rotate_gray(image: &GrayImage, angle: f32) -> GrayImage {
         height: image.height,
         data,
     }
+}
+
+/// One sprocket-hole band, as the row range `[start, end)` it occupies.
+#[derive(Debug, Clone, Copy)]
+struct Band {
+    start: f32,
+    end: f32,
+}
+
+impl Band {
+    /// The band's height, in rows.
+    fn height(self) -> f32 {
+        self.end - self.start
+    }
+}
+
+/// A strip's two hole bands and the mechanical tilt they carry.
+struct Bands {
+    top: Band,
+    bottom: Band,
+    skew: f32,
+}
+
+/// Detects the strip's sprocket-hole bands on one scan.
+///
+/// Returns `None` when either band is missing or too short: the strip never
+/// shows a full film width, which is exactly the case where the mechanical
+/// anchors are not available and detection must answer differently.
+fn detect_bands(image: &GrayImage, base: f32) -> Option<Bands> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let bright = base * HOLE_BRIGHTNESS;
+
+    // Share of each row that reads as bare light. Content never reaches this
+    // bar; holes reach it on every row of their band.
+    let mut fraction = vec![0.0f32; height];
+    for (y, slot) in fraction.iter_mut().enumerate() {
+        let mut count = 0usize;
+        for x in 0..width {
+            if image.get(x, y) >= bright {
+                count += 1;
+            }
+        }
+        *slot = coordinate(count) / coordinate(width.max(1));
+    }
+
+    let half = height / 2;
+    let top = band_run(&fraction, 0..half, true)?;
+    let bottom = band_run(&fraction, half..height, false)?;
+    let skew = band_skew(image, base, top, bottom);
+
+    Some(Bands { top, bottom, skew })
+}
+
+/// Runs of light rows in one vertical half of the grid, taking the run
+/// nearest the strip's edge: first qualifying run for the top, last for the
+/// bottom. A run grows through qualifying rows, tolerating the few dark rows
+/// a tilted band straddles between successive holes; shorter-than-minimal
+/// runs are not bands at all.
+fn band_run(fraction: &[f32], rows: std::ops::Range<usize>, from_top: bool) -> Option<Band> {
+    if rows.end > fraction.len() || rows.start >= rows.end {
+        return None;
+    }
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut current: Option<(usize, usize)> = None;
+    for row in rows.clone() {
+        if fraction[row] >= HOLE_ROW_FRACTION {
+            current = Some(match current {
+                Some((from, last)) if row <= last + BAND_GAP_TOLERANCE => (from, row),
+                _ => (row, row),
+            });
+        } else if let Some(run) = current.take() {
+            runs.push(run);
+        }
+    }
+    if let Some(run) = current {
+        runs.push(run);
+    }
+    runs.retain(|(from, last)| last.saturating_sub(*from) + 1 >= MIN_BAND_ROWS);
+
+    let chosen = if from_top {
+        runs.into_iter()
+            .min_by_key(|(from, last)| (*from, Reverse(last.saturating_sub(*from))))
+    } else {
+        runs.into_iter()
+            .max_by_key(|(from, last)| (*last, last.saturating_sub(*from)))
+    }?;
+
+    Some(Band {
+        start: coordinate(chosen.0),
+        end: coordinate(chosen.1 + 1),
+    })
+}
+
+/// The strip's tilt from the hole bands' axes, through a least-squares fit of
+/// each band's per-column bright centroid.
+///
+/// Bands are parts of the film itself; their axis carries the strip's skew
+/// with no content intercession anywhere in the measurement.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "band rows are non-negative small integers on the working grid"
+)]
+fn band_skew(image: &GrayImage, base: f32, top: Band, bottom: Band) -> f32 {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let bright = base * HOLE_BRIGHTNESS;
+
+    let slope = |band: Band| -> Option<f32> {
+        let y0 = band.start.floor().max(0.0) as usize;
+        let y1 = (band.end.ceil() as usize).min(height.saturating_sub(1));
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        for x in 0..width {
+            let mut weight = 0.0f32;
+            let mut sum = 0.0f32;
+            for y in y0..=y1 {
+                if image.get(x, y) >= bright {
+                    weight += 1.0;
+                    sum += coordinate(y);
+                }
+            }
+            if weight > 0.0 {
+                xs.push(coordinate(x));
+                ys.push(sum / weight);
+            }
+        }
+        if xs.len() < 8 {
+            return None;
+        }
+        let n = coordinate(xs.len());
+        let mean_x = xs.iter().sum::<f32>() / n;
+        let mean_y = ys.iter().sum::<f32>() / n;
+        let mut cov = 0.0f32;
+        let mut var = 0.0f32;
+        for i in 0..xs.len() {
+            let dx = xs[i] - mean_x;
+            cov += dx * (ys[i] - mean_y);
+            var += dx * dx;
+        }
+        if var <= 0.0 {
+            return None;
+        }
+        Some(cov / var)
+    };
+
+    // Slope dy/dx of a near-horizontal edge is tan(skew).
+    let slopes = [slope(top), slope(bottom)]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<f32>>();
+    if slopes.is_empty() {
+        return 0.0;
+    }
+    let mean = slopes.iter().sum::<f32>() / coordinate(slopes.len());
+    f32::atan(mean)
+}
+
+/// The picture-side boundary of one hole band, as a working-grid line.
+///
+/// From the band edge, a rebate-sized zone is scanned per column for the
+/// sharpest outer step — clear film toward the band, picture beyond it. The
+/// columns whose step clears a small floor vote; with enough of them the
+/// votes fit as one line. `None` when support is short of
+/// [`REBATE_SUPPORT_MIN`]: under that much dark content the rebate is simply
+/// not measurable and the caller places it by the reference offset.
+///
+/// `search` is the zone's depth, in grid rows — [`Band`]-derived and capped
+/// by the rebate bounds, never content-derived.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "band rows are non-negative small integers on the working grid"
+)]
+fn rebate_edge(
+    image: &GrayImage,
+    base: f32,
+    band: Band,
+    from_top: bool,
+    search: f32,
+) -> Option<Line> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let step_min = base * REBATE_STEP_MIN;
+
+    let (zone_start, zone_end) = if from_top {
+        (
+            band.end,
+            (band.end + search).min(coordinate(height.saturating_sub(1))),
+        )
+    } else {
+        ((band.start - search).max(0.0), band.start)
+    };
+    if zone_end - zone_start < 1.0 {
+        return None;
+    }
+
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for x in 0..width {
+        let mut best: Option<(f32, f32)> = None; // (row, step)
+        let y0 = zone_start.ceil() as usize;
+        let y1 = (zone_end.floor() as usize).min(height.saturating_sub(2));
+        for y in y0..y1 {
+            let above = image.get(x, y.saturating_sub(1));
+            let below = image.get(x, (y + 1).min(height.saturating_sub(1)));
+            // Toward the picture from the band, the rebate is the bright side.
+            let step = if from_top {
+                above - below
+            } else {
+                below - above
+            };
+            if step > best.map_or(f32::NEG_INFINITY, |(_, s)| s) {
+                best = Some((coordinate(y), step));
+            }
+        }
+        if best.is_some_and(|(_, step)| step >= step_min) {
+            xs.push(coordinate(x));
+            ys.push(best.expect("checked above").0);
+        }
+    }
+
+    let support = coordinate(xs.len()) / coordinate(width.max(1));
+    if support < REBATE_SUPPORT_MIN {
+        return None;
+    }
+
+    // Fit the votes. In the straightened grid the boundary is near-level, so
+    // this is a row line; width-spread votes with big residuals are distrust.
+    let n = coordinate(xs.len());
+    let mean_x = xs.iter().sum::<f32>() / n;
+    let mean_y = ys.iter().sum::<f32>() / n;
+    let mut cov = 0.0f32;
+    let mut var = 0.0f32;
+    let mut resid = 0.0f32;
+    for i in 0..xs.len() {
+        let dx = xs[i] - mean_x;
+        cov += dx * (ys[i] - mean_y);
+        var += dx * dx;
+        let pred = mean_y + cov.max(0.0) / var.max(1.0) * dx;
+        resid += (ys[i] - pred) * (ys[i] - pred);
+    }
+    if var <= 0.0 {
+        return Some(Line { a: mean_y, m: 0.0 });
+    }
+    let m = cov / var;
+    let a = mean_y - m * mean_x;
+    resid /= n;
+    if resid.sqrt() > 2.0 {
+        return None;
+    }
+    Some(Line { a, m })
+}
+
+/// A band's reference-side boundary line: the rebate placed by the measured
+/// default, at the band's row range.
+fn band_line(band: Band, from_top: bool) -> Line {
+    let offset = REBATE_DEFAULT_FRACTION * band.height();
+    let line_row = if from_top {
+        band.end + offset
+    } else {
+        band.start - offset
+    };
+    Line {
+        a: line_row,
+        m: 0.0,
+    }
+}
+
+/// The picture content's horizontal extent between two boundary rows.
+///
+/// Rows are sampled across the band; a row qualifies any pixel noticeably
+/// below the rebate as content and its extent is the widest qualifying run,
+/// tolerating bright content inside the picture. The median extent wins:
+/// rebate that reads darker than the base — an underexposed scan's usual
+/// state — drags individual rows wide, and the median bounds the damage.
+///
+/// Generous by design: the vertical sides of a band-anchored frame are
+/// approximations, with the frame's width coming from the film's aspect and
+/// the position from the content's centre.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "grid coordinates are non-negative small integers"
+)]
+fn content_span(image: &GrayImage, base: f32, top: Line, bottom: Line) -> Option<(f32, f32)> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let level = base * CONTENT_LEVEL_FRACTION;
+
+    let y_at = |line: Line, x: f32| line.a + line.m * x;
+    let row_top = y_at(top, coordinate(width) / 2.0)
+        .floor()
+        .clamp(0.0, coordinate(height.saturating_sub(1))) as usize;
+    let row_bottom = y_at(bottom, coordinate(width) / 2.0)
+        .floor()
+        .clamp(0.0, coordinate(height.saturating_sub(1))) as usize;
+    if row_bottom <= row_top + 1 {
+        return None;
+    }
+
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    let step_rows = ((row_bottom - row_top) / 60).max(2);
+    let mut row = row_top + 2;
+    while row < row_bottom.saturating_sub(2) {
+        // One row's widest qualifying run, small bright gaps tolerated: the
+        // picture holds highlight areas, but never rebate-sized ones.
+        let mut best: Option<(usize, usize)> = None;
+        let mut current: Option<(usize, usize)> = None;
+        let mut last = 0usize;
+        for x in 0..width {
+            let qualifies = image.get(x, row) < level;
+            if qualifies {
+                current = Some(match current {
+                    Some((from, _)) if x <= last + CONTENT_GAP_TOLERANCE => (from, x),
+                    _ => (x, x),
+                });
+                last = x;
+            } else if let Some(found) = current.take() {
+                best = Some(match best {
+                    Some(wider_of) => wider(found, wider_of),
+                    None => found,
+                });
+            }
+        }
+        if let Some(found) = current {
+            best = Some(match best {
+                Some(wider_of) => wider(found, wider_of),
+                None => found,
+            });
+        }
+        if let Some((from, to)) = best {
+            starts.push(coordinate(from));
+            ends.push(coordinate(to + 1));
+        }
+        row += step_rows;
+    }
+
+    if starts.len() < 3 {
+        return None;
+    }
+    starts.sort_by(f32::total_cmp);
+    ends.sort_by(f32::total_cmp);
+    let (start, end) = (median_of(&mut starts), median_of(&mut ends));
+    if end - start < coordinate(width) / 10.0 {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// The wider of two `(start, end)` runs.
+fn wider(a: (usize, usize), b: (usize, usize)) -> (usize, usize) {
+    if b.1 - b.0 > a.1 - a.0 { b } else { a }
+}
+
+/// Median of an unsorted slice, in place.
+fn median_of(values: &mut [f32]) -> f32 {
+    values.sort_by(f32::total_cmp);
+    values[values.len() / 2]
+}
+
+/// Builds the frame from the mechanical anchors: the bands set the vertical
+/// bounds, refined by the rebate search inside their own bounds; the film's
+/// aspect sets the width; the content's centre positions it.
+///
+/// Returns the frame in the grid's own coordinates, scaled to source pixels;
+/// the caller folds it back through the straightening rotation.
+fn band_frame(image: &GrayImage, scale: f32, base: f32, bands: &Bands) -> Option<Frame> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+
+    let inner = bands.bottom.start - bands.top.end;
+    if inner <= 0.0 {
+        return None;
+    }
+    let rebate_max = REBATE_MAX_FRACTION * inner;
+
+    let top = rebate_edge(image, base, bands.top, true, rebate_max)
+        .unwrap_or_else(|| band_line(bands.top, true));
+    let bottom = rebate_edge(image, base, bands.bottom, false, rebate_max)
+        .unwrap_or_else(|| band_line(bands.bottom, false));
+
+    let y0 = top.a.max(0.0).min(coordinate(height));
+    let y1 = bottom.a.max(y0).min(coordinate(height));
+    let height_grid = y1 - y0;
+    if height_grid <= 0.0 {
+        return None;
+    }
+
+    // Width from the film's own aspect; position from the content. The
+    // grid's long axis is the strip's length direction, cropped to one
+    // frame's length. Bounded by the grid: a frame may run off the sensor
+    // edge, and clamping into the sensor keeps the crop on film.
+    let (content_start, content_end) = content_span(image, base, top, bottom)?;
+    let content_center = f32::midpoint(content_start, content_end);
+    let width_grid = FRAME_ASPECT * height_grid;
+    let half = width_grid / 2.0;
+    let x0 = (content_center - half).max(0.0);
+    let x1 = (content_center + half).min(coordinate(width));
+
+    let final_width = (x1 - x0) * scale - 2.0 * BOUNDARY_INSET * scale;
+    let final_height = (y1 - y0) * scale - 2.0 * BOUNDARY_INSET * scale;
+    if final_width <= 0.0 || final_height <= 0.0 {
+        return None;
+    }
+
+    Some(Frame {
+        center: [f32::midpoint(x0, x1) * scale, f32::midpoint(y0, y1) * scale],
+        size: [final_width, final_height],
+        skew: bands.skew,
+    })
 }
 
 /// A downsampled grayscale image.
