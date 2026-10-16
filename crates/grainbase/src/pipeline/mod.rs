@@ -77,7 +77,11 @@ pub struct Settings {
     /// so each channel sees a mix of all three dye densities. Correcting that is
     /// a linear operation *in density*, not in linear light, because secondary
     /// absorptions are approximately linear in the other layers' densities.
-    /// Identity means no correction.
+    /// Identity means no correction — which is deliberately the default: no
+    /// literature-derived generic matrix ships unmeasured. A row-normalized
+    /// prior provably preserves neutrality, and this scan's real cast is a
+    /// per-channel level imbalance the prior cannot touch; the honest sources
+    /// are the film itself, fitted by the maintainer's capture protocol.
     pub crosstalk: [[f32; 3]; 3],
 }
 
