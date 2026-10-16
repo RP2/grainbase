@@ -344,7 +344,47 @@ impl Frame {
             skew: 0.0,
         }
     }
+
+    /// The frame's color-sampling region: the measured frame pulled in by
+    /// fractions of its own size, with the frame's skew carried through so a
+    /// caller samples the deskewed region's corners correctly.
+    ///
+    /// The vertical inset is lighter than the horizontal one: the bands anchor
+    /// the frame's height mechanically, while the horizontal sides are the
+    /// content-derived approximations (the width comes from the film's aspect
+    /// and the content's centre) and carry the greater error. Everything that
+    /// *measures color* — calibration fitting, quality checks — samples inside
+    /// this region rather than the frame at large, where rebate and film-edge
+    /// dark bands sit.
+    #[must_use]
+    pub fn sample_region(self) -> Self {
+        Self {
+            center: self.center,
+            size: [
+                self.size[0] * (1.0 - 2.0 * SAMPLE_INSET_WIDTH),
+                self.size[1] * (1.0 - 2.0 * SAMPLE_INSET_HEIGHT),
+            ],
+            skew: self.skew,
+        }
+    }
 }
+
+/// The color-sampling region's horizontal inset, as a fraction of the frame's
+/// width per side.
+///
+/// The frame's horizontal sides are approximations: their width comes from the
+/// film's aspect and the content's centre, not from four measured edges, so
+/// 20% per side keeps the sample away from the parts most likely to hold
+/// rebate or an inter-frame edge.
+const SAMPLE_INSET_WIDTH: f32 = 0.20;
+
+/// The color-sampling region's vertical inset, as a fraction of the frame's
+/// height per side.
+///
+/// Mechanically anchored to the sprocket bands, the frame's height is
+/// trustworthy; the 10% inset only trims the rebate the fallback placement
+/// may keep and the rounded film corners the maintainer trims by hand.
+const SAMPLE_INSET_HEIGHT: f32 = 0.10;
 
 /// Finds the film frame, or `None` when the image has no pixels.
 ///
@@ -2192,6 +2232,34 @@ mod tests {
         let frame = find(&image).expect("a frame");
         let cropped = apply(&image, &frame);
         assert!(clear_film_share(&cropped) < 0.02);
+    }
+
+    #[test]
+    fn the_sampling_region_insets_as_agreed() {
+        // 20% width, 10% height, per side; centre and skew carried.
+        let whole = Frame {
+            center: [100.0, 50.0],
+            size: [100.0, 50.0],
+            skew: 0.01,
+        };
+        let region = whole.sample_region();
+        assert!(
+            (region.size[0] - 60.0).abs() < 1e-4 && (region.size[1] - 40.0).abs() < 1e-5,
+            "got {region:?}"
+        );
+        assert_eq!(region.center, whole.center);
+        assert_eq!(region.skew, whole.skew);
+    }
+
+    #[test]
+    fn the_sampling_region_stays_inside_its_frame() {
+        let whole = Frame::whole(
+            &LinearImage::new(200, 100, vec![0.0; 200 * 100 * 3]).expect("well-formed"),
+        );
+        let region = whole.sample_region();
+        // The region's diagonal never leaves the frame: sample corners sit in.
+        let half = [region.size[0] / 2.0, region.size[1] / 2.0];
+        assert!(half[0] < whole.size[0] / 2.0 && half[1] < whole.size[1] / 2.0);
     }
 
     #[test]

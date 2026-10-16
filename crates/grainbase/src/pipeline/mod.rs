@@ -35,6 +35,38 @@ use crate::image::LinearImage;
 /// stock's measured value.
 pub const DEFAULT_DENSITY_MAX: f32 = 2.0;
 
+/// The Kodak LAD aims for a mid-scale neutral, per channel, in Status-M
+/// densities above base.
+///
+/// From Kodak's *Film Users' Guide and Digital Recorder Calibration and
+/// Aims* (H-387), Table VII: the Digital LAD aims are what Kodak publishes as
+/// the reference gray *on the film* — a correctly exposed neutral patch of
+/// C-41 negative measures these densities. The channels are unequal by
+/// design: the three dye layers respond differently, and these numbers are
+/// Kodak's own published statement of how much. They are the generic
+/// per-channel gray correction: the per-stock measured equivalent comes from
+/// the maintainer's capture protocol.
+const LAD_GRAY_STATUS_M: [f32; 3] = [1.0, 1.45, 1.55];
+
+/// The positive value the Kodak reference gray occupies: CV 470 of the Cineon
+/// print-density encoding, PD = 0.002·CV → 0.940 above base, between the
+/// H-387 reference black (CV 95 → 0.190) and white (CV 685 → 1.370).
+///
+/// Cited from Kodak H-387 and the Cineon printing-density convention. Derived
+/// in this repo's arithmetic: ceiling = LAD gray ÷ this value, so a correct
+/// gray lands here and the white point follows from the film's own range.
+const REFERENCE_GRAY_POSITIVE: f32 = 0.636;
+
+/// Yielding the default per-channel ceilings: LAD aims as density white
+/// points, per channel, so content denser than a Kodak gray renders above the
+/// gray and the film's densest regions approach white.
+///
+/// [1.5723, 2.2800, 2.4371] — H-387-derived, this repo's arithmetic.
+#[must_use]
+fn default_density_max() -> [f32; 3] {
+    LAD_GRAY_STATUS_M.map(|aim| aim / REFERENCE_GRAY_POSITIVE)
+}
+
 /// Tuning for the conversion core.
 ///
 /// This is the shape a fitted calibration profile fills in. Every field here is
@@ -88,7 +120,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            density_max: Some([DEFAULT_DENSITY_MAX; 3]),
+            density_max: Some(default_density_max()),
             density_floor: None,
             crosstalk: IDENTITY,
         }
@@ -111,7 +143,7 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
     // A zero or negative setting would divide by zero or invert the contrast.
     let density_max = settings
         .density_max
-        .unwrap_or([DEFAULT_DENSITY_MAX; 3])
+        .unwrap_or_else(default_density_max)
         .map(|value| value.max(f32::MIN_POSITIVE));
     let crosstalk = settings.crosstalk;
     let floor = settings.density_floor.unwrap_or([0.0; 3]);
@@ -297,13 +329,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_ceiling_is_the_fixed_neutral() {
-        // The conversion does not compensate for exposure: the default is a
-        // fixed physical anchor, not content percentiles.
-        assert_eq!(
-            Settings::default().density_max,
-            Some([DEFAULT_DENSITY_MAX; 3])
-        );
+    fn the_default_ceiling_is_the_kodak_anchored_gray() {
+        // The default is a fixed physical anchor derived from the published
+        // LAD aims, not content percentiles: gray lands at the reference
+        // gray, and the film's densest content approaches white.
+        assert_eq!(Settings::default().density_max, Some(default_density_max()));
         assert_eq!(Settings::default().density_floor, None);
     }
 
