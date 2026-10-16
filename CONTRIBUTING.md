@@ -3,6 +3,15 @@
 Thanks for your interest. This document is short on purpose: if `just` is
 installed locally, exactly one command covers what CI checks.
 
+## Attribution
+
+External knowledge feeding the code is cited, never absorbed: see
+[`docs/ATTRIBUTION.md`](docs/ATTRIBUTION.md) for the rule and the current
+ledger. In short: published facts may be used and cited; other projects'
+code, constants, and undocumented numbers are not used. Any constant in the
+tree whose value has external provenance carries its citation in the doc
+comment where it lives.
+
 ## Prerequisites
 
 - A recent stable Rust toolchain (`rustup default stable` will do; the
