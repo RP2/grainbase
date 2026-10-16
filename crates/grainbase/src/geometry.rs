@@ -8,30 +8,204 @@
 //! film against light. In a typical camera scan the film fills the frame and the
 //! only bare light is whatever shows through the sprocket holes; the rebate and
 //! the inter-frame gaps are film, just unexposed. Clear film is the brightest
-//! thing the *film* shows, because nothing in it absorbs, and any exposure at all
-//! makes the picture darker. Measured on a real frame the separation is about 5x,
-//! which is enough to threshold.
+//! thing the *film* shows, because nothing in it absorbs, and any exposure at
+//! all makes the picture darker.
 //!
-//! The threshold is found by Otsu's method rather than fixed, because the level
-//! depends on the film, the light source, and the exposure. A fixed constant would
-//! be a guess that happens to work on one rig.
+//! The separation is narrow in practice: on the maintainer's real scan the
+//! thinnest picture area is about 0.028 and clear film is about 0.06, only a 2x
+//! step. A global brightness threshold therefore cannot split the two — the
+//! picture itself spans 0.001–0.06. The information is in the *straightness* and
+//! *local contrast* of the boundary: a frame edge is a long straight line with
+//! clear film on the outside and picture on the inside.
+//!
+//! This module finds those lines: it looks for strong, straight edges, builds
+//! candidate rectangles from pairs of near-vertical and near-horizontal lines,
+//! and keeps only the rectangle whose four edges consistently have clear film
+//! outside and picture inside. Every threshold is on geometry or on a contrast
+//! *difference* across a boundary; there is no absolute brightness threshold.
 //!
 //! This module is pure: image in, geometry out, no I/O.
 
 use crate::image::LinearImage;
 use crate::pipeline::{FilmBase, film_base};
 
-/// A row needs at least this share of picture pixels to count toward the extent,
-/// which skips the ragged corners where two edges meet.
-const MIN_COVERAGE: f32 = 0.25;
+/// Largest tilt treated as genuine. Beyond this it is not a crooked scan, it is
+/// a frame found wrongly, and rotating by it would wreck the picture.
+const MAX_SKEW: f32 = 0.20; // radians, about 11.5 degrees
 
-/// Share of rows, at each end, skipped when fitting an edge.
-const EDGE_MARGIN_NUMERATOR: usize = 1;
-const EDGE_MARGIN_DENOMINATOR: usize = 20; // 5%
+/// Target long side for the working image.
+///
+/// The real scan is 6000×4000. Scaling the longest side to about 1400 samples
+/// throws away grain noise while leaving frame edges hundreds of pixels long.
+const WORKING_LONG_SIDE: u32 = 1400;
 
-/// Largest tilt treated as genuine. Beyond this it is not a crooked scan, it is a
-/// frame found wrongly, and rotating by it would wreck the picture.
-const MAX_SKEW: f32 = 0.20; // radians, about 11 degrees
+/// Which gradient-magnitude percentile a candidate edge pixel must reach.
+///
+/// Adaptive: no absolute level. The strongest transitions (sprocket holes
+/// against film, film against the sensor margin) are far brighter than the
+/// frame boundary, so this percentile does not sit anywhere near the top of
+/// the distribution: a fixed p99 of gradient magnitude let the hole-band edges
+/// set the bar, and the picture/rebate boundary — the only boundary this
+/// module exists to find — never entered the candidate set at all, which is
+/// the failure the maintainer saw as the crop keeping the sprocket band.
+/// Measured on the real scan the hole edges reach a gradient around 0.24
+/// while the rebate step runs several times under it but well above grain:
+/// p90 keeps every real boundary while leaving pure grain noise out.
+const GRADIENT_PERCENTILE: f32 = 0.90;
+
+/// Angular resolution of the Hough accumulator, in radians.
+///
+/// 0.25 degrees is fine enough to resolve small tilt while keeping the
+/// accumulator small.
+const ANGLE_STEP: f32 = 0.004_363_323; // 0.25 degrees
+
+/// Offset resolution of the Hough accumulator, in downsampled pixels.
+///
+/// One pixel matches the working-grid precision after the box downsample; any
+/// coarser and the least-squares refinement would start too far from the edge.
+const OFFSET_STEP: f32 = 1.0;
+
+/// Maximum slope searched for either family of lines.
+///
+/// `tan(MAX_SKEW)`; slopes outside this range would imply a tilt larger than the
+/// frame-level gate.
+const MAX_LINE_SLOPE: f32 = 0.204_969_94; // tan(0.20)
+
+/// Minimum votes in a Hough cell for it to be considered a peak.
+///
+/// Keeps accidental alignments of a handful of noise pixels from becoming line
+/// candidates. Real edges produce dozens to hundreds of votes.
+const MIN_VOTES: u32 = 5;
+
+/// Half-width of the Hough peak-suppression window, in offset bins.
+///
+/// Candidate pixels of one real edge land in several adjacent offset bins; a
+/// one-real-edge-per-region window stops the same edge from surfacing as
+/// multiple peaks and eating the per-family peak budget.
+const NMS_OFFSET_RADIUS: usize = 6;
+
+/// Half-width of the Hough peak-suppression window, in angle bins.
+///
+/// With 0.25-degree bins this is one degree: the least-squares refinement
+/// moves a fitted slope by several bins from its Hough bin, and without the
+/// wider window the duplicates crowd out genuine lines.
+const NMS_ANGLE_RADIUS: usize = 4;
+
+/// Maximum number of peaks to refine per family.
+///
+/// A frame has four edges; keeping extras lets the rectangle stage choose
+/// between overlapping candidates, and at the p90 candidate bar plenty of
+/// picture-content edges compete for the same slots.
+const MAX_PEAKS_PER_FAMILY: usize = 24;
+
+/// Offset tolerance for treating two fitted lines as the same line, in
+/// downsampled pixels. Tied Hough bins refine to one line; this drops the
+/// remeasure.
+const DUPLICATE_OFFSET: f32 = 3.0;
+
+/// The same for slope, in the accumulator's slope units.
+const DUPLICATE_SLOPE: f32 = 0.01;
+
+/// How far from a frame's edge the image centre may sit and still count as
+/// inside, in source pixels.
+///
+/// Containment is a tie-break on equal scores; a centre coincident with an
+/// edge belongs to the rectangle it bounds. The length of a set of real
+/// transitions is small against frame sizes, so a couple of pixels of drift
+/// are nothing.
+const CENTER_TOLERANCE: f32 = 2.0;
+
+/// Maximum perpendicular distance, in downsampled pixels, for a candidate pixel
+/// to be an inlier of a fitted line.
+const INLIER_DISTANCE: f32 = 2.5;
+
+/// Maximum standard deviation of perpendicular residuals for a line to be
+/// considered straight.
+///
+/// Measured on synthetic data a perfect edge is sub-pixel; 1.5 px allows for
+/// grain, optical blur, and the box downsample while rejecting ragged scratches.
+const MAX_RESIDUAL_STD: f32 = 1.5;
+
+/// Minimum fraction of the line's own extent that inliers must cover.
+///
+/// Not a fraction of the image axis: a portrait frame in a wide sensor area —
+/// film stock and neighbour frames all around — has complete edges that span
+/// only part of one axis, so a threshold there throws away real frames. This
+/// gate only has to kill short scattered candidates: a strip of transition
+/// pixels with big holes along its run. Anything that survives this but is not
+/// a frame edge dies later, at the per-edge contrast gate in the rectangle
+/// assembly, which is where edge-vs-not is actually decidable.
+const MIN_SPAN_RATIO: f32 = 0.35;
+
+/// Minimum number of inliers for a line.
+///
+/// A real frame edge is hundreds of pixels long; 20 is a small fraction of that
+/// but is still enough for the synthetic tests.
+const MIN_LINE_INLIERS: usize = 20;
+
+/// Maximum angular disagreement between one edge and the median skew of a
+/// candidate rectangle, in radians.
+///
+/// Opposite edges of a rectangle share one tilt; this rejects inconsistent
+/// pairings of spurious lines.
+const MAX_SKEW_DISAGREEMENT: f32 = 0.05;
+
+/// Smallest dimension a found frame may have, as a fraction of the source image.
+///
+/// Generous: a 20% floor still passes the bounded-frame synthetic tests and
+/// rejects tiny accidental rectangles formed by scratches.
+const MIN_FRAME_EXTENT: f32 = 0.20;
+
+/// How much the measured rectangle is pulled in, per side, in working pixels.
+///
+/// The fitted line runs through the middle of the transition between picture
+/// and clear film, and the crop expands outward from it (floor on one side,
+/// ceiling on the other). Pulled in half a sample beyond that expansion, the
+/// axis-aligned crop holds picture pixels only — and everywhere else the soft,
+/// half-film samples at the border stay out of the result. The maintainer has
+/// ruled that keeping rebate looks worse than shaving a boundary sliver of the
+/// picture, so the error here is deliberately toward cutting in.
+const BOUNDARY_INSET: f32 = 0.7;
+
+/// Width of the score band in which two rectangles count as equal.
+///
+/// Finding this frame and finding the *next* frame past the inter-frame gap are
+/// locally indistinguishable: both are rectangles bounded by clear film on all
+/// four sides, with the same edge contrasts. Differences below the grain-noise
+/// floor are not evidence, so within the band the larger rectangle wins: the
+/// operator frames the current frame almost fully, while an equally-scored
+/// neighbour is the exceptional case.
+const SCORE_TIE: f32 = 0.004;
+
+/// Center offset of the contrast sampling band, in downsampled pixels.
+///
+/// Skips the smeared boundary; far enough to get a clean local mean, close
+/// enough not to cross another edge.
+const BAND_OFFSET: f32 = 8.0;
+
+/// Half-width of the contrast band, in downsampled pixels.
+///
+/// The band is the mean of the two offsets `BAND_OFFSET ± BAND_HALF_WIDTH`.
+const BAND_HALF_WIDTH: f32 = 2.0;
+
+/// Which quantile of an edge's band samples the gates read.
+///
+/// An edge's outside band is not uniform along its length: where the rebate
+/// narrows to nothing, sprocket holes sit directly above the picture. A mean
+/// over the band would smear that in; a 60th-percentile ignores up to two
+/// fifths of polluted samples while staying representative.
+const BAND_QUANTILE: f32 = 0.60;
+
+/// Minimum brightness step across a frame edge, in least-channel units.
+///
+/// The real picture/clear-film step is 0.02–0.03 and grain noise is about 0.002.
+/// A fifth of the step (0.006) is therefore a bright-side-outside gate that
+/// rejects interior tonal edges while accepting the real boundary.
+const MIN_CONTRAST_STEP: f32 = 0.006;
+
+/// Step between samples along an edge when measuring contrast, in downsampled
+/// pixels.
+const CONTRAST_SAMPLE_STEP: f32 = 2.0;
 
 /// A pixel coordinate as a float.
 ///
@@ -80,62 +254,977 @@ impl Frame {
 /// Finds the film frame, or `None` when the image has no pixels.
 ///
 /// Falls back to [`Frame::whole`] whenever there is nothing to measure: no
-/// separation between picture and clear film, or a tilt too large to be a crooked
-/// scan.
+/// strong straight edges, or no rectangle whose edges agree on a tilt and a
+/// contrast sign.
 #[must_use]
 pub fn find(image: &LinearImage) -> Option<Frame> {
-    let (width, height) = (image.width as usize, image.height as usize);
+    let width = image.width as usize;
+    let height = image.height as usize;
     if width == 0 || height == 0 {
         return None;
     }
 
-    let Some(threshold) = picture_threshold(image) else {
-        return Some(Frame::whole(image));
-    };
+    let (gray, scale) = downsample(image);
 
-    let measured = extents(image, threshold);
-    let picture_rows: Vec<usize> = (0..height)
-        .filter(|row| measured.coverage[*row] >= MIN_COVERAGE)
-        .collect();
-
-    // No row is mostly picture, or every row is. Either way there is no boundary
-    // to find, and inventing one would be worse than declining.
-    if picture_rows.is_empty() || picture_rows.len() >= height {
+    // The clear-film level, for the per-edge gates in the assembly. Reuses the
+    // film-base detector rather than measuring brightness here: the base *is*
+    // the clear-film level, and that detector already knows to ignore the
+    // sprocket holes, which are bare light rather than film.
+    let detected = FilmBase::detect(image, film_base::DEFAULT_PERCENTILE);
+    let base = detected
+        .transmittance
+        .iter()
+        .copied()
+        .fold(f32::INFINITY, f32::min);
+    if !base.is_finite() || base <= 0.0 {
+        // Without a measurable clear-film level there is no frame to find.
         return Some(Frame::whole(image));
     }
 
-    let left_edge = slope_of(&picture_rows, |row| measured.left[row]);
-    let right_edge = slope_of(&picture_rows, |row| measured.right[row]);
-
-    // A near-vertical edge of a frame rotated by theta has dx/dy = -tan(theta),
-    // so the skew is the negation of the fitted slope.
-    let Some(skew) = combine(&[left_edge, right_edge])
-        .map(|slope| -slope)
-        .filter(|slope| slope.abs() <= MAX_SKEW)
-    else {
+    let Some(first) = detect_frame(&gray, scale, image.width, image.height, base) else {
         return Some(Frame::whole(image));
     };
 
-    let first = picture_rows[0];
-    let last = picture_rows[picture_rows.len() - 1];
-    let left = median(&measured.left[first..=last]);
-    let right = median(&measured.right[first..=last]);
+    // Straighten the analysis grid and detect again. Sizes are rotation
+    // invariant; only the centre needs mapping back.
+    let rotated = rotate_gray(&gray, -first.skew);
+    let Some(second) = detect_frame(&rotated, scale, image.width, image.height, base) else {
+        return Some(first);
+    };
+
+    let skew = first.skew + second.skew;
+    if skew.abs() > MAX_SKEW {
+        return Some(Frame::whole(image));
+    }
+
+    let src_w = coordinate(width);
+    let src_h = coordinate(height);
+    let (sin, cos) = first.skew.sin_cos();
+    let qx = second.center[0] - src_w / 2.0;
+    let qy = second.center[1] - src_h / 2.0;
+    let center = [
+        src_w / 2.0 + cos * qx - sin * qy,
+        src_h / 2.0 + sin * qx + cos * qy,
+    ];
 
     Some(Frame {
-        center: [
-            f32::midpoint(left, right),
-            f32::midpoint(coordinate(first), coordinate(last)),
-        ],
-        size: [right - left, coordinate(last) - coordinate(first)],
+        center,
+        size: second.size,
         skew,
     })
 }
 
-/// Per-row picture extent.
-struct Extents {
-    left: Vec<f32>,
-    right: Vec<f32>,
-    coverage: Vec<f32>,
+/// Runs the whole detection pipeline on one analysis grid.
+///
+/// The grid may already be straightened; coordinates come back in that grid's
+/// space, scaled to source pixels. `base` is the least-channel clear-film
+/// level, measured once by [`FilmBase`] and shared by both passes.
+fn detect_frame(
+    gray: &GrayImage,
+    scale: f32,
+    source_width: u32,
+    source_height: u32,
+    base: f32,
+) -> Option<Frame> {
+    let gradients = gradient(gray);
+    let (vertical, horizontal) = candidates(gray, &gradients);
+    if vertical.is_empty() || horizontal.is_empty() {
+        return None;
+    }
+
+    let dw = gray.width as usize;
+    let dh = gray.height as usize;
+    let vertical_lines = find_lines(&vertical, dw, dh, Family::Vertical);
+    let horizontal_lines = find_lines(&horizontal, dw, dh, Family::Horizontal);
+    if vertical_lines.is_empty() || horizontal_lines.is_empty() {
+        return None;
+    }
+
+    assemble_frame(
+        &vertical_lines,
+        &horizontal_lines,
+        gray,
+        scale,
+        source_width,
+        source_height,
+        base,
+    )
+}
+
+/// Rotates an analysis grid by `angle` about its centre.
+///
+/// Full extent, nothing cropped, and samples outside the grid clamp to the
+/// edge — a lossy operation, which is why it happens only to the downsampled
+/// analysis image and never to the scan itself.
+fn rotate_gray(image: &GrayImage, angle: f32) -> GrayImage {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let (cx, cy) = (coordinate(width) / 2.0, coordinate(height) / 2.0);
+    let (sin, cos) = angle.sin_cos();
+
+    let mut data = vec![0.0f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let dx = coordinate(x) - cx;
+            let dy = coordinate(y) - cy;
+            // Inverse of "rotate the content by angle": sample the source.
+            let sx = cx + cos * dx + sin * dy;
+            let sy = cy - sin * dx + cos * dy;
+            data[y * width + x] = sample_gray(image, width, height, sx, sy);
+        }
+    }
+
+    GrayImage {
+        width: image.width,
+        height: image.height,
+        data,
+    }
+}
+
+/// A downsampled grayscale image.
+struct GrayImage {
+    width: u32,
+    height: u32,
+    data: Vec<f32>,
+}
+
+impl GrayImage {
+    fn get(&self, x: usize, y: usize) -> f32 {
+        self.data[y * self.width as usize + x]
+    }
+}
+
+/// Builds the least-channel grayscale image and box-downsamples it so the
+/// longest side is about [`WORKING_LONG_SIDE`] samples.
+///
+/// Returns the working image and the source-to-working scale factor.
+fn downsample(image: &LinearImage) -> (GrayImage, f32) {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let max_dim = image.width.max(image.height);
+
+    let factor = if max_dim <= WORKING_LONG_SIDE {
+        1
+    } else {
+        max_dim.div_ceil(WORKING_LONG_SIDE)
+    } as usize;
+
+    let gray: Vec<f32> = image
+        .data
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(least_channel)
+        .collect();
+
+    if factor == 1 {
+        return (
+            GrayImage {
+                width: image.width,
+                height: image.height,
+                data: gray,
+            },
+            1.0,
+        );
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "downsample factor is at most a small integer"
+    )]
+    let scale = factor as f32;
+    let out_w = width.div_ceil(factor);
+    let out_h = height.div_ceil(factor);
+    let mut out = vec![0.0f32; out_w * out_h];
+
+    for oy in 0..out_h {
+        let y0 = oy * factor;
+        let y1 = ((oy + 1) * factor).min(height);
+        for ox in 0..out_w {
+            let x0 = ox * factor;
+            let x1 = ((ox + 1) * factor).min(width);
+
+            let mut sum = 0.0f32;
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    sum += gray[y * width + x];
+                    count += 1;
+                }
+            }
+            out[oy * out_w + ox] = sum / coordinate(count);
+        }
+    }
+
+    (
+        GrayImage {
+            width: u32::try_from(out_w).unwrap_or(1),
+            height: u32::try_from(out_h).unwrap_or(1),
+            data: out,
+        },
+        scale,
+    )
+}
+
+/// Gradient components and magnitude on the working grid.
+struct Gradient {
+    gx: Vec<f32>,
+    gy: Vec<f32>,
+    mag: Vec<f32>,
+}
+
+/// Central-difference gradient magnitude on the least-channel image.
+fn gradient(image: &GrayImage) -> Gradient {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let len = width * height;
+    let mut gx = vec![0.0f32; len];
+    let mut gy = vec![0.0f32; len];
+    let mut mag = vec![0.0f32; len];
+
+    for y in 1..height.saturating_sub(1) {
+        for x in 1..width.saturating_sub(1) {
+            let idx = y * width + x;
+            let dx = (image.get(x + 1, y) - image.get(x - 1, y)) * 0.5;
+            let dy = (image.get(x, y + 1) - image.get(x, y - 1)) * 0.5;
+            gx[idx] = dx;
+            gy[idx] = dy;
+            mag[idx] = f32::hypot(dx, dy);
+        }
+    }
+
+    Gradient { gx, gy, mag }
+}
+
+/// A candidate edge pixel on the working grid.
+struct Candidate {
+    x: f32,
+    y: f32,
+    gx: f32,
+    gy: f32,
+}
+
+/// Splits candidate edge pixels into near-vertical and near-horizontal families.
+///
+/// Near-vertical edges have a strong horizontal gradient; near-horizontal edges
+/// have a strong vertical gradient. Only the top percentile of gradient
+/// magnitude is kept.
+fn candidates(image: &GrayImage, grad: &Gradient) -> (Vec<Candidate>, Vec<Candidate>) {
+    let width = image.width as usize;
+    let height = image.height as usize;
+
+    let threshold = percentile(&grad.mag, GRADIENT_PERCENTILE);
+
+    let mut vertical = Vec::new();
+    let mut horizontal = Vec::new();
+
+    for y in 0..height {
+        for x in 0..width {
+            let idx = y * width + x;
+            let m = grad.mag[idx];
+            // At or below the bar — which is zero at or below for an image with
+            // no texture at all.
+            if m <= threshold {
+                continue;
+            }
+            let c = Candidate {
+                x: coordinate(x),
+                y: coordinate(y),
+                gx: grad.gx[idx],
+                gy: grad.gy[idx],
+            };
+            if c.gx.abs() > c.gy.abs() {
+                vertical.push(c);
+            } else {
+                horizontal.push(c);
+            }
+        }
+    }
+
+    (vertical, horizontal)
+}
+
+/// Returns the value at the given fractional rank, or `0.0` for an empty slice.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the index is a non-negative fraction of the slice length and fits usize"
+)]
+fn percentile(values: &[f32], fraction: f32) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted: Vec<f32> = values.to_vec();
+    let index = (coordinate(sorted.len().saturating_sub(1)) * fraction.clamp(0.0, 1.0)) as usize;
+    let (_left, value, _right) = sorted.select_nth_unstable_by(index, f32::total_cmp);
+    *value
+}
+
+/// Which family a line belongs to.
+#[derive(Debug, Clone, Copy)]
+enum Family {
+    /// `x = a + m * y`
+    Vertical,
+    /// `y = b + m * x`
+    Horizontal,
+}
+
+/// A fitted line on the working grid.
+#[derive(Clone, Copy)]
+struct Line {
+    /// Intercept: `a` for vertical family, `b` for horizontal family.
+    a: f32,
+    /// Slope: `dx/dy` for vertical family, `dy/dx` for horizontal family.
+    m: f32,
+}
+
+/// Runs a Hough-style accumulator for one family and refines the strongest peaks.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "accumulator dimensions are derived from small positive counts and angles"
+)]
+fn find_lines(candidates: &[Candidate], width: usize, height: usize, family: Family) -> Vec<Line> {
+    let angle_bins = (2.0 * MAX_SKEW / ANGLE_STEP).ceil() as usize + 1;
+    let angle_min = -MAX_SKEW;
+    let slopes: Vec<f32> = (0..angle_bins)
+        .map(|i| {
+            let angle = angle_min + coordinate(i) * ANGLE_STEP;
+            f32::tan(angle)
+        })
+        .collect();
+
+    let last_x = coordinate(width.saturating_sub(1));
+    let last_y = coordinate(height.saturating_sub(1));
+    let (offset_min, offset_max) = match family {
+        Family::Vertical => (-MAX_LINE_SLOPE * last_y, last_x + MAX_LINE_SLOPE * last_y),
+        Family::Horizontal => (-MAX_LINE_SLOPE * last_x, last_y + MAX_LINE_SLOPE * last_x),
+    };
+    let offset_bins = ((offset_max - offset_min) / OFFSET_STEP).ceil() as usize + 1;
+
+    let mut acc = vec![vec![0u32; offset_bins]; angle_bins];
+
+    for c in candidates {
+        for (ai, &m) in slopes.iter().enumerate() {
+            let rho = match family {
+                Family::Vertical => c.x - m * c.y,
+                Family::Horizontal => c.y - m * c.x,
+            };
+            let Some(oi) = bin_index(rho, offset_min, OFFSET_STEP, offset_bins) else {
+                continue;
+            };
+            acc[ai][oi] += 1;
+        }
+    }
+
+    let peaks = extract_peaks(&acc);
+
+    let mut lines = Vec::new();
+    for (ai, oi, _votes) in peaks.into_iter().take(MAX_PEAKS_PER_FAMILY) {
+        let m0 = slopes[ai];
+        let a0 = offset_min + coordinate(oi) * OFFSET_STEP;
+        let Some(line) = refine_line(candidates, family, a0, m0, width, height) else {
+            continue;
+        };
+
+        // Tied bins refine to the same line; keep the first fit.
+        let duplicate = lines.iter().any(|fitted: &Line| {
+            (fitted.a - line.a).abs() < DUPLICATE_OFFSET
+                && (fitted.m - line.m).abs() < DUPLICATE_SLOPE
+        });
+        if !duplicate {
+            lines.push(line);
+        }
+    }
+
+    lines
+}
+
+/// Maps a continuous parameter to a bin index, or `None` if it lies outside.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "value is checked to be within [0, bins) before truncation"
+)]
+fn bin_index(value: f32, min: f32, step: f32, bins: usize) -> Option<usize> {
+    let f = (value - min) / step;
+    if f < 0.0 || f >= coordinate(bins) {
+        return None;
+    }
+    Some(f as usize)
+}
+
+/// Extracts local maxima from the accumulator, sorted by vote count descending.
+///
+/// The comparison against peers is strict, not greater-or-equal: the transition
+/// band between picture and film straddles one or two offset bins and those
+/// bins usually tie, and with greater-or-equal each suppressed the other until
+/// no peak survived at all. Both bins survive here and only ever refine to the
+/// same line, which [`find_lines`] deduplicates.
+fn extract_peaks(acc: &[Vec<u32>]) -> Vec<(usize, usize, u32)> {
+    let angle_bins = acc.len();
+    if angle_bins == 0 {
+        return Vec::new();
+    }
+    let offset_bins = acc[0].len();
+
+    let mut peaks = Vec::new();
+    for ai in 0..angle_bins {
+        for oi in 0..offset_bins {
+            let count = acc[ai][oi];
+            if count < MIN_VOTES {
+                continue;
+            }
+
+            let mut is_max = true;
+            for dai in 0..=2 * NMS_ANGLE_RADIUS {
+                let ai_n = ai.saturating_add(dai).saturating_sub(NMS_ANGLE_RADIUS);
+                if ai_n >= angle_bins {
+                    continue;
+                }
+                for doi in 0..=2 * NMS_OFFSET_RADIUS {
+                    let oi_n = oi.saturating_add(doi).saturating_sub(NMS_OFFSET_RADIUS);
+                    if oi_n >= offset_bins || (ai_n == ai && oi_n == oi) {
+                        continue;
+                    }
+                    if acc[ai_n][oi_n] > count {
+                        is_max = false;
+                        break;
+                    }
+                }
+                if !is_max {
+                    break;
+                }
+            }
+
+            if is_max {
+                peaks.push((ai, oi, count));
+            }
+        }
+    }
+
+    peaks.sort_by_key(|a| std::cmp::Reverse(a.2));
+    peaks
+}
+
+/// Refines a Hough peak with least-squares and quality gates.
+fn refine_line(
+    candidates: &[Candidate],
+    family: Family,
+    a0: f32,
+    m0: f32,
+    width: usize,
+    height: usize,
+) -> Option<Line> {
+    let (a, m) = fit_line(candidates, family, a0, m0)?;
+    let (a, m) = fit_line(candidates, family, a, m)?;
+
+    let stats = line_stats(candidates, family, a, m, width, height)?;
+    if stats.count < MIN_LINE_INLIERS
+        || stats.residual_std > MAX_RESIDUAL_STD
+        || stats.span_ratio < MIN_SPAN_RATIO
+    {
+        return None;
+    }
+
+    Some(Line { a, m })
+}
+
+/// Fits a line to its inliers and returns the refined parameters.
+fn fit_line(candidates: &[Candidate], family: Family, a: f32, m: f32) -> Option<(f32, f32)> {
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    for c in candidates {
+        if distance_to_line(c, family, a, m).abs() <= INLIER_DISTANCE {
+            xs.push(c.x);
+            ys.push(c.y);
+        }
+    }
+
+    let n = coordinate(xs.len());
+    if xs.len() < 4 {
+        return None;
+    }
+
+    let mean_x = xs.iter().sum::<f32>() / n;
+    let mean_y = ys.iter().sum::<f32>() / n;
+
+    match family {
+        Family::Vertical => {
+            let mut var_y = 0.0f32;
+            let mut cov_xy = 0.0f32;
+            for i in 0..xs.len() {
+                let dy = ys[i] - mean_y;
+                var_y += dy * dy;
+                cov_xy += dy * (xs[i] - mean_x);
+            }
+            if var_y <= 0.0 {
+                return None;
+            }
+            let m_new = cov_xy / var_y;
+            let a_new = mean_x - m_new * mean_y;
+            Some((a_new, m_new))
+        }
+        Family::Horizontal => {
+            let mut var_x = 0.0f32;
+            let mut cov_xy = 0.0f32;
+            for i in 0..xs.len() {
+                let dx = xs[i] - mean_x;
+                var_x += dx * dx;
+                cov_xy += dx * (ys[i] - mean_y);
+            }
+            if var_x <= 0.0 {
+                return None;
+            }
+            let m_new = cov_xy / var_x;
+            let b_new = mean_y - m_new * mean_x;
+            Some((b_new, m_new))
+        }
+    }
+}
+
+/// Signed perpendicular distance from a candidate to a line.
+fn distance_to_line(c: &Candidate, family: Family, a: f32, m: f32) -> f32 {
+    let num = match family {
+        Family::Vertical => c.x - a - m * c.y,
+        Family::Horizontal => c.y - a - m * c.x,
+    };
+    num / f32::hypot(1.0, m)
+}
+
+/// Quality statistics for a fitted line.
+struct LineStats {
+    count: usize,
+    residual_std: f32,
+    span_ratio: f32,
+}
+
+/// Computes inlier count, residual spread, and span ratio for a line.
+fn line_stats(
+    candidates: &[Candidate],
+    family: Family,
+    a: f32,
+    m: f32,
+    width: usize,
+    height: usize,
+) -> Option<LineStats> {
+    let mut residuals = Vec::new();
+    let mut along = Vec::new();
+
+    for c in candidates {
+        let d = distance_to_line(c, family, a, m);
+        if d.abs() <= INLIER_DISTANCE {
+            residuals.push(d);
+            along.push(match family {
+                Family::Vertical => c.y,
+                Family::Horizontal => c.x,
+            });
+        }
+    }
+
+    if residuals.is_empty() {
+        return None;
+    }
+
+    let mean = residuals.iter().sum::<f32>() / coordinate(residuals.len());
+    let variance = residuals
+        .iter()
+        .map(|r| (r - mean) * (r - mean))
+        .sum::<f32>()
+        / coordinate(residuals.len());
+    let residual_std = variance.sqrt();
+
+    let extent = line_extent(family, a, m, width, height);
+    let span = along.iter().copied().fold(f32::INFINITY, f32::min)
+        ..along.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let span_length = span.end - span.start;
+    let span_ratio = if extent > 0.0 {
+        span_length / extent
+    } else {
+        0.0
+    };
+
+    Some(LineStats {
+        count: residuals.len(),
+        residual_std,
+        span_ratio,
+    })
+}
+
+/// Length of the segment where the line lies inside the image.
+fn line_extent(family: Family, a: f32, m: f32, width: usize, height: usize) -> f32 {
+    let last_x = coordinate(width.saturating_sub(1));
+    let last_y = coordinate(height.saturating_sub(1));
+
+    match family {
+        Family::Vertical => {
+            // x = a + m * y must stay within [0, last_x] while y in [0, last_y].
+            let mut y0 = 0.0f32;
+            let mut y1 = last_y;
+            if m.abs() > 1e-6 {
+                let y_at_x0 = -a / m;
+                let y_at_x1 = (last_x - a) / m;
+                if m > 0.0 {
+                    y0 = y0.max(y_at_x0);
+                    y1 = y1.min(y_at_x1);
+                } else {
+                    y0 = y0.max(y_at_x1);
+                    y1 = y1.min(y_at_x0);
+                }
+            } else if a < 0.0 || a > last_x {
+                return 0.0;
+            }
+            (y1 - y0).max(0.0)
+        }
+        Family::Horizontal => {
+            // y = a + m * x must stay within [0, last_y] while x in [0, last_x].
+            let mut x0 = 0.0f32;
+            let mut x1 = last_x;
+            if m.abs() > 1e-6 {
+                let x_at_y0 = -a / m;
+                let x_at_y1 = (last_y - a) / m;
+                if m > 0.0 {
+                    x0 = x0.max(x_at_y0);
+                    x1 = x1.min(x_at_y1);
+                } else {
+                    x0 = x0.max(x_at_y1);
+                    x1 = x1.min(x_at_y0);
+                }
+            } else if a < 0.0 || a > last_y {
+                return 0.0;
+            }
+            (x1 - x0).max(0.0)
+        }
+    }
+}
+
+/// Tries every ordered pair of vertical lines and every ordered pair of
+/// horizontal lines, keeping the best-scoring candidate rectangle.
+///
+/// Ties break first toward a rectangle that contains the image centre, then
+/// toward the larger area.
+fn assemble_frame(
+    vertical: &[Line],
+    horizontal: &[Line],
+    image: &GrayImage,
+    scale: f32,
+    source_width: u32,
+    source_height: u32,
+    base: f32,
+) -> Option<Frame> {
+    let dw = image.width as usize;
+    let dh = image.height as usize;
+    let src_w = coordinate(source_width as usize);
+    let src_h = coordinate(source_height as usize);
+
+    let mut candidates_valid: Option<(Frame, f32, bool)> = None;
+    let mut best_area = 0.0f32;
+
+    for left in vertical {
+        for right in vertical {
+            if std::ptr::eq(left, right) {
+                continue;
+            }
+            for top in horizontal {
+                for bottom in horizontal {
+                    if std::ptr::eq(top, bottom) {
+                        continue;
+                    }
+
+                    let Some((frame, score, contains_center)) = score_rectangle(
+                        *left, *right, *top, *bottom, image, dw, dh, scale, src_w, src_h, base,
+                    ) else {
+                        continue;
+                    };
+
+                    let area = frame.size[0] * frame.size[1];
+                    let better = match &candidates_valid {
+                        None => true,
+                        Some((_, best_score, best_contains)) => {
+                            if score > *best_score + SCORE_TIE {
+                                true
+                            } else if score >= *best_score - SCORE_TIE {
+                                match (contains_center, *best_contains) {
+                                    (true, false) => true,
+                                    (false, true) => false,
+                                    // A smaller equal-scoring rectangle is
+                                    // exactly the swallowed-rebate case; the
+                                    // larger shape cannot be a frame whose
+                                    // edges were missed, because any valid
+                                    // interior rectangle has picture outside
+                                    // its edges and fails the level window.
+                                    _ => area < best_area,
+                                }
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if better {
+                        candidates_valid = Some((frame, score, contains_center));
+                        best_area = area;
+                    }
+                }
+            }
+        }
+    }
+
+    candidates_valid.map(|(frame, _, _)| frame)
+}
+
+/// Scores one candidate rectangle. Returns `None` if the rectangle fails any
+/// consistency or clear-film gate.
+///
+/// `base` is the least-channel clear-film level for this frame, measured by
+/// the film-base detector on the same image.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "rectangle scoring needs the four lines, the image, dimensions, scale, and base"
+)]
+fn score_rectangle(
+    left: Line,
+    right: Line,
+    top: Line,
+    bottom: Line,
+    image: &GrayImage,
+    dw: usize,
+    dh: usize,
+    scale: f32,
+    src_w: f32,
+    src_h: f32,
+    base: f32,
+) -> Option<(Frame, f32, bool)> {
+    let skew_left = -f32::atan(left.m);
+    let skew_right = -f32::atan(right.m);
+    let skew_top = f32::atan(top.m);
+    let skew_bottom = f32::atan(bottom.m);
+    let skew = median4([skew_left, skew_right, skew_top, skew_bottom]);
+
+    if [skew_left, skew_right, skew_top, skew_bottom]
+        .iter()
+        .any(|s| (*s - skew).abs() > MAX_SKEW_DISAGREEMENT)
+    {
+        return None;
+    }
+    if skew.abs() > MAX_SKEW {
+        return None;
+    }
+
+    let cos = f32::cos(skew);
+
+    // In deskewed coordinates vertical lines become x' = a * cos(skew) and
+    // horizontal lines become y' = b * cos(skew).
+    let mut x0 = left.a * cos;
+    let mut x1 = right.a * cos;
+    if x0 > x1 {
+        std::mem::swap(&mut x0, &mut x1);
+    }
+    let mut y0 = top.a * cos;
+    let mut y1 = bottom.a * cos;
+    if y0 > y1 {
+        std::mem::swap(&mut y0, &mut y1);
+    }
+
+    let inset = BOUNDARY_INSET;
+    let width_source = ((x1 - x0) - 2.0 * inset) * scale;
+    let height_source = ((y1 - y0) - 2.0 * inset) * scale;
+    if width_source < MIN_FRAME_EXTENT * src_w || height_source < MIN_FRAME_EXTENT * src_h {
+        return None;
+    }
+
+    let tl = intersect(left, top);
+    let tr = intersect(right, top);
+    let bl = intersect(left, bottom);
+    let br = intersect(right, bottom);
+    let corners = [tl, tr, bl, br];
+
+    let left_out = normalize([-1.0, left.m]);
+    let right_out = normalize([1.0, -right.m]);
+    let top_out = normalize([top.m, -1.0]);
+    let bottom_out = normalize([-bottom.m, 1.0]);
+
+    let left_contrast = edge_quality(image, dw, dh, tl, bl, left_out, base)?;
+    let right_contrast = edge_quality(image, dw, dh, tr, br, right_out, base)?;
+    let top_contrast = edge_quality(image, dw, dh, tl, tr, top_out, base)?;
+    let bottom_contrast = edge_quality(image, dw, dh, bl, br, bottom_out, base)?;
+
+    let center_ds = [
+        (tl.0 + tr.0 + bl.0 + br.0) * 0.25,
+        (tl.1 + tr.1 + bl.1 + br.1) * 0.25,
+    ];
+    let center = [center_ds[0] * scale, center_ds[1] * scale];
+
+    // Guard against lines that meet far outside the image.
+    if center[0] < 0.0 || center[0] > src_w || center[1] < 0.0 || center[1] > src_h {
+        return None;
+    }
+
+    // Additional guard: no corner may lie absurdly far from the image, which
+    // would mean the four lines do not actually form a usable rectangle.
+    let margin = src_w.max(src_h) * 2.0;
+    if corners
+        .iter()
+        .any(|(x, y)| x.abs() > margin || y.abs() > margin)
+    {
+        return None;
+    }
+
+    let score = left_contrast + right_contrast + top_contrast + bottom_contrast;
+    let frame = Frame {
+        center,
+        size: [width_source, height_source],
+        skew,
+    };
+
+    // Does the rectangle contain the image centre? The operator frames the
+    // current frame near the middle of the sensor; a clipped neighbour frame is
+    // the exception. Used only as a tie-break between equal-scoring
+    // rectangles, which happen when a neighbour frame is fully visible. The
+    // tolerance lets a centre lying exactly on a boundary count as contained:
+    // the fitted lines run through the middle of a finite-wide transition.
+    let ix = src_w / 2.0;
+    let iy = src_h / 2.0;
+    let contains_center = (frame.center[0] - ix).abs() <= frame.size[0] / 2.0 + CENTER_TOLERANCE
+        && (frame.center[1] - iy).abs() <= frame.size[1] / 2.0 + CENTER_TOLERANCE;
+
+    Some((frame, score, contains_center))
+}
+
+/// Normalizes a vector to unit length, or returns the zero vector.
+fn normalize(v: [f32; 2]) -> [f32; 2] {
+    let len = f32::hypot(v[0], v[1]);
+    if len == 0.0 {
+        return [0.0; 2];
+    }
+    [v[0] / len, v[1] / len]
+}
+
+/// Intersection of a vertical-family line and a horizontal-family line.
+fn intersect(vertical: Line, horizontal: Line) -> (f32, f32) {
+    let denom = 1.0 - vertical.m * horizontal.m;
+    if denom.abs() < 1e-6 {
+        return (0.0, 0.0);
+    }
+    let x = (vertical.a + vertical.m * horizontal.a) / denom;
+    let y = horizontal.a + horizontal.m * x;
+    (x, y)
+}
+
+/// Median of four values.
+fn median4(mut values: [f32; 4]) -> f32 {
+    values.sort_by(f32::total_cmp);
+    f32::midpoint(values[1], values[2])
+}
+
+/// How far below the clear-film level the outside band may sit, as a fraction
+/// of the base.
+///
+/// The outside of every frame edge is clear film, so anything darker than a
+/// fraction of the base is not film: the black sensor margin around the strip
+/// measures a fiftieth of the base, and its edge lines are precisely what a
+/// whole-strip rectangle is built from.
+const OUTSIDE_BASE_MIN: f32 = 0.4;
+
+/// How far above the clear-film level the outside band may sit, as a fraction
+/// of the base.
+///
+/// Bare light — sprocket holes — measures about ten times the base on a real
+/// scan, so a hole-band edge cannot become the outside of a frame side. The
+/// window is deliberately generous: uneven illumination shifts the rebate a
+/// little, the holes shift it an order of magnitude.
+const OUTSIDE_BASE_MAX: f32 = 2.5;
+
+/// Samples one edge and applies the frame's per-edge gates.
+///
+/// `outward` is the unit normal pointing toward the clear-film side, computed
+/// per edge in [`score_rectangle`]: for the left edge it points toward negative
+/// x, the right edge toward positive x, the top edge toward negative y, and the
+/// bottom edge toward positive y.
+///
+/// Two gates, both on quantiles along the edge rather than means, because an
+/// edge's band is not uniform: where the rebate narrows to nothing the holes
+/// sit directly above the picture, and a mean over the whole edge would smear
+/// that in. The 60th-percentile keeps the band's typical sample.
+///
+/// * the outside band must be clear film: its level sits between fractions of
+///   the measured base ([`OUTSIDE_BASE_MIN`], [`OUTSIDE_BASE_MAX`]).
+/// * the outside must be clearly brighter than the inside:
+///   [`MIN_CONTRAST_STEP`].
+///
+/// Returns the measured step if both gates pass.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "step count is a positive length divided by a positive step size"
+)]
+fn edge_quality(
+    image: &GrayImage,
+    width: usize,
+    height: usize,
+    start: (f32, f32),
+    end: (f32, f32),
+    outward: [f32; 2],
+    base: f32,
+) -> Option<f32> {
+    let dx = end.0 - start.0;
+    let dy = end.1 - start.1;
+    let length = f32::hypot(dx, dy);
+    if length == 0.0 {
+        return None;
+    }
+
+    let steps = ((length / CONTRAST_SAMPLE_STEP).ceil() as usize).max(1);
+
+    let offsets = [BAND_OFFSET - BAND_HALF_WIDTH, BAND_OFFSET + BAND_HALF_WIDTH];
+    let mut outside = Vec::with_capacity(steps * offsets.len());
+    let mut inside = Vec::with_capacity(steps * offsets.len());
+
+    for step in 0..steps {
+        let t = coordinate(step) / coordinate(steps - 1);
+        let px = start.0 + dx * t;
+        let py = start.1 + dy * t;
+
+        for &offset in &offsets {
+            let ox = px + outward[0] * offset;
+            let oy = py + outward[1] * offset;
+            let ix = px - outward[0] * offset;
+            let iy = py - outward[1] * offset;
+
+            outside.push(sample_gray(image, width, height, ox, oy));
+            inside.push(sample_gray(image, width, height, ix, iy));
+        }
+    }
+
+    let out_level = percentile(&outside, BAND_QUANTILE);
+    let in_level = percentile(&inside, BAND_QUANTILE);
+    let diff = out_level - in_level;
+    if out_level < OUTSIDE_BASE_MIN * base
+        || out_level > OUTSIDE_BASE_MAX * base
+        || diff < MIN_CONTRAST_STEP
+    {
+        return None;
+    }
+    Some(diff)
+}
+
+/// Bilinear sample of the working grayscale image, clamped to the edge.
+fn sample_gray(image: &GrayImage, width: usize, height: usize, x: f32, y: f32) -> f32 {
+    let last_x = coordinate(width.saturating_sub(1));
+    let last_y = coordinate(height.saturating_sub(1));
+    let clamp_x = |v: f32| v.clamp(0.0, last_x);
+    let clamp_y = |v: f32| v.clamp(0.0, last_y);
+    let (x, y) = (clamp_x(x), clamp_y(y));
+
+    let x0 = floor_to_usize(x);
+    let y0 = floor_to_usize(y);
+    let x1 = (x0 + 1).min(width.saturating_sub(1));
+    let y1 = (y0 + 1).min(height.saturating_sub(1));
+    let fx = x - coordinate(x0);
+    let fy = y - coordinate(y0);
+
+    let top = image.get(x0, y0) * (1.0 - fx) + image.get(x1, y0) * fx;
+    let bottom = image.get(x0, y1) * (1.0 - fx) + image.get(x1, y1) * fx;
+    top * (1.0 - fy) + bottom * fy
 }
 
 /// The lowest channel value, which is what the orange mask suppresses.
@@ -145,155 +1234,6 @@ struct Extents {
 /// reading as clear film.
 fn least_channel(pixel: &[f32; 3]) -> f32 {
     pixel[0].min(pixel[1]).min(pixel[2])
-}
-
-/// How far below the clear-film level the picture starts, as a fraction.
-///
-/// Clear film sits *at* the base: nothing in it absorbs. Any exposure puts the
-/// picture below that, so the boundary is the base level less a margin for noise
-/// in the clear film itself. 0.8 is about a tenth of a density step.
-const PICTURE_FRACTION: f32 = 0.8;
-
-/// The highest least-channel value that is still film, which is clear film.
-///
-/// Reuses the film-base detector rather than measuring brightness here: the base
-/// *is* the clear-film level, and that detector already knows to ignore the
-/// sprocket holes, which are not film at all.
-fn clear_film_level(image: &LinearImage) -> Option<f32> {
-    let base = FilmBase::detect(image, film_base::DEFAULT_PERCENTILE);
-    let level = base
-        .transmittance
-        .iter()
-        .copied()
-        .fold(f32::INFINITY, f32::min);
-
-    (level.is_finite() && level > 0.0).then_some(level)
-}
-
-/// The level separating clear film from exposed picture.
-///
-/// Returns `None` when there is nothing to separate.
-///
-/// Deliberately *not* a global threshold like Otsu's. The film population is a
-/// continuum from dense to thin with no bimodality between "picture" and "clear
-/// film", so a variance-maximising split lands inside the picture's own tonal
-/// range, fragmenting every row and reading the fragmentation as a tilt. Measured:
-/// 8 degrees of skew on a frame that is straight.
-fn picture_threshold(image: &LinearImage) -> Option<f32> {
-    clear_film_level(image).map(|level| level * PICTURE_FRACTION)
-}
-
-/// Measures each row's picture extent.
-///
-/// A row is scanned for runs of picture pixels, and the longest run wins — with
-/// small gaps *inside* a run tolerated and large ones not.
-///
-/// Both extremes fail on their own. A row's first-to-last picture pixel swallows
-/// the inter-frame gap and the next frame with it. A strict longest-run breaks
-/// wherever the picture varies across the threshold, so the run's start jumps
-/// between rows and the edge fit reads that as tilt — measured at 6.7 degrees on a
-/// frame that is straight. The two cases differ only in size: a few percent of the
-/// width is threshold noise, and the inter-frame gap is wider than that.
-fn extents(image: &LinearImage, threshold: f32) -> Extents {
-    let width = image.width as usize;
-    let height = image.height as usize;
-    let (pixels, _remainder) = image.data.as_chunks::<3>();
-    let max_gap = (width / 32).max(1);
-
-    let mut left = vec![0.0f32; height];
-    let mut right = vec![0.0f32; height];
-    let mut coverage = vec![0.0f32; height];
-
-    for row in 0..height {
-        let mut best = (0usize, 0usize);
-        let mut run_start: Option<usize> = None;
-        let mut last_picture = 0usize;
-
-        for column in 0..width {
-            if least_channel(&pixels[row * width + column]) >= threshold {
-                continue;
-            }
-            match run_start {
-                None => run_start = Some(column),
-                Some(start) if column - last_picture > max_gap => {
-                    best = longer(best, (start, last_picture + 1));
-                    run_start = Some(column);
-                }
-                Some(_) => {}
-            }
-            last_picture = column;
-        }
-
-        if let Some(start) = run_start {
-            best = longer(best, (start, last_picture + 1));
-        }
-
-        let (start, end) = best;
-        left[row] = coordinate(start);
-        // `end` is exclusive; the fallback keeps a row with no picture from
-        // claiming the whole width.
-        right[row] = coordinate(end.saturating_sub(1).max(start));
-        coverage[row] = coordinate(end - start) / coordinate(width.max(1));
-    }
-
-    Extents {
-        left,
-        right,
-        coverage,
-    }
-}
-
-/// Slope of an edge, as `dx/dy`, fitted over the middle of the rows.
-///
-/// The ends are skipped because that is where one edge meets the next and bends.
-fn slope_of(rows: &[usize], position: impl Fn(usize) -> f32) -> Option<f32> {
-    let count = rows.len();
-    if count < 8 {
-        return None;
-    }
-    // Integer arithmetic: a count-to-float round trip is exactly the kind of
-    // precision loss that bit the percentile code.
-    let margin = (count * EDGE_MARGIN_NUMERATOR / EDGE_MARGIN_DENOMINATOR).max(1);
-    let middle = &rows[margin..count - margin];
-
-    let n = coordinate(middle.len());
-    let mean_row = middle.iter().map(|row| coordinate(*row)).sum::<f32>() / n;
-    let mean_position = middle.iter().map(|row| position(*row)).sum::<f32>() / n;
-
-    let mut covariance = 0.0f32;
-    let mut variance = 0.0f32;
-    for row in middle {
-        let dy = coordinate(*row) - mean_row;
-        covariance += dy * (position(*row) - mean_position);
-        variance += dy * dy;
-    }
-
-    (variance > 0.0).then_some(covariance / variance)
-}
-
-/// The longer of two `(start, end)` runs.
-fn longer(a: (usize, usize), b: (usize, usize)) -> (usize, usize) {
-    if b.1 - b.0 > a.1 - a.0 { b } else { a }
-}
-
-/// Median of a slice, by value.
-fn median(values: &[f32]) -> f32 {
-    let mut sorted: Vec<f32> = values.to_vec();
-    let middle = sorted.len() / 2;
-    sorted.select_nth_unstable_by(middle, f32::total_cmp);
-    sorted[middle]
-}
-
-/// Combines edge slopes into one skew.
-///
-/// Opposite edges of a rectangle tilt by the same amount, so the median is a
-/// reasonable summary.
-fn combine(slopes: &[Option<f32>]) -> Option<f32> {
-    let present: Vec<f32> = slopes.iter().filter_map(|slope| *slope).collect();
-    if present.is_empty() {
-        return None;
-    }
-    Some(median(&present))
 }
 
 /// Tilt below which rotating costs more than it corrects.
@@ -544,16 +1484,6 @@ mod tests {
     }
 
     #[test]
-    fn the_threshold_lands_between_the_two_populations() {
-        let image = scan_with_frame(100, 80, [-30.0, -30.0, 30.0, 30.0], 0.0);
-        let threshold = picture_threshold(&image).expect("two populations");
-        assert!(
-            threshold > PICTURE && threshold < CLEAR_FILM,
-            "threshold {threshold} should sit between {PICTURE} and {CLEAR_FILM}"
-        );
-    }
-
-    #[test]
     fn a_tilted_frame_reports_its_tilt() {
         let skew = 0.06f32; // about 3.4 degrees
         let image = scan_with_frame(200, 200, [-60.0, -40.0, 60.0, 40.0], skew);
@@ -575,8 +1505,9 @@ mod tests {
 
     #[test]
     fn a_picture_that_does_not_reach_the_edges_is_bounded() {
-        // The real case: clear film along two edges, picture filling the rest.
-        let image = scan_with_frame(200, 200, [-100.0, -60.0, 90.0, 100.0], 0.0);
+        // Clear film on all four sides, as the real scan has: the picture must be
+        // bounded by it, not spill to the sensor edge.
+        let image = scan_with_frame(200, 200, [-90.0, -60.0, 80.0, 80.0], 0.0);
         let frame = find(&image).expect("a frame");
 
         assert!(
@@ -587,8 +1518,8 @@ mod tests {
     }
 
     #[test]
-    fn sprocket_holes_do_not_become_the_picture() {
-        // Bare light in the frame must not drag the threshold toward it.
+    fn sprocket_holes_do_not_become_the_frame() {
+        // Bare light in the frame must not drag the detector toward the holes.
         let mut image = scan_with_frame(200, 200, [-80.0, -60.0, 80.0, 60.0], 0.0);
         let (pixels, _remainder) = image.data.as_chunks_mut::<3>();
         // A hole band above the picture, as a real scan has. Kept small: bare
@@ -601,12 +1532,6 @@ mod tests {
                 }
             }
         }
-
-        let threshold = picture_threshold(&image).expect("two populations");
-        assert!(
-            threshold < CLEAR_FILM * 0.9,
-            "the holes should be excluded from the split, got threshold {threshold}"
-        );
 
         let frame = find(&image).expect("a frame");
         assert!(
@@ -645,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn a_uniform_image_has_no_threshold_to_find() {
+    fn a_uniform_image_has_no_frame_to_find() {
         let image = LinearImage::new(4, 4, vec![0.05; 48]).expect("well-formed");
         let frame = find(&image).expect("a frame");
         assert_eq!(frame.size, [4.0, 4.0]);
@@ -741,5 +1666,75 @@ mod tests {
         };
         let result = apply(&image, &empty);
         assert_eq!((result.width, result.height), (64, 48));
+    }
+
+    #[test]
+    fn an_interior_bright_patch_does_not_become_the_frame() {
+        // Mirrors the measured real failure: bright picture regions whose level
+        // approaches clear film. There is no level that can refute a *straight,
+        // full-length* boundary of rebate-level content — the levels agree by
+        // construction — but real thin picture areas never grow that shape:
+        // they are irregular, the way content is. The patch here is shaped like
+        // an actual bright content region, and the frame must still win.
+        let width = 400u32;
+        let height = 300u32;
+        let mut data = vec![0.0f32; width as usize * height as usize * 3];
+
+        // Picture spans 0.001–0.028, clear film is 0.06.
+        let picture_left = 60usize;
+        let picture_right = 340usize;
+        let picture_top = 40usize;
+        let picture_bottom = 260usize;
+
+        for row in 0..height as usize {
+            for column in 0..width as usize {
+                let value = if row < picture_top
+                    || row >= picture_bottom
+                    || column < picture_left
+                    || column >= picture_right
+                {
+                    0.06 // clear film
+                } else {
+                    // Vary the picture level so it is a continuum, not a single
+                    // population that a level threshold could split.
+                    let base = 0.001
+                        + 0.027 * coordinate(column - picture_left)
+                            / coordinate(picture_right - picture_left);
+                    // A bright, irregular content region: a highlight blob
+                    // centred on the picture, whose level reaches clear-film
+                    // values and whose boundary is content-shaped, not straight.
+                    let dx = coordinate(column) - 200.0;
+                    let dy = coordinate(row) - 150.0;
+                    let distance = f32::hypot(dx, dy * 1.5);
+                    let blob = (45.0 - distance).max(0.0) / 45.0;
+                    let highlight = blob * (0.04 + 0.012 * (coordinate(row) / 7.0).sin());
+                    (base + highlight).min(0.058)
+                };
+                let at = (row * width as usize + column) * 3;
+                data[at..at + 3].fill(value);
+            }
+        }
+
+        let image = LinearImage::new(width, height, data).expect("well-formed");
+        let frame = find(&image).expect("a frame");
+
+        // The true picture width is 280 px; a frame formed from the patch edges
+        // would be only 40 px wide.
+        assert!(
+            frame.size[0] > 200.0,
+            "the true frame should be much wider than the patch, got {:?}",
+            frame.size
+        );
+        assert!(
+            frame.skew.abs() < 0.02,
+            "the synthetic image is not tilted, got {}",
+            frame.skew
+        );
+
+        let cropped = apply(&image, &frame);
+        assert!(
+            clear_film_share(&cropped) < 0.05,
+            "the crop should be almost entirely picture"
+        );
     }
 }
