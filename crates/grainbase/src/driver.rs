@@ -172,14 +172,14 @@ pub fn run(job: &Job) -> Report {
 
     let outcomes = inputs
         .par_iter()
-        .map(|input| convert_one(job, input, base.as_ref()))
+        .map(|input| convert_one(job, input, base.as_ref(), &job.settings))
         .collect();
 
     Report { outcomes }
 }
 
 /// Converts one frame, or reports why not.
-fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
+fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>, settings: &Settings) -> Outcome {
     let Some(output) = output_path_for(&job.input, &job.output, input) else {
         return Outcome::Failed(
             input.to_path_buf(),
@@ -191,7 +191,7 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
         return Outcome::Skipped(output);
     }
 
-    match convert_frame(input, &output, &job.settings, base, job.crop) {
+    match convert_frame(input, &output, settings, base, job.crop) {
         Ok(()) => Outcome::Converted(output),
         Err(err) => Outcome::Failed(input.to_path_buf(), err.to_string()),
     }

@@ -75,6 +75,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace_min_channel(&negative);
 
     let base = FilmBase::detect(&negative, film_base::DEFAULT_PERCENTILE);
+    trace_densities(&negative, &base);
+
     println!(
         "film base   R {:.4}  G {:.4}  B {:.4}",
         base.transmittance[0], base.transmittance[1], base.transmittance[2]
@@ -101,6 +103,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     println!("wrote {output}");
     Ok(())
+}
+
+/// Traces the per-channel density distributions the auto bounds read.
+///
+/// Auto white points come from percentiles of the *sampled* densities; this
+/// shows those percentiles per channel, plus the same percentiles of the
+/// linear values, so a wrong ceiling can be told apart from a wrong mask
+/// division without guessing.
+fn trace_densities(image: &LinearImage, base: &FilmBase) {
+    use std::fmt::Write as _;
+
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+    let stride = (pixels.len() / (1 << 17)).max(1);
+
+    println!("--- per-channel density percentiles (sampled) ---");
+    for channel in 0..3 {
+        let mut densities: Vec<f32> = pixels
+            .iter()
+            .step_by(stride)
+            .map(|p| {
+                let value = p[channel];
+                let base_channel = base.transmittance[channel].max(f32::MIN_POSITIVE);
+                // Same arithmetic as the inversion, for the same picture.
+                (-((value / base_channel).clamp(0.0, 1.0).log10())).min(10.0)
+            })
+            .collect();
+
+        densities.sort_unstable_by(f32::total_cmp);
+        let mut line = String::new();
+        for percentile_ in [50.0, 90.0, 99.0, 99.5, 99.9, 100.0] {
+            let value = percentile::value_at_sorted(&densities, percentile_).unwrap_or(f32::NAN);
+            let _ = writeln!(line, "  p{percentile_} {value:.3}");
+        }
+        println!("  ch {channel}:{line}");
+    }
+
+    println!("--- per-channel linear value percentiles (sampled) ---");
+    for channel in 0..3 {
+        let mut values: Vec<f32> = pixels.iter().step_by(stride).map(|p| p[channel]).collect();
+        values.sort_unstable_by(f32::total_cmp);
+        let mut line = String::new();
+        for percentile_ in [10.0, 50.0, 90.0, 99.0, 99.9, 100.0] {
+            let value = percentile::value_at_sorted(&values, percentile_).unwrap_or(f32::NAN);
+            let _ = writeln!(line, "  p{percentile_} {value:.4}");
+        }
+        println!("  ch {channel}:{line}");
+    }
 }
 
 /// Traces the distribution of the least channel.

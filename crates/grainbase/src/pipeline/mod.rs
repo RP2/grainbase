@@ -29,8 +29,10 @@ use crate::image::LinearImage;
 /// Density mapped to the positive's white point by default, in log10 units.
 ///
 /// A real negative's density range depends on the film stock, the exposure, and
-/// the capture. This is a fixed, deterministic starting point, and the value a
-/// fitted calibration profile replaces.
+/// the capture. Fixed, existing, deterministic: the conversion does not
+/// compensate for exposure, so a thin scan stays thin — the maintainer's
+/// accuracy rule. A fitted calibration profile replaces the ceiling with the
+/// stock's measured value.
 pub const DEFAULT_DENSITY_MAX: f32 = 2.0;
 
 /// Tuning for the conversion core.
@@ -40,14 +42,34 @@ pub const DEFAULT_DENSITY_MAX: f32 = 2.0;
 /// starting point rather than a tuned value.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
-    /// Density at which each channel reaches the positive's white point.
+    /// Density at which each channel reaches the positive's white point, or
+    /// `None` to use [`DEFAULT_DENSITY_MAX`].
     ///
     /// Per channel, and that is the point: the negative's three dye layers
     /// develop to slightly different contrasts. Any per-channel error grows
     /// linearly with density, so it is invisible in the midtones you balanced
-    /// with and worst in the shadows — the classic residual shadow cast. One
-    /// shared value cannot express that correction.
-    pub density_max: [f32; 3],
+    /// with and worst in the shadows — the classic residual shadow cast, and in
+    /// the maintainer's scans a blue cast: one shared ceiling leaves a channel
+    /// whose content runs denser with its whites unfulfilled.
+    ///
+    /// There is deliberately no per-frame *measurement* here: percentiles of
+    /// the frame's own content would brighten thin scans into exposure
+    /// compensation, and the conversion's job is accuracy, not rescue. The
+    /// honest sources for per-channel values are the film itself: a fitted
+    /// profile's measured values — one per stock, foreseen by the capture
+    /// protocol's two neutral exposures — or the neutral default.
+    pub density_max: Option<[f32; 3]>,
+
+    /// The density each channel's black point sits at, matching the white
+    /// point in the same way a print maps its own range.
+    ///
+    /// A real print does not stretch from density zero: the paper's own
+    /// density sits below the film's thinnest content, and the *difference*
+    /// carries the print's contrast. Per-channel floors are the same shape of
+    /// correction as the ceilings — a channel whose thinnest content is much
+    /// denser than zero is remapped to black there instead of to a washed
+    /// value. Default is three zeros: no black-point lift, straight inversion.
+    pub density_floor: Option<[f32; 3]>,
 
     /// Dye crosstalk correction, applied to density before it is scaled.
     ///
@@ -62,7 +84,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            density_max: [DEFAULT_DENSITY_MAX; 3],
+            density_max: Some([DEFAULT_DENSITY_MAX; 3]),
+            density_floor: None,
             crosstalk: IDENTITY,
         }
     }
@@ -84,8 +107,10 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
     // A zero or negative setting would divide by zero or invert the contrast.
     let density_max = settings
         .density_max
+        .unwrap_or([DEFAULT_DENSITY_MAX; 3])
         .map(|value| value.max(f32::MIN_POSITIVE));
     let crosstalk = settings.crosstalk;
+    let floor = settings.density_floor.unwrap_or([0.0; 3]);
 
     image.map_rgb(|[red, green, blue]| {
         let density = [
@@ -95,9 +120,9 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
         ];
         let corrected = mix(crosstalk, density);
         [
-            (corrected[0] / density_max[0]).clamp(0.0, 1.0),
-            (corrected[1] / density_max[1]).clamp(0.0, 1.0),
-            (corrected[2] / density_max[2]).clamp(0.0, 1.0),
+            ((corrected[0] - floor[0]) / density_max[0]).clamp(0.0, 1.0),
+            ((corrected[1] - floor[1]) / density_max[1]).clamp(0.0, 1.0),
+            ((corrected[2] - floor[2]) / density_max[2]).clamp(0.0, 1.0),
         ]
     })
 }
@@ -154,8 +179,13 @@ mod tests {
         FilmBase { transmittance }
     }
 
+    /// Explicit ceilings, so math tests stay pinned to known values; the
+    /// automatic measurement is tested on its own.
     fn settings() -> Settings {
-        Settings::default()
+        Settings {
+            density_max: Some([DEFAULT_DENSITY_MAX; 3]),
+            ..Settings::default()
+        }
     }
 
     fn assert_close(actual: f32, expected: f32) {
@@ -255,7 +285,7 @@ mod tests {
     fn a_zero_density_ceiling_does_not_produce_nan() {
         let source = image(&[[0.5, 0.5, 0.5]]);
         let settings = Settings {
-            density_max: [0.0; 3],
+            density_max: Some([0.0; 3]),
             ..Settings::default()
         };
         let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
@@ -263,8 +293,43 @@ mod tests {
     }
 
     #[test]
-    fn one_shared_ceiling_is_the_default_across_channels() {
-        assert_eq!(Settings::default().density_max, [DEFAULT_DENSITY_MAX; 3]);
+    fn the_default_ceiling_is_the_fixed_neutral() {
+        // The conversion does not compensate for exposure: the default is a
+        // fixed physical anchor, not content percentiles.
+        assert_eq!(
+            Settings::default().density_max,
+            Some([DEFAULT_DENSITY_MAX; 3])
+        );
+        assert_eq!(Settings::default().density_floor, None);
+    }
+
+    #[test]
+    fn a_density_floor_lifts_the_channel_black() {
+        // A print maps the density range through its own black point; a
+        // non-zero floor puts thinnest content at black rather than washed.
+        // The pixel is 10^-0.5: density exactly 0.5.
+        let source = image(&[[0.316_227_77, 0.316_227_77, 0.316_227_77]]);
+        let settings = Settings {
+            density_floor: Some([0.5; 3]),
+            ..settings()
+        };
+        let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
+        // density 0.5 above a floor of 0.5 is exactly black.
+        for channel in result.data {
+            assert_close(channel, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_density_floor_below_the_content_is_a_contrast_cut() {
+        // Floor 0.25, ceiling 2.0: density 0.5 renders at (0.5-0.25)/2.0.
+        let source = image(&[[0.316_227_77, 0.316_227_77, 0.316_227_77]]);
+        let settings = Settings {
+            density_floor: Some([0.25; 3]),
+            ..settings()
+        };
+        let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
+        assert_close(result.data[0], 0.125);
     }
 
     #[test]
@@ -272,7 +337,7 @@ mod tests {
         // Same density, different ceilings: the lower ceiling reaches white first.
         let source = image(&[[0.1, 0.1, 0.1]]);
         let settings = Settings {
-            density_max: [2.0, 1.0, 0.5],
+            density_max: Some([2.0, 1.0, 0.5]),
             ..Settings::default()
         };
         let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
@@ -301,7 +366,7 @@ mod tests {
         let source = image(&[[0.1, 1.0, 1.0]]);
         let settings = Settings {
             crosstalk: [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
-            ..Settings::default()
+            ..settings()
         };
         let result = invert(&source, &base([1.0, 1.0, 1.0]), &settings);
 

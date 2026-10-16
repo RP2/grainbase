@@ -82,7 +82,30 @@ pub struct Profile {
     /// equally trustworthy, and should not look identical.
     pub frames: u32,
     /// The fitted conversion settings.
+    ///
+    /// Derived `Default` would leave the bounds `None` — meaning *measured* —
+    /// which cannot serialise: a profile text is explicit by definition.
+    /// Overridden here so the neutral default round-trips.
     pub settings: Settings,
+}
+
+impl Profile {
+    /// The neutral built-in profile: no fit, no correction, explicit
+    /// defaults.
+    #[must_use]
+    pub fn neutral() -> Self {
+        Self {
+            film: String::new(),
+            camera: String::new(),
+            method: Method::Neutral,
+            frames: 0,
+            settings: Settings {
+                density_max: Some([crate::pipeline::DEFAULT_DENSITY_MAX; 3]),
+                density_floor: None,
+                crosstalk: crate::pipeline::IDENTITY,
+            },
+        }
+    }
 }
 
 /// Why a profile could not be read.
@@ -149,7 +172,12 @@ impl std::error::Error for ParseError {}
 impl fmt::Display for Profile {
     /// Renders the profile as text.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let max = self.settings.density_max;
+        let Some(max) = self.settings.density_max else {
+            // Unreachable in practice: every constructor of `Profile` carries
+            // explicit bounds, so a `None` here is a caller bug, and the
+            // failure to serialise is the honest report.
+            return Err(fmt::Error);
+        };
         let matrix = self.settings.crosstalk;
 
         writeln!(f, "# grainbase calibration profile")?;
@@ -164,6 +192,11 @@ impl fmt::Display for Profile {
         writeln!(f, "method = {}", self.method)?;
         writeln!(f, "frames = {}", self.frames)?;
         writeln!(f, "density_max = {:.6} {:.6} {:.6}", max[0], max[1], max[2])?;
+        // Optional keys stay optional on both sides: an older profile parses
+        // as well as a newer one.
+        if let Some([red, green, blue]) = self.settings.density_floor {
+            writeln!(f, "density_floor = {red:.6} {green:.6} {blue:.6}")?;
+        }
         writeln!(f, "# Rows are output channels, columns are dye densities.")?;
         writeln!(
             f,
@@ -197,6 +230,7 @@ impl Profile {
         let mut method = None;
         let mut frames = None;
         let mut density_max = None;
+        let mut density_floor = None;
         let mut crosstalk = None;
 
         for (index, raw) in text.lines().enumerate() {
@@ -221,6 +255,7 @@ impl Profile {
                 "method" => method = Some(Method::parse(line, key, value)?),
                 "frames" => frames = Some(parse_u32(line, key, value)?),
                 "density_max" => density_max = Some(parse_floats::<3>(line, key, value)?),
+                "density_floor" => density_floor = Some(parse_floats::<3>(line, key, value)?),
                 "crosstalk" => {
                     let flat = parse_floats::<9>(line, key, value)?;
                     crosstalk = Some([
@@ -249,7 +284,11 @@ impl Profile {
             method: method.ok_or(ParseError::MissingKey { key: "method" })?,
             frames: frames.ok_or(ParseError::MissingKey { key: "frames" })?,
             settings: Settings {
-                density_max: density_max.ok_or(ParseError::MissingKey { key: "density_max" })?,
+                // A parsed profile's bounds are explicit by definition.
+                density_max: Some(
+                    density_max.ok_or(ParseError::MissingKey { key: "density_max" })?,
+                ),
+                density_floor,
                 crosstalk: crosstalk.ok_or(ParseError::MissingKey { key: "crosstalk" })?,
             },
         })
@@ -346,7 +385,8 @@ mod tests {
             method: Method::Fitted,
             frames: 12,
             settings: Settings {
-                density_max: [1.85, 1.92, 1.74],
+                density_max: Some([1.85, 1.92, 1.74]),
+                density_floor: None,
                 crosstalk: [[1.0, 0.05, 0.02], [0.03, 1.0, 0.04], [0.01, 0.02, 1.0]],
             },
         }
@@ -362,10 +402,10 @@ mod tests {
 
     #[test]
     fn the_default_profile_is_valid_and_neutral() {
-        let text = Profile::default().to_string();
+        let text = Profile::neutral().to_string();
         let parsed = Profile::parse(&text).expect("should parse");
 
-        assert_eq!(parsed.settings.density_max, [DEFAULT_DENSITY_MAX; 3]);
+        assert_eq!(parsed.settings.density_max, Some([DEFAULT_DENSITY_MAX; 3]));
         assert_eq!(
             parsed.settings.crosstalk, IDENTITY,
             "default means no correction"
@@ -499,7 +539,7 @@ mod tests {
         let profile = Profile {
             film: "Fuji \"Neopan\" 400".to_owned(),
             camera: "rig\\1".to_owned(),
-            ..Profile::default()
+            ..Profile::neutral()
         };
         let parsed = Profile::parse(&profile.to_string()).expect("should parse");
         assert_eq!(parsed.film, profile.film);
