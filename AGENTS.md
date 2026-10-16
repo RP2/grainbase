@@ -4,10 +4,11 @@
 
 Repo holds **code + public docs only** (this README, license, code).
 
-Everything else — spec, plan, ADRs, design map, research, glossary, monetization, market analysis
+Everything else — spec, plan, ADRs, design map, research, glossary, monetization, market analysis,
+session handoffs
 — lives in the sibling private repo:
 
-**`../grainbase-private/`**
+**`../grainbase-private/`** — handoffs in `docs/handoffs/`, never in a temp directory.
 
 ## Rules
 
