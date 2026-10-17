@@ -15,6 +15,7 @@ use rayon::prelude::*;
 use crate::geometry;
 pub use crate::image::Flips;
 use crate::image::LinearImage;
+use crate::overlay;
 use crate::pipeline::{self, FilmBase, Settings, film_base};
 use crate::{decode, encode};
 
@@ -22,6 +23,13 @@ use crate::{decode, encode};
 const RAW_EXTENSIONS: &[&str] = &[
     "arw", "dng", "cr2", "cr3", "nef", "nrw", "rw2", "raf", "orf", "pef", "srw",
 ];
+
+/// Sample points drawn in the diagnostic overlay.
+///
+/// A drawing of every point the base sample reads is a filled rectangle; this
+/// is enough marks to show the shape of the sample and which side of the strip
+/// it came from.
+const OVERLAY_SAMPLE_MARKS: usize = 400;
 
 /// Frames sampled to measure the roll's film base.
 ///
@@ -50,13 +58,22 @@ pub struct Job {
     pub settings: Settings,
     /// Whether to locate the film frame and crop to it.
     ///
-    /// Cropping is a judgement, so it is a setting rather than something baked in:
-    /// turning it off gives the raw frame back, and sources are never modified, so
-    /// the decision is always reversible.
+    /// Off in the free CLI: the frame's edges are what a camera scan states
+    /// least reliably — the film's aspect varies with the crop the lab or the
+    /// rig applied, and content edges inside the picture imitate the film's own
+    /// — so the conversion keeps the whole scan and the operator crops. The
+    /// base measurement does not depend on this: it is taken from the film the
+    /// punch bands bound, which is found without a frame.
     pub crop: bool,
     /// The operator's orientation decision (spec step 1), carried by the whole
     /// roll: a roll is scanned one way.
     pub flips: Flips,
+    /// Whether to write a diagnostic overlay beside each positive.
+    ///
+    /// The overlay is the oriented scan with the pipeline's own marks on it:
+    /// the frame it found, the punch bands, and the film the base was measured
+    /// from. Off by default: it is a debugging surface, not an output.
+    pub overlay: bool,
     /// Optional authoritative base sample rectangle, as fractions `[x0, y0, x1,
     /// y1]` of the uncropped scan.
     ///
@@ -130,6 +147,14 @@ pub enum Error {
     Encode(encode::Error),
     /// The output directory could not be created.
     Io(io::Error),
+    /// The film base could not be measured from the scan.
+    ///
+    /// The punch bands are what a base measurement is built on: they mark where
+    /// the film is, and the film between them holds the unexposed base. A scan
+    /// whose bands are not visible leaves nothing to measure, and inventing a
+    /// value there is worse than refusing — the operator knows their film and
+    /// can hand the base over.
+    NoFilmBase,
 }
 
 impl fmt::Display for Error {
@@ -138,6 +163,12 @@ impl fmt::Display for Error {
             Self::Decode(err) => write!(f, "{err}"),
             Self::Encode(err) => write!(f, "{err}"),
             Self::Io(err) => write!(f, "{err}"),
+            Self::NoFilmBase => write!(
+                f,
+                "no film base could be measured: the scan shows no sprocket bands to measure \
+                 between. Measure the base by hand and pass --film-base r,g,b, or a rebate \
+                 rectangle as --base-sample x0,y0,x1,y1"
+            ),
         }
     }
 }
@@ -148,6 +179,7 @@ impl std::error::Error for Error {
             Self::Decode(err) => Some(err),
             Self::Encode(err) => Some(err),
             Self::Io(err) => Some(err),
+            Self::NoFilmBase => None,
         }
     }
 }
@@ -218,6 +250,7 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
         job.crop,
         job.base_sample,
         job.film_base,
+        job.overlay,
     ) {
         Ok(()) => Outcome::Converted(output),
         Err(err) => Outcome::Failed(input.to_path_buf(), err.to_string()),
@@ -248,11 +281,12 @@ fn cropped(image: &LinearImage, frame: &geometry::Frame) -> LinearImage {
 ///    precedence. A caller-supplied roll-level base wins (the roll's base is
 ///    one measurement, per the lab tools' border-lock practice); then a
 ///    manually supplied per-channel base; then a manually supplied sample
-///    rectangle; then the sprocket-band-anchored rebate regions; then the
-///    whole-frame statistics the scanner tools document as their default
-///    base estimate — whose known limit is light-table glare on copy-stand
-///    scans, for which the manual inputs are the documented answer, not a
-///    further heuristic.
+///    rectangle; then the clear film just outside the frame's own boundary,
+///    which is the film's mechanical answer and needs neither a rebate region
+///    nor a punch band to be recognised; then the whole-frame statistics the
+///    scanner tools document as their default base estimate —
+///    whose known limit is light-table glare on copy-stand scans, for which
+///    the manual inputs are the documented answer, not a further heuristic.
 /// 4. *Crop* to the exposed frame, so the inversion only sees picture pixels.
 /// 5. *Invert*, with the settings (a profile when loaded).
 ///
@@ -273,6 +307,7 @@ pub fn convert_frame(
     crop: bool,
     base_sample: Option<[f32; 4]>,
     film_base: Option<[f32; 3]>,
+    overlay: bool,
 ) -> Result<(), Error> {
     let scan = decode::decode(input)?;
 
@@ -280,8 +315,9 @@ pub fn convert_frame(
     // decision about which side of the film faced the lens.
     let uncropped = scan.linear.flipped(flips);
 
-    // Find the frame once. The same frame is used for the base measurement
-    // and the crop.
+    // Find the frame once. Its punch bands and the film they bound are what the
+    // base is measured from; its rectangle is what a crop would use, when the
+    // caller asked for one.
     let frame = geometry::find(&uncropped).unwrap_or_else(|| geometry::Frame::whole(&uncropped));
     let cropped = if crop {
         let c = cropped(&uncropped, &frame);
@@ -307,15 +343,45 @@ pub fn convert_frame(
     } else if let Some(rect) = base_sample {
         measured = FilmBase::detect_in_rect(&uncropped, rect, film_base::DEFAULT_PERCENTILE);
         &measured
-    } else if let Some(regions) = frame.film {
-        measured = FilmBase::detect_in_regions(&uncropped, &regions, film_base::DEFAULT_PERCENTILE);
+    } else if let Some(base) = measured_between_sprockets(&uncropped, &frame) {
+        // The base is the unexposed film. The punch rows between the
+        // perforations are where it is guaranteed to be: outside the exposure,
+        // and clear of the light table. Nothing here reads the picture.
+        measured = base;
         &measured
     } else {
-        measured = FilmBase::detect(&uncropped, film_base::DEFAULT_PERCENTILE);
-        &measured
+        // Nothing to measure from: refuse rather than invent a base.
+        return Err(Error::NoFilmBase);
     };
 
     let positive = pipeline::invert(cropped.as_ref().unwrap_or(&uncropped), base, settings);
+
+    // With the crop off, the output *is* the scan the decisions were made on, so
+    // the marks belong on it: one image shows the final frame and where the
+    // pipeline looked, in the same coordinates. With the crop on, the output is
+    // a sub-rectangle the marks would not line up with, so they go to a separate
+    // annotated scan instead.
+    let positive = if overlay {
+        let bands: Vec<film_base::FilmRegion> = frame.holes.iter().flatten().copied().collect();
+        let samples = FilmBase::sprocket_sample_points(&uncropped, &bands, OVERLAY_SAMPLE_MARKS);
+        let sprockets = FilmBase::sprocket_holes(&uncropped, &bands);
+        let marks = overlay::Marks {
+            holes: &frame.holes,
+            sprockets: &sprockets,
+            film: frame.film.as_ref(),
+            samples: &samples,
+            color_region: Some(&frame.sample_region().exposure_region(&uncropped, base)),
+            crop: if crop { Some(&frame) } else { None },
+        };
+        if cropped.is_some() {
+            encode::encode(&overlay::annotate(&uncropped, &marks), overlay_path(output))?;
+            positive
+        } else {
+            overlay::annotate(&positive, &marks)
+        }
+    } else {
+        positive
+    };
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -346,7 +412,9 @@ fn roll_base(inputs: &[PathBuf], flips: Flips, base_sample: Option<[f32; 4]>) ->
             let oriented = scan.linear.flipped(flips);
             let frame =
                 geometry::find(&oriented).unwrap_or_else(|| geometry::Frame::whole(&oriented));
-            Some(roll_frame_base(&oriented, &frame, base_sample))
+            // A frame with nothing to measure contributes nothing; the
+            // conversion refuses rather than guessing if none of them does.
+            roll_frame_base(&oriented, &frame, base_sample)
         })
         .collect();
 
@@ -374,21 +442,61 @@ fn roll_base(inputs: &[PathBuf], flips: Flips, base_sample: Option<[f32; 4]>) ->
 /// One sampled frame's base for the roll measurement.
 ///
 /// The same source ordering as [`convert_frame`], minus the supplied-base
-/// case: a manual rectangle or the film regions on the uncropped scan, else
-/// the cropped picture.
+/// case: a manual rectangle, else the film the punch bands bound.
 fn roll_frame_base(
     uncropped: &LinearImage,
     frame: &geometry::Frame,
     base_sample: Option<[f32; 4]>,
-) -> FilmBase {
+) -> Option<FilmBase> {
     if let Some(rect) = base_sample {
-        return FilmBase::detect_in_rect(uncropped, rect, film_base::DEFAULT_PERCENTILE);
+        return Some(FilmBase::detect_in_rect(
+            uncropped,
+            rect,
+            film_base::DEFAULT_PERCENTILE,
+        ));
     }
-    if let Some(regions) = frame.film {
-        return FilmBase::detect_in_regions(uncropped, &regions, film_base::DEFAULT_PERCENTILE);
+    let region = frame.film?;
+    Some(FilmBase::detect_in_regions(
+        uncropped,
+        std::slice::from_ref(&region),
+        film_base::DEFAULT_PERCENTILE,
+    ))
+}
+
+/// The base measured from the film between the sprocket holes, when the scan
+/// shows any punch at all.
+///
+/// The punch bands are the one structure a camera scan states reliably, and the
+/// film between their perforations is unexposed by construction. A frame with no
+/// band has no base to measure, and the caller has to ask the operator.
+fn measured_between_sprockets(image: &LinearImage, frame: &geometry::Frame) -> Option<FilmBase> {
+    let bands: Vec<film_base::FilmRegion> = frame.holes.iter().flatten().copied().collect();
+    if bands.is_empty() {
+        return None;
     }
-    let cropped = cropped(uncropped, frame);
-    FilmBase::detect(&cropped, film_base::DEFAULT_PERCENTILE)
+    let base = FilmBase::detect_between_sprockets(image, &bands);
+    // The identity base means the sampler found nothing to read — a band with no
+    // lit punch, or no gap between two holes. That is not a measurement, and
+    // converting with it would render every frame wrong in silence.
+    (base != FilmBase::IDENTITY).then_some(base)
+}
+
+/// Where the diagnostic overlay for an output goes: beside it, marked.
+///
+/// The overlay is the annotated scan a conversion measured from — the frame it
+/// found, the punch bands it kept clear of, and the film it read the base
+/// from. It exists
+/// so that a wrong result can be told apart from a wrong report, and so a bug
+/// report can carry the pipeline's own view of the scan.
+fn overlay_path(output: &Path) -> PathBuf {
+    let mut path = output.to_path_buf();
+    let stem = output.file_stem().map_or_else(
+        || "overlay".to_owned(),
+        |stem| format!("{}-overlay", stem.to_string_lossy()),
+    );
+    path.set_file_name(stem);
+    path.set_extension("png");
+    path
 }
 
 /// Where the positive for `file` goes: the input tree mirrored, extension `.png`.
@@ -539,6 +647,7 @@ mod tests {
             settings: Settings::default(),
             crop: true,
             flips: Flips::default(),
+            overlay: false,
             base_sample: None,
             film_base: None,
         });
@@ -570,6 +679,7 @@ mod tests {
             settings: Settings::default(),
             crop: true,
             flips: Flips::default(),
+            overlay: false,
             base_sample: None,
             film_base: None,
         });

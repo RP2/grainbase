@@ -19,8 +19,19 @@
 use grainbase::decode;
 use grainbase::pipeline::{self, FilmBase, Settings, film_base, percentile};
 use grainbase::profile::Profile;
-use grainbase::{LinearImage, encode, geometry};
+use grainbase::{LinearImage, encode, geometry, overlay};
 
+/// Sample points drawn in the overlay.
+///
+/// A drawing of every point the base sample reads is a filled rectangle; this is
+/// enough marks to show the shape of the sample and which side of the strip it
+/// came from.
+const OVERLAY_SAMPLE_MARKS: usize = 400;
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "a diagnostic tool's main is a readout of every stage in order"
+)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = parse_options()?;
 
@@ -59,9 +70,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Base on the oriented scan, still uncropped, by the documented source
     // precedence (spec step 3): hand-supplied values, hand-placed rectangle,
-    // mechanical rebate regions, whole-frame statistics. The whole-frame tier
-    // is VueScan's documented default estimate; its known limit is light-table
-    // glare on copy-stand scans, for which the manual inputs are the answer.
+    // the clear film just outside the frame, whole-frame statistics. The
+    // whole-frame tier is VueScan's documented default estimate; its known
+    // limit is light-table glare on copy-stand scans, for which the manual
+    // inputs are the answer.
+    if std::env::var("GRAINBASE_TRACE").is_ok() {
+        diagnose_base(&negative);
+        trace_tail(&negative);
+    }
+
+    // The base is the unexposed film, and the punch rows between the
+    // perforations are the one place it is guaranteed to be: outside the
+    // exposure, and clear of the light table.
+    let bands: Vec<film_base::FilmRegion> = frame.holes.iter().flatten().copied().collect();
+
     let base = if let Some(values) = options.film_base {
         println!("film base (manual values)");
         FilmBase {
@@ -70,18 +92,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else if let Some(rect) = options.base_sample {
         println!("film base (manual sample rectangle)");
         FilmBase::detect_in_rect(&negative, rect, film_base::DEFAULT_PERCENTILE)
-    } else if let Some(regions) = frame.film {
-        println!("film base (clear-film regions)");
-        for (side, region) in ["top", "bottom"].iter().zip(&regions) {
+    } else if let Some(base) = measured_between_sprockets(&negative, &bands) {
+        println!("film base (the film between the sprocket holes)");
+        for band in &bands {
             println!(
-                "  region {side}: center_y {:.1} ±{:.1} slope {:.5}",
-                region.center_y, region.half_height, region.slope
+                "  sprocket band: center_y {:.1} ±{:.1} slope {:.5}",
+                band.center_y, band.half_height, band.slope
             );
         }
-        FilmBase::detect_in_regions(&negative, &regions, film_base::DEFAULT_PERCENTILE)
+        base
     } else {
-        println!("film base (whole-frame statistics)");
-        FilmBase::detect(&negative, film_base::DEFAULT_PERCENTILE)
+        eprintln!(
+            "no film base could be measured: the scan shows no sprocket bands to measure \
+             between. Pass --film-base r,g,b or --base-sample x0,y0,x1,y1."
+        );
+        std::process::exit(1);
+    };
+
+    // The overlay is drawn in the uncropped scan's coordinates, so it has to
+    // keep a copy when the crop moves the picture underneath it.
+    let overlay_scan = if options.overlay && !options.no_crop {
+        Some(negative.clone())
+    } else {
+        None
     };
 
     // Orientation first, then the frame: the frame is a property of the film, and
@@ -104,20 +137,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report("negative", &negative, &base);
     report("positive", &positive, &base);
 
-    diagnose_base(&negative);
+    // The marks are drawn in the uncropped scan's coordinates, so the sample
+    // points are read from it before the output takes it over.
+    let samples = FilmBase::sprocket_sample_points(&negative, &bands, OVERLAY_SAMPLE_MARKS);
+    let sprockets = FilmBase::sprocket_holes(&negative, &bands);
+    let color_region = frame.sample_region().exposure_region(&negative, &base);
+    println!(
+        "color region: centre {:.0},{:.0} size {:.0}x{:.0} (from frame {:.0}x{:.0})",
+        color_region.center[0],
+        color_region.center[1],
+        color_region.size[0],
+        color_region.size[1],
+        frame.size[0],
+        frame.size[1]
+    );
 
-    trace_tail(&negative);
+    let mut written = if options.negative_stage {
+        // The negative itself is worth writing out, since a RAW file cannot be
+        // opened in the usual viewers: this is the scan as captured.
+        negative
+    } else {
+        positive
+    };
 
-    encode::encode(
-        &if options.negative_stage {
-            // The negative itself is worth writing out, since a RAW file cannot be
-            // opened in the usual viewers: this is the scan as captured.
-            negative
-        } else {
-            positive
-        },
-        &options.output,
-    )?;
+    // With the crop off, the output *is* the scan the decisions were made on,
+    // so the marks belong on it: one image shows the final frame and where the
+    // pipeline looked, in the same coordinates. With the crop on, the output is
+    // a sub-rectangle the marks would not line up with, so they go to a
+    // separate annotated scan instead.
+    if options.overlay {
+        let marks = overlay::Marks {
+            holes: &frame.holes,
+            sprockets: &sprockets,
+            film: frame.film.as_ref(),
+            samples: &samples,
+            color_region: Some(&color_region),
+            crop: if options.no_crop { None } else { Some(&frame) },
+        };
+        written = draw_marks(&options.output, written, overlay_scan.as_ref(), &marks)?;
+    }
+
+    encode::encode(&written, &options.output)?;
     println!("wrote {}", options.output);
     Ok(())
 }
@@ -135,6 +195,7 @@ struct Options {
     flip_v: bool,
     no_crop: bool,
     negative_stage: bool,
+    overlay: bool,
     settings: Settings,
     film_base: Option<[f32; 3]>,
     base_sample: Option<[f32; 4]>,
@@ -147,6 +208,7 @@ fn parse_options() -> Result<Options, String> {
     let mut flip_v = false;
     let mut no_crop = false;
     let mut negative_stage = false;
+    let mut overlay = false;
     let mut profile_path: Option<String> = None;
     let mut base_sample: Option<[f32; 4]> = None;
     let mut film_base: Option<[f32; 3]> = None;
@@ -158,6 +220,7 @@ fn parse_options() -> Result<Options, String> {
             "--flip-v" => flip_v = true,
             "--no-crop" => no_crop = true,
             "--negative" => negative_stage = true,
+            "--overlay" => overlay = true,
             "--profile" => {
                 let path = args.next().ok_or("--profile requires a path")?;
                 profile_path = Some(path);
@@ -198,10 +261,69 @@ fn parse_options() -> Result<Options, String> {
         flip_v,
         no_crop,
         negative_stage,
+        overlay,
         settings,
         film_base,
         base_sample,
     })
+}
+
+/// Draws the marks on the output when it shares the scan's coordinates, or on a
+/// copy of the scan beside it when a crop moved the picture underneath them.
+fn draw_marks(
+    output: &str,
+    written: LinearImage,
+    uncropped: Option<&LinearImage>,
+    marks: &overlay::Marks<'_>,
+) -> Result<LinearImage, Box<dyn std::error::Error>> {
+    match uncropped {
+        None => Ok(overlay::annotate(&written, marks)),
+        Some(scan) => {
+            write_overlay(output, scan, marks)?;
+            Ok(written)
+        }
+    }
+}
+
+/// Writes the annotated scan beside the preview.
+fn write_overlay(
+    output: &str,
+    negative: &LinearImage,
+    marks: &overlay::Marks<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = overlay_path(output);
+    encode::encode(&overlay::annotate(negative, marks), &path)?;
+    println!("wrote {path}");
+    Ok(())
+}
+
+/// The base measured from the film between the sprocket holes, or `None` when
+/// there is nothing to measure.
+///
+/// The identity base means the sampler found nothing to read — a band with no
+/// lit punch, or no gap between two holes. That is not a measurement, and
+/// converting with it would render every frame wrong in silence.
+fn measured_between_sprockets(
+    image: &LinearImage,
+    bands: &[film_base::FilmRegion],
+) -> Option<FilmBase> {
+    if bands.is_empty() {
+        return None;
+    }
+    let base = FilmBase::detect_between_sprockets(image, bands);
+    (base != FilmBase::IDENTITY).then_some(base)
+}
+
+/// The overlay for a preview goes beside it, marked.
+fn overlay_path(output: &str) -> String {
+    let path = std::path::Path::new(output);
+    let stem = path.file_stem().map_or_else(
+        || "overlay".to_owned(),
+        |stem| stem.to_string_lossy().into_owned(),
+    );
+    let mut marked = path.to_path_buf();
+    marked.set_file_name(format!("{stem}-overlay.png"));
+    marked.to_string_lossy().into_owned()
 }
 
 /// Traces the per-channel density distributions the auto bounds read.

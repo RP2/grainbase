@@ -17,6 +17,11 @@ use grainbase::profile::Profile;
 
 /// Convert camera-scanned film negatives into finished positives.
 #[derive(Debug, Parser)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each switch names an independent operator decision: crop, the two \
+              mirrors, and the diagnostic overlay"
+)]
 #[command(name = "grainbase", version, about, long_about = None)]
 #[command(subcommand_negates_reqs = true)]
 struct Cli {
@@ -39,12 +44,15 @@ struct Cli {
     #[arg(long)]
     profile: Option<PathBuf>,
 
-    /// Do not crop to the film frame.
+    /// Crop to the detected film frame.
     ///
-    /// Cropping is a judgement, so it can be switched off. Sources are never
-    /// modified, so this only changes what the output contains.
+    /// Off by default, and deliberately: the frame's edges are the one thing a
+    /// camera scan does not state reliably, so the free conversion keeps the
+    /// whole scan and lets the operator crop where they want. This exists for
+    /// trying the detector out, and for a caller that has checked it on its own
+    /// rig. Sources are never modified.
     #[arg(long)]
-    no_crop: bool,
+    crop: bool,
 
     /// Mirror the scans left to right: the emulsion faced the lens.
     #[arg(long)]
@@ -66,6 +74,15 @@ struct Cli {
     /// uncropped scan. Overrides the automatic rebate-region detector.
     #[arg(long, value_parser = parse_base_sample)]
     base_sample: Option<[f32; 4]>,
+
+    /// Write a diagnostic overlay beside each positive: the scan with the
+    /// frame, the sprocket bands, and the film-base probe points drawn on it.
+    ///
+    /// Irreplaceable when a conversion comes out wrong: it shows exactly where
+    /// the pipeline looked. Yellow probes are the ones the film base was read
+    /// from; magenta probes disagreed with the rest and were ignored.
+    #[arg(long)]
+    overlay: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,6 +124,15 @@ struct FitArgs {
     /// uncropped scan. Overrides the automatic rebate-region detector.
     #[arg(long, value_parser = parse_base_sample)]
     base_sample: Option<[f32; 4]>,
+
+    /// Write a diagnostic overlay beside each positive: the scan with the
+    /// frame, the sprocket bands, and the film-base probe points drawn on it.
+    ///
+    /// Irreplaceable when a conversion comes out wrong: it shows exactly where
+    /// the pipeline looked. Yellow probes are the ones the film base was read
+    /// from; magenta probes disagreed with the rest and were ignored.
+    #[arg(long)]
+    overlay: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -143,13 +169,14 @@ fn main() -> ExitCode {
         output: cli.out,
         mode: cli.mode.into(),
         settings,
-        crop: !cli.no_crop,
+        crop: cli.crop,
         flips: Flips {
             horizontal: cli.flip_h,
             vertical: cli.flip_v,
         },
         base_sample: cli.base_sample,
         film_base: cli.film_base,
+        overlay: cli.overlay,
     });
 
     println!(
@@ -216,10 +243,14 @@ fn run_fit(args: FitArgs) -> ExitCode {
         }
     } else if let Some(rect) = args.base_sample {
         FilmBase::detect_in_rect(&uncropped, rect, film_base::DEFAULT_PERCENTILE)
-    } else if let Some(regions) = frame.film {
-        FilmBase::detect_in_regions(&uncropped, &regions, film_base::DEFAULT_PERCENTILE)
+    } else if let Some(base) = measured_between_sprockets(&uncropped, &frame) {
+        base
     } else {
-        FilmBase::detect(&uncropped, film_base::DEFAULT_PERCENTILE)
+        eprintln!(
+            "no film base could be measured: the scan shows no sprocket bands to measure \
+             between. Pass --film-base r,g,b or --base-sample x0,y0,x1,y1."
+        );
+        return ExitCode::FAILURE;
     };
 
     let image = geometry::apply(&uncropped, &frame);
@@ -267,6 +298,24 @@ fn run_fit(args: FitArgs) -> ExitCode {
     print_fit_summary(&profile);
     println!("wrote {}", output.display());
     ExitCode::SUCCESS
+}
+
+/// The base measured from the film between the sprocket holes, or `None` when
+/// there is nothing to measure.
+///
+/// The identity base means the sampler found nothing to read — a band with no
+/// lit punch, or no gap between two holes. That is not a measurement, and
+/// converting with it would render every frame wrong in silence.
+fn measured_between_sprockets(
+    image: &grainbase::LinearImage,
+    frame: &geometry::Frame,
+) -> Option<FilmBase> {
+    let bands: Vec<film_base::FilmRegion> = frame.holes.iter().flatten().copied().collect();
+    if bands.is_empty() {
+        return None;
+    }
+    let base = FilmBase::detect_between_sprockets(image, &bands);
+    (base != FilmBase::IDENTITY).then_some(base)
 }
 
 /// The default profile path is a sibling of the capture with `.profile` extension.

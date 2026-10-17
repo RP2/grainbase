@@ -86,15 +86,6 @@ const BAND_GAP_TOLERANCE: usize = 3;
 /// The least height, in grid rows, for one hole band.
 const MIN_BAND_ROWS: usize = 3;
 
-/// The least plausible band height as a share of the hole-to-hole span.
-///
-/// On real 35 mm the punch band is a fixed slice of the strip's width: the
-/// measurements run 3.05% (reference scan) to 3.5% across the maintainer's
-/// fixtures, and a scan margin at the sensor's edge reads in under 1%. A
-/// "band" below this share is the margin, and trusting it puts the rebate
-/// sample on the light table.
-const MIN_BAND_INNER_SHARE: f32 = 0.02;
-
 /// How far the picture may sit from the hole band it faces, as a fraction of
 /// the hole-to-hole span.
 ///
@@ -130,13 +121,6 @@ const REBATE_SUPPORT_MIN: f32 = 0.25;
 /// percent of the base; 4% clears grain noise (about 2% on these scans)
 /// while staying far below a bright content seam.
 const REBATE_STEP_MIN: f32 = 0.04;
-
-/// Width over height of a full 35mm frame.
-///
-/// Bounding, not asserting: it keeps a candidate rectangle from chaining
-/// across an inter-frame gap into the next frame, where a level-based edge
-/// gate alone would keep walking.
-const FRAME_ASPECT: f32 = 1.5;
 
 /// The content level that separates exposed picture from rebate, as a
 /// fraction of the base, when scanning a row for the picture's horizontal
@@ -334,15 +318,21 @@ pub struct Frame {
     /// How far the frame is rotated, in radians. Rotating the image by the
     /// negative of this makes the frame axis-aligned.
     pub skew: f32,
-    /// Rebate regions that geometry located mechanically, when it could.
+    /// The sprocket-hole bands geometry found, in source coordinates.
     ///
-    /// These are the clear-film bands above and below the picture, bounded by
-    /// the sprocket holes on one side and the picture on the other. They are
-    /// already in source coordinates and are the preferred source for the film
-    /// base. `None` means the band machinery did not apply (whole-image or
-    /// line-pipeline frames), and callers should fall back to whole-image base
-    /// detection.
-    pub film: Option<[film_base::FilmRegion; 2]>,
+    /// Bare light: light through a punched hole is the lamp, not the film, so
+    /// anything sampling the film base keeps out of these. Either slot may be
+    /// empty — a band can lie outside the sensor — and both are empty when the
+    /// frame came from the content-line path.
+    pub holes: [Option<film_base::FilmRegion>; 2],
+    /// The film the punch bands bound, in source coordinates, when they did.
+    ///
+    /// This is the region a base sample belongs in: the strip's interior
+    /// between the two bands, or the strip's remainder beside the one band that
+    /// is in frame. Everything beyond the bands is the sensor's margin and the
+    /// light table, brighter than any film. `None` when no band was found, and
+    /// callers then fall back to the whole image.
+    pub film: Option<film_base::FilmRegion>,
 }
 
 impl Frame {
@@ -360,6 +350,7 @@ impl Frame {
             center: [size[0] / 2.0, size[1] / 2.0],
             size,
             skew: 0.0,
+            holes: [None, None],
             film: None,
         }
     }
@@ -384,39 +375,282 @@ impl Frame {
     #[must_use]
     pub fn sample_region(self) -> Self {
         // Band-anchored and fallback frames share the axis assignment for
-        // now: the strip is horizontal either way. `film: Some` is the
-        // mechanical guarantee behind the transverse inset; a line-detected
-        // frame approximates it.
+        // now: the strip is horizontal either way. The transverse inset is
+        // small because the sprocket bands bound those sides mechanically
+        // when they were found, and a content-line frame approximates the
+        // same boundary.
         Self {
             center: self.center,
-            film: self.film,
             size: [
                 self.size[0] * (1.0 - 2.0 * SAMPLE_INSET_LENGTH),
                 self.size[1] * (1.0 - 2.0 * SAMPLE_INSET_TRANSVERSE),
             ],
             skew: self.skew,
+            holes: self.holes,
+            film: self.film,
         }
+    }
+
+    /// The sampling region pulled in until every side reads as picture.
+    ///
+    /// The frame's long edges are the pair a scan states least reliably, so a
+    /// region inset from them lands in rebate on one side and cuts exposure on
+    /// the other. Clear film is the brightest thing the film shows, and the base
+    /// was measured from it, so a strip that reads at the base's level is
+    /// unexposed film: each side is walked inward, one step at a time, until the
+    /// strip just inside it reads as content instead. That is the exposure's own
+    /// edge, found where the frame's was not.
+    #[must_use]
+    pub fn exposure_region(self, image: &LinearImage, base: &FilmBase) -> Self {
+        let film_level = base
+            .transmittance
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min);
+        if !film_level.is_finite() || film_level <= 0.0 {
+            return self;
+        }
+
+        let mut region = self.sample_region();
+        // Only the long sides are searched. The transverse pair is bounded by
+        // the punch bands, which are found reliably, and an exposure runs close
+        // to them on every scan — so the default inset is already right there,
+        // and moving it would only eat picture. The long pair has nothing
+        // concrete behind it, which is exactly why it is the pair that lands in
+        // rebate on one side and cuts exposure on the other.
+        //
+        // Each long side is searched on its own, and only ever *in*: a side with
+        // unexposed film behind it comes in until it reads as picture. Growing
+        // the other way was tried and overshot — a bright highlight in a thin
+        // negative reads as close to the base as film does, so a side with no
+        // film behind it grew straight past the exposure.
+        for side in LONG_SIDES {
+            for _ in 0..EXPOSURE_MAX_STEPS {
+                let step = EXPOSURE_STEP_SHARE * region.size[0];
+                if step <= 0.0 {
+                    break;
+                }
+                if !reads_as_film(image, &region, film_level, side) {
+                    break;
+                }
+                // Unexposed film behind this side: bring it in, up to the room
+                // the film beyond an exposure can take.
+                if region.size[0] <= self.size[0] * (1.0 - EXPOSURE_MAX_SHRINK_SHARE) {
+                    break;
+                }
+                region = region.pulled_in(side, step);
+            }
+
+            // Breathing room: a side that came to rest on film goes back out one
+            // step, so no sample sits in the transition.
+            let step = EXPOSURE_STEP_SHARE * region.size[0];
+            if step > 0.0
+                && region.can_grow(side, step, self)
+                && reads_as_film(image, &region, film_level, side)
+            {
+                region = region.pushed_out(side, step);
+            }
+        }
+        region
+    }
+
+    /// Whether one long side can move outward by `amount` and stay inside
+    /// `frame`.
+    fn can_grow(self, side: usize, amount: f32, frame: Self) -> bool {
+        let (half, frame_half) = (self.size[0] / 2.0, frame.size[0] / 2.0);
+        if side == 0 {
+            self.center[0] - half - amount >= frame.center[0] - frame_half
+        } else {
+            self.center[0] + half + amount <= frame.center[0] + frame_half
+        }
+    }
+
+    /// The region with one long side moved outward by `amount`.
+    fn pushed_out(self, side: usize, amount: f32) -> Self {
+        let mut region = self;
+        if side == 0 {
+            region.center[0] -= amount / 2.0;
+        } else {
+            region.center[0] += amount / 2.0;
+        }
+        region.size[0] += amount;
+        region
+    }
+
+    /// The region with one side moved inward by `amount`, the opposite side
+    /// held.
+    fn pulled_in(self, side: usize, amount: f32) -> Self {
+        let mut region = self;
+        match side {
+            0 => {
+                region.center[0] += amount / 2.0;
+                region.size[0] -= amount;
+            }
+            1 => {
+                region.center[0] -= amount / 2.0;
+                region.size[0] -= amount;
+            }
+            2 => {
+                region.center[1] += amount / 2.0;
+                region.size[1] -= amount;
+            }
+            _ => {
+                region.center[1] -= amount / 2.0;
+                region.size[1] -= amount;
+            }
+        }
+        region
     }
 }
 
 /// The color-sampling region's inset along the strip's length, as a fraction
 /// per side.
 ///
+/// Tighter than it once was: the frame's long sides are what a scan states
+/// least reliably, so the region pulls in enough to be inside the exposure
+/// whatever the frame did — but the picture is what is being read, and every
+/// percent of inset is a percent of the frame no measurement can see.
+///
 /// Dead space along the film's length is *not* cut away reliably: a digital
 /// sensor is longer than the strip, adjacent frames and film ends adjoin the
 /// frame, and the frame's own horizontal sides are approximations (the width
 /// comes from the film's aspect and the content's centre, not from four
 /// measured edges). The larger inset keeps the sample inside the picture.
-const SAMPLE_INSET_LENGTH: f32 = 0.20;
+const SAMPLE_INSET_LENGTH: f32 = 0.05;
 
-/// The color-sampling region's inset across the film, as a fraction per
-/// side.
+/// The color-sampling region's inset across the film, as a fraction per side.
+///
+/// The sprocket bands bound these sides mechanically when they were found, so
+/// the region needs only enough inset to clear the rebate the frame may have
+/// kept and the rounded film corners the maintainer trims by hand.
 ///
 /// The sprocket bands bound the film across its width mechanically, and the
 /// strip is cut there on every scan, so the frame's two band-facing sides
 /// carry the small residual error only: rebate the fallback placement may
 /// keep and the rounded film corners the maintainer trims by hand.
-const SAMPLE_INSET_TRANSVERSE: f32 = 0.10;
+const SAMPLE_INSET_TRANSVERSE: f32 = 0.05;
+
+/// The sides of the sampling region whose position nothing concrete fixes: the
+/// two along the strip's length.
+const LONG_SIDES: std::ops::Range<usize> = 0..2;
+
+/// How far inside a side of the sampling region one walk step looks, as a
+/// fraction of that side's length.
+const EXPOSURE_STEP_SHARE: f32 = 0.02;
+
+/// Most steps one side may be walked in.
+///
+/// A side that still reads as film after this much has no exposure behind it to
+/// find, and the region is better left where it was than shrunk to nothing.
+const EXPOSURE_MAX_STEPS: usize = 20;
+
+/// The median least channel of the strip just inside one side of a region.
+///
+/// The strip is sampled along the side, following the region's own tilt. Its
+/// level against the base the clear-film level is what says whether there is
+/// film or picture behind that side; `None` when the strip falls off the image.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "sample points inside the image, rounded to their pixels"
+)]
+fn reads_as_film(image: &LinearImage, region: &Frame, film_level: f32, side: usize) -> bool {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 {
+        return false;
+    }
+
+    let step = EXPOSURE_STEP_SHARE * region.size[0];
+    let (half_w, half_h) = (region.size[0] / 2.0, region.size[1] / 2.0);
+    let (sin, cos) = region.skew.sin_cos();
+    let to_source = |local: [f32; 2]| {
+        [
+            region.center[0] + cos * local[0] - sin * local[1],
+            region.center[1] + sin * local[0] + cos * local[1],
+        ]
+    };
+
+    // The side is read in strips, not as one average. A frame can carry a shadow
+    // that reads as bright as clear film and a highlight that does too, so a
+    // single number along the whole side can land in either population and say
+    // the wrong thing; each strip is judged on its own, and the side follows the
+    // majority of them.
+    let mut film_strips = 0usize;
+    let mut strips = 0usize;
+    for strip in 0..EXPOSURE_STRIPS {
+        let t = (coordinate(strip) + 0.5) / coordinate(EXPOSURE_STRIPS);
+        let along = -half_w + region.size[0] * t;
+        let mut samples = Vec::new();
+        for row in 0..EXPOSURE_STRIP_POINTS {
+            let u = (coordinate(row) + 0.5) / coordinate(EXPOSURE_STRIP_POINTS);
+            let local = match side {
+                0 => [along, -half_h + step * u],
+                1 => [half_w - region.size[0] * (1.0 - t), -half_h + step * u],
+                2 => [-half_w + step * u, along],
+                _ => [-half_w + step * u, half_h - region.size[1] * (1.0 - t)],
+            };
+            let [x, y] = to_source(local);
+            if x < 0.0 || y < 0.0 {
+                continue;
+            }
+            let (x, y) = (x.round() as usize, y.round() as usize);
+            if x >= width || y >= height {
+                continue;
+            }
+            let pixel = &image.data[(y * width + x) * 3..][..3];
+            samples.push(pixel[0].min(pixel[1]).min(pixel[2]));
+        }
+        if samples.len() < 2 {
+            continue;
+        }
+
+        samples.sort_unstable_by(f32::total_cmp);
+        let median = samples[samples.len() / 2];
+        let spread = samples[samples.len() - 1] - samples[0];
+        strips += 1;
+        // Film: at the base's level, and featureless. A highlight or a shadow
+        // may sit at the same level but carries structure, which is what tells
+        // them apart where a level alone cannot.
+        if median >= EXPOSURE_FILM_SHARE * film_level && spread <= EXPOSURE_FLAT_SHARE * film_level
+        {
+            film_strips += 1;
+        }
+    }
+
+    strips > 0 && film_strips * 2 >= strips
+}
+
+/// Strips one side is read in.
+const EXPOSURE_STRIPS: usize = 16;
+
+/// Points read across one strip's thickness.
+const EXPOSURE_STRIP_POINTS: usize = 5;
+
+/// How much a strip's own samples may vary and still read as film, as a
+/// fraction of the clear-film level.
+///
+/// Clear film is featureless: grain and the light's falloff are a few percent.
+/// Content — a highlight, a shadow, a window — carries an edge somewhere in the
+/// strip, and that is what this catches.
+const EXPOSURE_FLAT_SHARE: f32 = 0.05;
+
+/// How close to the clear-film level a strip must read to count as unexposed,
+/// as a fraction of it.
+///
+/// Clear film is the *brightest* the film gets, and the base was measured from
+/// it, so a strip this close to the base has essentially no exposure on it. The
+/// margin is tight on purpose: a thin negative puts its *bright content* within
+/// a few percent of the base as well, and a looser test shrinks the region over
+/// picture.
+const EXPOSURE_FILM_SHARE: f32 = 0.97;
+
+/// Most of a long side that may be given up to unexposed film, as a fraction of
+/// the region's length.
+///
+/// The film beyond the exposure along the strip is the inter-frame gap, a few
+/// percent of a frame; this leaves room for it and for a scan that caught more.
+const EXPOSURE_MAX_SHRINK_SHARE: f32 = 0.08;
 
 /// Conditional tracing for the frame pipeline, active when `GRAINBASE_TRACE`
 /// is set in the environment. Diagnostic only; the quiet default is the
@@ -461,11 +695,22 @@ pub fn find(image: &LinearImage) -> Option<Frame> {
     let src_h = coordinate(height);
 
     // Hole bands straighten the grid and anchor the frame mechanically.
-    if let Some(coarse) = detect_bands(&gray, base).map(|bands| bands.skew) {
+    if let Some(coarse_bands) = detect_bands(&gray, base) {
+        let coarse = coarse_bands.skew;
         let rotated = rotate_gray(&gray, -coarse);
         trace_find("bands found, straightening for the anchored pass");
-        let anchored = detect_bands(&rotated, base)
-            .and_then(|bands| band_frame(&rotated, scale, base, &bands, coarse, src_w, src_h));
+        let rechecked = detect_bands(&rotated, base);
+        // The hole bands are known even when only one of them is in frame, and
+        // the base sampler must keep clear of them either way.
+        let holes = rechecked.as_ref().map_or([None, None], |bands| {
+            hole_bands(&rotated, scale, coarse, bands, src_w, src_h)
+        });
+        let film = rechecked
+            .as_ref()
+            .and_then(|bands| film_between_bands(&rotated, scale, coarse, bands, src_w, src_h));
+        let anchored = rechecked
+            .as_ref()
+            .and_then(|bands| band_frame(&rotated, scale, base, bands, coarse, src_w, src_h));
         if let Some(second) = anchored {
             let skew = coarse + second.skew;
             if skew.abs() <= MAX_SKEW {
@@ -476,14 +721,17 @@ pub fn find(image: &LinearImage) -> Option<Frame> {
         } else {
             trace_find("band frame unusable, falling to the content-line detector");
         }
-        // The bands were visible but their frame came out unusable: try the
-        // content-based detector on the same straightened grid before
-        // giving up on the crop entirely.
+        // The bands were visible but their frame came out unusable (or only one
+        // band was): try the content-based detector on the same straightened
+        // grid before giving up on the crop entirely. Its frame keeps the bands
+        // it was straightened with, so a base sample still avoids the holes.
         let still = detect_frame(&rotated, scale, image.width, image.height, base);
-        if let Some(second) = still {
+        if let Some(mut second) = still {
             let skew = coarse + second.skew;
             if skew.abs() <= MAX_SKEW {
-                trace_find("content-line frame accepted (no film regions)");
+                second.holes = holes;
+                second.film = film;
+                trace_find("content-line frame accepted");
                 return Some(map_back(second, coarse, src_w, src_h));
             }
         }
@@ -525,6 +773,7 @@ fn map_back(frame: Frame, coarse_skew: f32, src_w: f32, src_h: f32) -> Frame {
         ],
         size: frame.size,
         skew: coarse_skew + frame.skew,
+        holes: frame.holes,
         film: frame.film,
     }
 }
@@ -610,22 +859,25 @@ impl Band {
     }
 }
 
-/// A strip's two hole bands and the mechanical tilt they carry.
+/// A strip's hole bands and the mechanical tilt they carry.
+///
+/// Either band may be missing. A band the sensor cut away leaves the other one,
+/// and a single band still carries the strip's tilt; refusing both is the
+/// whole-image case.
 struct Bands {
-    top: Band,
-    bottom: Band,
+    top: Option<Band>,
+    bottom: Option<Band>,
     skew: f32,
 }
 
 /// Detects the strip's sprocket-hole bands on one scan.
 ///
-/// Returns `None` when either band is missing or too short: the strip never
-/// shows a full film width, which is exactly the case where the mechanical
-/// anchors are not available and detection must answer differently. A band
-/// cut by the sensor's edge is still a band: the truncation shortens it
-/// without saying anything about whether sprockets are present, and the
-/// pre-inversion hole signature — bare light at the white balance — reaches
-/// the 2×base bar on every row the punch still covers.
+/// The scan cuts the strip across its width, so a band can lie outside the
+/// sensor while its opposite is (partly) in frame; `None` is returned only when
+/// neither half of the grid holds one. A band cut by the sensor's edge is still
+/// a band: the truncation shortens it without saying anything about whether
+/// sprockets are present, and the pre-inversion hole signature — bare light at
+/// the white balance — reaches the 2×base bar on every row the punch covers.
 fn detect_bands(image: &GrayImage, base: f32) -> Option<Bands> {
     let width = image.width as usize;
     let height = image.height as usize;
@@ -645,11 +897,26 @@ fn detect_bands(image: &GrayImage, base: f32) -> Option<Bands> {
     }
 
     let half = height / 2;
-    let top = band_run(&fraction, 0..half, true)?;
-    let bottom = band_run(&fraction, half..height, false)?;
-    let skew = band_skew(image, base, top, bottom);
+    let top = band_run(&fraction, 0..half, true);
+    let bottom = band_run(&fraction, half..height, false);
+    trace_find(&format!(
+        "detect_bands base {base} bright {bright} grid {}x{} top {:?} bottom {:?}",
+        image.width,
+        image.height,
+        top.map(|band| (band.start, band.end)),
+        bottom.map(|band| (band.start, band.end)),
+    ));
+    if top.is_none() && bottom.is_none() {
+        return None;
+    }
 
-    Some(Bands { top, bottom, skew })
+    let mut bands = Bands {
+        top,
+        bottom,
+        skew: 0.0,
+    };
+    bands.skew = band_skew(image, base, &bands);
+    Some(bands)
 }
 
 /// Runs of light rows in one vertical half of the grid, taking the run
@@ -704,13 +971,14 @@ fn band_run(fraction: &[f32], rows: std::ops::Range<usize>, from_top: bool) -> O
 /// each band's per-column bright centroid.
 ///
 /// Bands are parts of the film itself; their axis carries the strip's skew
-/// with no content intercession anywhere in the measurement.
+/// with no content intercession anywhere in the measurement. One band answers
+/// as well as two: it is the same strip.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "band rows are non-negative small integers on the working grid"
 )]
-fn band_skew(image: &GrayImage, base: f32, top: Band, bottom: Band) -> f32 {
+fn band_skew(image: &GrayImage, base: f32, bands: &Bands) -> f32 {
     let width = image.width as usize;
     let height = image.height as usize;
     let bright = base * HOLE_BRIGHTNESS;
@@ -754,9 +1022,10 @@ fn band_skew(image: &GrayImage, base: f32, top: Band, bottom: Band) -> f32 {
     };
 
     // Slope dy/dx of a near-horizontal edge is tan(skew).
-    let slopes = [slope(top), slope(bottom)]
+    let slopes = [bands.top, bands.bottom]
         .into_iter()
         .flatten()
+        .filter_map(slope)
         .collect::<Vec<f32>>();
     if slopes.is_empty() {
         return 0.0;
@@ -969,9 +1238,16 @@ fn median_of(values: &mut [f32]) -> f32 {
     values[values.len() / 2]
 }
 
-/// Builds the frame from the mechanical anchors: the bands set the vertical
-/// bounds, refined by the rebate search inside their own bounds; the film's
-/// aspect sets the width; the content's centre positions it.
+/// Builds the frame from whatever the scan actually shows: each side is the
+/// boundary that could be measured, and a side that could not is left at the
+/// edge of the scan, uncropped.
+///
+/// The punch bands bound the picture across the strip, refined by the rebate
+/// search inside their own bounds; the content's horizontal extent bounds it
+/// along the strip. Nothing is assumed about the film's shape: a frame the
+/// sensor cut, or a picture whose content does not separate from the rebate,
+/// loses that side's crop and keeps the rest rather than being guessed back
+/// into a nominal rectangle.
 ///
 /// Returns the frame in the grid's own coordinates, scaled to source pixels;
 /// the caller folds it back through the straightening rotation.
@@ -987,26 +1263,28 @@ fn band_frame(
     let width = image.width as usize;
     let height = image.height as usize;
 
-    let inner = bands.bottom.start - bands.top.end;
+    // Both bands are needed to bound the picture across the strip. With one of
+    // them out of frame the content-line path answers instead, which measures
+    // the sides it can and leaves the whole image alone when it cannot.
+    let (Some(top_band), Some(bottom_band)) = (bands.top, bands.bottom) else {
+        return None;
+    };
+
+    let inner = bottom_band.start - top_band.end;
     if inner <= 0.0 {
         return None;
     }
     let rebate_max = REBATE_MAX_FRACTION * inner;
 
-    let top = rebate_edge(image, base, bands.top, true, rebate_max)
-        .unwrap_or_else(|| band_line(bands.top, true));
-    let bottom = rebate_edge(image, base, bands.bottom, false, rebate_max)
-        .unwrap_or_else(|| band_line(bands.bottom, false));
+    // A band whose rebate is not measurable places its boundary by the
+    // reference offset inside the band's own rows.
+    let top = rebate_edge(image, base, top_band, true, rebate_max)
+        .unwrap_or_else(|| band_line(top_band, true));
+    let bottom = rebate_edge(image, base, bottom_band, false, rebate_max)
+        .unwrap_or_else(|| band_line(bottom_band, false));
     trace_find(&format!(
-        "bands top {}..{} bottom {}..{} inner {inner} rebate_max {rebate_max} | top line a {} m {} | bottom line a {} m {}",
-        bands.top.start,
-        bands.top.end,
-        bands.bottom.start,
-        bands.bottom.end,
-        top.a,
-        top.m,
-        bottom.a,
-        bottom.m,
+        "band boundaries top {} {} bottom {} {} rebate_max {rebate_max}",
+        top.a, top.m, bottom.a, bottom.m
     ));
 
     let y0 = top.a.max(0.0).min(coordinate(height));
@@ -1016,16 +1294,16 @@ fn band_frame(
         return None;
     }
 
-    // Width from the film's own aspect; position from the content. The
-    // grid's long axis is the strip's length direction, cropped to one
-    // frame's length. Bounded by the grid: a frame may run off the sensor
-    // edge, and clamping into the sensor keeps the crop on film.
-    let (content_start, content_end) = content_span(image, base, top, bottom)?;
-    let content_center = f32::midpoint(content_start, content_end);
-    let width_grid = FRAME_ASPECT * height_grid;
-    let half = width_grid / 2.0;
-    let x0 = (content_center - half).max(0.0);
-    let x1 = (content_center + half).min(coordinate(width));
+    // The picture's horizontal extent bounds the frame along the strip. It is
+    // measured from the content between the two boundaries, so an undetectable
+    // picture leaves both of these sides uncropped rather than inventing a
+    // width.
+    let (x0, x1) = match content_span(image, base, top, bottom) {
+        Some((start, end)) => (start.max(0.0), end.min(coordinate(width))),
+        // No measurable content extent: the strip's own ends are the picture's,
+        // so those two sides are not cropped rather than invented.
+        None => (0.0, coordinate(width)),
+    };
 
     let final_width = (x1 - x0) * scale - 2.0 * BOUNDARY_INSET * scale;
     let final_height = (y1 - y0) * scale - 2.0 * BOUNDARY_INSET * scale;
@@ -1033,129 +1311,126 @@ fn band_frame(
         return None;
     }
 
-    // Build the clear-film regions in source coordinates. They are the rebate
-    // between each hole band and its picture-side boundary. A missing or
-    // degenerately thin region drops the whole pair: a one-sided base sample
-    // would be biased by the light table on the other side.
-    let film = film_regions(image, scale, coarse, bands, top, bottom, src_w, src_h);
-
     Some(Frame {
         center: [f32::midpoint(x0, x1) * scale, f32::midpoint(y0, y1) * scale],
         size: [final_width, final_height],
         skew: bands.skew,
-        film,
+        holes: hole_bands(image, scale, coarse, bands, src_w, src_h),
+        film: film_between_bands(image, scale, coarse, bands, src_w, src_h),
     })
 }
 
-/// Builds the two rebate regions for a band-anchored frame.
+/// The strip's interior as one band: from the top punch's inner edge to the
+/// bottom punch's inner edge.
 ///
-/// Each region is the clear-film strip between a hole band's inner edge and
-/// the measured (or fallback) picture boundary. They are mapped back to
-/// source coordinates so the film-base detector can sample them directly on
-/// the uncropped scan.
+/// This is where the film base is measured from. The punch bands bound it on
+/// both sides, and everything beyond them — the film's own edges, the sensor's
+/// margin, the light table — is left out by construction, which is what makes
+/// this region trustworthy where a whole-image percentile is not.
 ///
-/// The claim is gated on the bands reading as the film's punch: the punch
-/// plus its fence is a fixed slice of the strip's width, while a band cut to
-/// slivers by the sensor edge can leave the "between band and picture" rows
-/// holding the strip edge's transition rather than the rebate. Such bands
-/// still anchor the frame above — their edge line is real — they just may
-/// not claim a rebate sample.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "geometry helpers need many scalars"
-)]
-fn film_regions(
+/// One band in frame is enough to know the film on its own side: the region
+/// then runs from that band's inner edge to the edge of the scan, which is
+/// still film, still clear of the light table, and still bounded by the punch
+/// on the side that matters.
+fn film_between_bands(
     image: &GrayImage,
     scale: f32,
     coarse: f32,
     bands: &Bands,
-    top: Line,
-    bottom: Line,
     src_w: f32,
     src_h: f32,
-) -> Option<[film_base::FilmRegion; 2]> {
-    let inner = bands.bottom.start - bands.top.end;
-    if inner <= 0.0
-        || bands.top.height() / inner < MIN_BAND_INNER_SHARE
-        || bands.bottom.height() / inner < MIN_BAND_INNER_SHARE
-    {
+) -> Option<film_base::FilmRegion> {
+    let slope = (coarse + bands.skew).tan();
+    let (start, end) = match (bands.top, bands.bottom) {
+        (Some(top), Some(bottom)) if bottom.start > top.end => (top.end, bottom.start),
+        // One band: the film is on the side the punch does not occupy.
+        (Some(top), None) => (top.end, coordinate(image.height as usize)),
+        (None, Some(bottom)) => (0.0, bottom.start),
+        _ => return None,
+    };
+    if end <= start {
         return None;
     }
-
-    let total_skew = coarse + bands.skew;
-    let slope = total_skew.tan();
-
-    let top_region = rebate_region(
+    Some(span_region(
         image,
         scale,
         coarse,
         slope,
-        bands.top.end,
-        top,
+        f32::midpoint(start, end),
+        (end - start) / 2.0,
         src_w,
         src_h,
-    )?;
-    let bottom_region = rebate_region(
-        image,
-        scale,
-        coarse,
-        slope,
-        bands.bottom.start,
-        bottom,
-        src_w,
-        src_h,
-    )?;
-
-    Some([top_region, bottom_region])
+    ))
 }
 
-/// One rebate region mapped from grid space to source space.
+/// The sprocket-hole bands the frame was straightened against, in source
+/// coordinates.
 ///
-/// `band_edge` is the hole-side boundary (constant across the grid width); the
-/// `boundary` line is the picture-side boundary. The region lies between them.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "geometry helpers need many scalars"
-)]
-fn rebate_region(
+/// These are bare light: a base sample that lands inside one has measured the
+/// lamp, not the film. Mapping them out of the working grid is the same shear
+/// and scale the frame's own coordinates go through, so a band sits where the
+/// holes it was measured from sit.
+fn hole_bands(
+    image: &GrayImage,
+    scale: f32,
+    coarse: f32,
+    bands: &Bands,
+    src_w: f32,
+    src_h: f32,
+) -> [Option<film_base::FilmRegion>; 2] {
+    let slope = (coarse + bands.skew).tan();
+    [bands.top, bands.bottom]
+        .map(|band| band.map(|band| band_region(image, scale, coarse, slope, band, src_w, src_h)))
+}
+
+/// One band mapped from grid space to source space.
+fn band_region(
     image: &GrayImage,
     scale: f32,
     coarse: f32,
     slope: f32,
-    band_edge: f32,
-    boundary: Line,
+    band: Band,
     src_w: f32,
     src_h: f32,
-) -> Option<film_base::FilmRegion> {
+) -> film_base::FilmRegion {
+    span_region(
+        image,
+        scale,
+        coarse,
+        slope,
+        f32::midpoint(band.start, band.end),
+        band.height() / 2.0,
+        src_w,
+        src_h,
+    )
+}
+
+/// An oriented span of grid rows mapped into source coordinates.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "geometry helpers need many scalars"
+)]
+fn span_region(
+    image: &GrayImage,
+    scale: f32,
+    coarse: f32,
+    slope: f32,
+    center_grid: f32,
+    half_grid: f32,
+    src_w: f32,
+    src_h: f32,
+) -> film_base::FilmRegion {
     let grid_cx = coordinate(image.width as usize) / 2.0;
-    let boundary_at_cx = boundary.a + boundary.m * grid_cx;
-
-    // The measured boundary should already lie inside the rebate limit, but
-    // clamp it so a wild fallback line cannot produce a runaway region. For the
-    // bottom region the picture-side boundary sits *above* the hole band in the
-    // grid, so the signed span can be negative; the region is the absolute band.
-    let span_grid = (boundary_at_cx - band_edge).abs();
-    let half_height_grid = (span_grid / 2.0).max(0.0);
-    trace_find(&format!(
-        "rebate_region band_edge {band_edge} boundary_at_cx {boundary_at_cx} span {span_grid} half {half_height_grid}"
-    ));
-    if half_height_grid < 1.0 {
-        return None;
-    }
-
-    let center_y_grid = f32::midpoint(band_edge, boundary_at_cx);
     let (rotated_x, rotated_y) =
-        map_grid_to_source(grid_cx, center_y_grid, coarse, scale, src_w, src_h);
+        map_grid_to_source(grid_cx, center_grid, coarse, scale, src_w, src_h);
 
     // Express the centerline as `y` at the image's horizontal center.
     let image_center_x = src_w / 2.0;
-    let center_y = rotated_y + slope * (image_center_x - rotated_x);
-
-    Some(film_base::FilmRegion {
-        center_y,
-        half_height: half_height_grid * scale,
+    film_base::FilmRegion {
+        center_y: rotated_y + slope * (image_center_x - rotated_x),
+        half_height: half_grid * scale,
         slope,
-    })
+    }
 }
 
 /// Maps a point from the working grid to source coordinates.
@@ -1875,6 +2150,7 @@ fn score_rectangle(
         center,
         size: [width_source, height_source],
         skew,
+        holes: [None, None],
         film: None,
     };
 
@@ -2460,16 +2736,17 @@ mod tests {
 
     #[test]
     fn the_sampling_region_insets_as_agreed() {
-        // 20% width, 10% height, per side; centre and skew carried.
+        // 5% width and height, per side; centre and skew carried.
         let whole = Frame {
             center: [100.0, 50.0],
             size: [100.0, 50.0],
             skew: 0.01,
+            holes: [None, None],
             film: None,
         };
         let region = whole.sample_region();
         assert!(
-            (region.size[0] - 60.0).abs() < 1e-4 && (region.size[1] - 40.0).abs() < 1e-5,
+            (region.size[0] - 90.0).abs() < 1e-4 && (region.size[1] - 45.0).abs() < 1e-5,
             "got {region:?}"
         );
         assert_eq!(region.center, whole.center);
@@ -2494,6 +2771,7 @@ mod tests {
             center: [32.0, 24.0],
             size: [0.0, 0.0],
             skew: 0.0,
+            holes: [None, None],
             film: None,
         };
         let result = apply(&image, &empty);
@@ -2626,97 +2904,72 @@ mod tests {
     }
 
     #[test]
-    fn band_frame_reports_rebate_regions() {
+    fn a_band_anchored_frame_reports_the_punch_bands() {
         let image = scan_with_strip(600, 400, 0.0);
         let frame = find(&image).expect("a frame");
-        let regions = frame
-            .film
-            .expect("band-anchored frame should carry rebate regions");
+        let bands: Vec<_> = frame.holes.iter().flatten().collect();
+        assert_eq!(bands.len(), 2, "both bands are in frame here");
 
-        let width = image.width as usize;
-        let cx = coordinate(width) / 2.0;
-        // margin 1 + hole 8 + half rebate 6.
-        let top_rebate_center = 15.0;
-        let bottom_rebate_center = coordinate(image.height as usize) - 15.0;
-
-        for &x in &[0usize, width / 2, width - 1] {
-            let x_f = coordinate(x);
-            for (region, expected) in regions
-                .iter()
-                .zip([top_rebate_center, bottom_rebate_center])
-            {
-                let center = region.center_y + region.slope * (x_f - cx);
-                assert!(
-                    (center - expected).abs() < 2.0,
-                    "region center at column {x} should be near {expected}, got {center}"
-                );
-                assert!(
-                    region.half_height >= 4.5 && region.half_height <= 7.0,
-                    "half-height should cover the rebate, got {}",
-                    region.half_height
-                );
-            }
+        // margin 1 + half of hole 8.
+        let cx = coordinate(image.width as usize) / 2.0;
+        for (band, expected_center) in bands
+            .iter()
+            .zip([5.0, coordinate(image.height as usize) - 5.0])
+        {
+            let center = band.center_y + band.slope * (cx - cx);
+            assert!(
+                (center - expected_center).abs() < 2.0,
+                "band centre should be near {expected_center}, got {center}"
+            );
+            assert!(
+                (band.half_height - 4.0).abs() < 2.0,
+                "half-height should cover the punch, got {}",
+                band.half_height
+            );
         }
     }
 
     #[test]
-    fn rebate_regions_follow_strip_tilt() {
-        let skew = 0.02f32;
-        let image = scan_with_strip(600, 400, skew);
+    fn a_band_anchored_frame_reports_the_film_the_bands_bound() {
+        let image = scan_with_strip(600, 400, 0.0);
         let frame = find(&image).expect("a frame");
-        let regions = frame
-            .film
-            .expect("band-anchored frame should carry rebate regions");
+        let region = frame.film.expect("both bands are in frame here");
 
-        // The region slope must match the frame's measured total skew; the
-        // synthetic tilt is only an input, and the detector may measure a
-        // slightly different value.
-        let expected_slope = frame.skew.tan();
+        // margin 1 + hole 8 = the punch band ends at row 9; the bottom band
+        // starts at row 391, so the film between them is rows 9..391: centre
+        // 200, half 191.
+        let cx = coordinate(image.width as usize) / 2.0;
+        let center = region.center_y + region.slope * (cx - cx);
         assert!(
-            (regions[0].slope - expected_slope).abs() < 0.005,
-            "region slope {} should match frame skew slope {}",
-            regions[0].slope,
-            expected_slope
+            (center - 200.0).abs() < 2.0,
+            "the region should span the strip's interior, got centre {center}"
         );
-
-        // At opposite edges the centerlines should have moved by roughly the
-        // skew times half the width.
-        let width = image.width as usize;
-        let left = regions[0].center_y + regions[0].slope * (0.0 - coordinate(width) / 2.0);
-        let right = regions[0].center_y
-            + regions[0].slope * (coordinate(width - 1) - coordinate(width) / 2.0);
         assert!(
-            (right - left).abs() > 4.0,
-            "tilted regions should shift across the width, got {left}..{right}"
+            (region.half_height - 191.0).abs() < 2.0,
+            "half-height should reach the punch bands, got {}",
+            region.half_height
         );
     }
 
     #[test]
-    fn rebate_regions_stay_out_of_holes_and_margins() {
-        let image = scan_with_strip(600, 400, 0.0);
+    fn one_band_still_bounds_the_film_on_its_side() {
+        // A strip whose top punch is out of frame: the film below the bottom
+        // band is still film, and the region has to say so rather than refuse.
+        let mut image = scan_with_strip(600, 400, 0.0);
+        let (pixels, _remainder) = image.data.as_chunks_mut::<3>();
+        for row in 0..9usize {
+            for column in 0..600usize {
+                // Paint the top punch band back to film.
+                if (column / 12) % 2 == 0 {
+                    pixels[row * 600 + column] = [0.12, 0.12, 0.12];
+                }
+            }
+        }
         let frame = find(&image).expect("a frame");
-        let regions = frame
-            .film
-            .expect("band-anchored frame should carry rebate regions");
-
-        let width = image.width as usize;
-        let cx = coordinate(width) / 2.0;
-
-        // Top rebate is rows 9..20, between the hole band (1..9) and picture.
-        let top = regions[0];
-        let top_center = top.center_y + top.slope * (cx - cx);
+        let region = frame.film.expect("one band still bounds the film");
         assert!(
-            top_center - top.half_height >= 8.0 && top_center + top.half_height <= 21.0,
-            "top region {top:?} should stay inside the rebate rows 9..20"
-        );
-
-        // Bottom rebate is rows 379..390, between picture and hole band.
-        let bottom = regions[1];
-        let bottom_center = bottom.center_y + bottom.slope * (cx - cx);
-        assert!(
-            bottom_center - bottom.half_height >= 378.0
-                && bottom_center + bottom.half_height <= 391.0,
-            "bottom region {bottom:?} should stay inside the rebate rows 379..390"
+            region.half_height > 100.0,
+            "the region should reach the sensor's far edge, got {region:?}"
         );
     }
 }

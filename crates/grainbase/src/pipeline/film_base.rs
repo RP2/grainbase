@@ -145,6 +145,153 @@ impl FilmBase {
         Self { transmittance }
     }
 
+    /// Estimates the base from the film between the sprocket holes.
+    ///
+    /// The punch band runs across the strip at the film's edge, and the holes
+    /// are punched out of it. The film *between* one hole and the next is
+    /// unexposed by construction: the camera's gate never reaches the strip's
+    /// edge, so nothing but the mask has ever been between that film and the
+    /// light. The band's own rows, at the columns that are not holes, are
+    /// therefore clear film by the film's geometry alone — no region has to be
+    /// estimated, and the exposure, the light table, and the holes themselves
+    /// are excluded by *where* the samples are taken rather than by a level.
+    ///
+    /// The holes are the bright minority of the band's area (measured 0.34–0.39
+    /// of it on the maintainer's scans), so the median of the band's column
+    /// means is the film, and the median is what this takes.
+    ///
+    /// Returns [`FilmBase::IDENTITY`] when there is no band to measure; callers
+    /// must then ask the operator for a base rather than guess.
+    #[must_use]
+    pub fn detect_between_sprockets(image: &LinearImage, bands: &[FilmRegion]) -> Self {
+        let values: Vec<[f32; 3]> = sample_values(image, bands)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        if values.is_empty() {
+            return Self::IDENTITY;
+        }
+
+        // The base is the value most of the samples hold, not their average. A
+        // strip whose punch is only found on part of its width puts a handful of
+        // points on the other side, where the film is not the same colour; a
+        // handful cannot move a majority.
+        let mut best = 0usize;
+        let mut best_count = 0usize;
+        for (index, candidate) in values.iter().enumerate() {
+            let count = values
+                .iter()
+                .filter(|other| agrees(*candidate, **other))
+                .count();
+            if count > best_count {
+                best = index;
+                best_count = count;
+            }
+        }
+
+        // The floor: a value that most samples do not hold is not the film, and
+        // the caller has to ask the operator instead of being handed one.
+        if best_count * 2 < values.len() || best_count < SAMPLE_MIN {
+            return Self::IDENTITY;
+        }
+
+        let mut transmittance = [1.0f32; 3];
+        for (channel, slot) in transmittance.iter_mut().enumerate() {
+            let mut agreeing: Vec<f32> = values
+                .iter()
+                .filter(|other| agrees(values[best], **other))
+                .map(|value| value[channel])
+                .collect();
+            agreeing.sort_unstable_by(f32::total_cmp);
+            *slot = agreeing[agreeing.len() / 2].max(f32::MIN_POSITIVE);
+        }
+        Self { transmittance }
+    }
+
+    /// The sprocket holes themselves, as their rectangles in source pixels.
+    ///
+    /// A hole is the bright run of columns inside a punch band: the band's own
+    /// measured rows bound it above and below, and the run bounds it along the
+    /// strip. Diagnostic as much as anything — it is what the sampler blocks,
+    /// and drawing it is how a reader checks that the blocking is where they
+    /// think it is.
+    #[must_use]
+    pub fn sprocket_holes(image: &LinearImage, bands: &[FilmRegion]) -> Vec<[f32; 4]> {
+        let mut holes = Vec::new();
+        for band in bands {
+            let columns = sprocket_columns(image, band);
+            let Some(bar) = sprocket_bar(&columns) else {
+                // No lit perforations in this band: nothing in it can be trusted
+                // to be the film *between* two holes. The other band is enough on
+                // its own — one side's punch is all the base needs.
+                continue;
+            };
+
+            // One run of hole columns is one hole, and runs stay inside their own
+            // band: a hole of the upper band and one of the lower are two holes
+            // however they line up.
+            let mut band_holes: Vec<[f32; 4]> = Vec::new();
+            let mut run: Option<[f32; 4]> = None;
+            for column in columns {
+                if column.least() >= bar {
+                    run = Some(match run {
+                        Some([x0, y0, _, y1]) => [
+                            x0,
+                            y0.min(column.y_low),
+                            column.at[0],
+                            y1.max(column.y_high),
+                        ],
+                        None => [column.at[0], column.y_low, column.at[0], column.y_high],
+                    });
+                } else if let Some(hole) = run.take() {
+                    band_holes.push(hole);
+                }
+            }
+            if let Some(hole) = run {
+                band_holes.push(hole);
+            }
+
+            // A punch is a lattice. Bright runs that are too few, unevenly
+            // spaced, or the wrong share of their pitch are not the film's
+            // perforations — shadowed holes, an edge, a reflection — and the gaps
+            // between them are not the film between holes. Only one band has to
+            // hold a punch: one side's perforations are enough for a base.
+            holes.extend(regular_holes(&band_holes));
+        }
+        holes
+    }
+
+    /// The columns the base was measured from, thinned to `limit` of them.
+    ///
+    /// Exactly the columns [`Self::detect_between_sprockets`] read that agree
+    /// with the value it measured — the film between the holes, not the holes —
+    /// so a diagnostic drawing of these is a drawing of the measurement.
+    #[must_use]
+    pub fn sprocket_sample_points(
+        image: &LinearImage,
+        bands: &[FilmRegion],
+        limit: usize,
+    ) -> Vec<[f32; 2]> {
+        // Only the points that agree with the measured base are the measurement:
+        // a point the vote set aside is where the film was not the same colour,
+        // and drawing it as a sample would say otherwise.
+        let base = Self::detect_between_sprockets(image, bands);
+        if base == Self::IDENTITY {
+            return Vec::new();
+        }
+        let mut points: Vec<[f32; 2]> = sample_values(image, bands)
+            .into_iter()
+            .filter(|(_, value)| agrees(*value, base.transmittance))
+            .map(|(at, _)| at)
+            .collect();
+        if limit == 0 || points.len() <= limit {
+            points.truncate(limit);
+            return points;
+        }
+        let step = points.len().div_ceil(limit);
+        points.into_iter().step_by(step).collect()
+    }
+
     /// Estimates the base from mechanically identified rebate regions.
     ///
     /// Only pixels inside `regions` are sampled. The regions come from the film's
@@ -203,6 +350,58 @@ impl FilmBase {
         Self { transmittance }
     }
 
+    /// The source points one region's sample reads, thinned to `limit` of them.
+    ///
+    /// Exactly the points [`Self::detect_in_regions`] reads — the same stride,
+    /// the same rows — so a diagnostic drawing of these is a drawing of the
+    /// measurement rather than an impression of it. Thinned because the sampler
+    /// reads a quarter of a million points and a drawing of those is a filled
+    /// rectangle.
+    #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "region rows are clamped to the image's pixel count before the \
+                  index casts, and source coordinates are photograph-sized"
+    )]
+    pub fn region_sample_points(
+        image: &LinearImage,
+        region: &FilmRegion,
+        limit: usize,
+    ) -> Vec<[f32; 2]> {
+        let width = image.width as usize;
+        let height = image.height as usize;
+        if width == 0 || height == 0 || limit == 0 {
+            return Vec::new();
+        }
+
+        let center_x = coordinate(width) / 2.0;
+        let last_row = height.saturating_sub(1) as f32;
+        let stride = region_stride(std::slice::from_ref(region), width, height);
+
+        let mut points = Vec::new();
+        for x in (0..width).step_by(stride) {
+            let y_center = region.center_y + region.slope * (coordinate(x) - center_x);
+            let y_low = (y_center - region.half_height).ceil().max(0.0);
+            let y_high = (y_center + region.half_height).floor().min(last_row);
+            if y_low > y_high {
+                continue;
+            }
+            for y in (y_low as usize..=y_high as usize).step_by(stride) {
+                points.push([coordinate(x), coordinate(y)]);
+            }
+        }
+
+        if points.len() <= limit {
+            return points;
+        }
+        // Evenly spread, so the drawing shows the sample's shape rather than its
+        // beginning.
+        let step = points.len().div_ceil(limit);
+        points.into_iter().step_by(step).collect()
+    }
+
     /// Estimates the base from an authoritative axis-aligned rectangle.
     ///
     /// `rect` is `[x0, y0, x1, y1]` in fractions of the image width and height.
@@ -252,6 +451,304 @@ impl FilmBase {
 
         Self { transmittance }
     }
+}
+
+/// One column of a punch band: where it is, and what it reads.
+struct SprocketColumn {
+    /// The column's centre, in source coordinates.
+    at: [f32; 2],
+    /// The top and bottom of the band at that column, in source rows.
+    y_low: f32,
+    y_high: f32,
+    /// The per-channel mean of the band's rows at that column.
+    value: [f32; 3],
+}
+
+impl SprocketColumn {
+    /// The column's least channel: the film's mask absorbs most there, and a
+    /// hole has no mask at all in the way, so this is what tells them apart.
+    fn least(&self) -> f32 {
+        self.value[0].min(self.value[1]).min(self.value[2])
+    }
+}
+
+/// The gap centres and what the film reads at each.
+///
+/// One pass over the sample points, so the measurement and any drawing of it are
+/// the same points read the same way.
+fn sample_values(image: &LinearImage, bands: &[FilmRegion]) -> Vec<([f32; 2], [f32; 3])> {
+    gap_centres(image, bands)
+        .into_iter()
+        .filter_map(|point| window_mean(image, point).map(|value| (point, value)))
+        .collect()
+}
+
+/// Where the base is read: the centre of each gap between two sprocket holes,
+/// stepped just outside the punch band toward the film's edge.
+///
+/// The holes give the positions exactly. Between one hole and the next the
+/// film is unexposed — the camera's gate never reaches the strip's edge — and
+/// just outside the punch band, on the side away from the picture, it is
+/// unexposed again: the film's own margin. Both are clear film by the film's
+/// geometry, and the sample is taken where the geometry says, not where a level
+/// says.
+///
+/// Where the band runs off the sensor, there is no film outside it to read, and
+/// the point falls back inside the band's rows — still between two holes, still
+/// unexposed.
+#[must_use]
+fn gap_centres(image: &LinearImage, bands: &[FilmRegion]) -> Vec<[f32; 2]> {
+    let height = image.height as usize;
+    let mut points = Vec::new();
+
+    // Upper band first, so "outward" is known: the picture lies between them.
+    let mut ordered: Vec<FilmRegion> = bands.to_vec();
+    ordered.sort_by(|a, b| a.center_y.total_cmp(&b.center_y));
+
+    for (index, band) in ordered.iter().enumerate() {
+        let outward = if index == 0 { -1.0f32 } else { 1.0 };
+        let edge = band.center_y + outward * band.half_height;
+        let outside = edge + outward * EDGE_OFFSET;
+
+        let holes = FilmBase::sprocket_holes(image, std::slice::from_ref(band));
+        // Gap centres: between each pair of neighbouring holes.
+        for pair in holes.windows(2) {
+            let x = f32::midpoint(pair[0][2], pair[1][0]);
+            let y = if outside >= 0.0 && outside < coordinate(height) {
+                outside
+            } else {
+                band.center_y
+            };
+            points.push([x, y]);
+        }
+    }
+    points
+}
+
+/// How far outside the punch band's outer edge a sample sits, in source pixels.
+const EDGE_OFFSET: f32 = 2.0;
+
+/// The window averaged at one sample point, in source pixels.
+const SAMPLE_WINDOW: usize = 5;
+
+/// The per-channel mean of a small window centered on a point, or [`None`] when
+/// the point falls outside the image.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a point inside the image, rounded to its pixel"
+)]
+fn window_mean(image: &LinearImage, point: [f32; 2]) -> Option<[f32; 3]> {
+    if point[0] < 0.0 || point[1] < 0.0 {
+        return None;
+    }
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let center_x = point[0].round() as usize;
+    let center_y = point[1].round() as usize;
+    if center_x >= width || center_y >= height {
+        return None;
+    }
+
+    let half = SAMPLE_WINDOW / 2;
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+    let mut sums = [0.0f32; 3];
+    let mut count = 0usize;
+    for y in center_y.saturating_sub(half)..(center_y + half + 1).min(height) {
+        for x in center_x.saturating_sub(half)..(center_x + half + 1).min(width) {
+            let pixel = pixels[y * width + x];
+            for (sum, channel) in sums.iter_mut().zip(pixel) {
+                *sum += channel;
+            }
+            count += 1;
+        }
+    }
+    let count = coordinate(count.max(1));
+    Some(sums.map(|sum| sum / count))
+}
+
+/// The holes that fit their band's own lattice, or nothing when the band's
+/// bright runs are not a punch at all.
+///
+/// A punch is a lattice: holes of one width at one pitch, covering a known share
+/// of the strip's length. On 35 mm that is a 1.98 mm hole every 4.75 mm — a duty
+/// of about 0.42, and the maintainer's scans measure 0.40 in a full band's rows.
+/// Runs that do not fit that shape are not the film's perforations, and the gaps
+/// between them are not the film between holes.
+///
+/// The fit is judged against the band's *own* median, and runs that miss it are
+/// dropped rather than failing the band: a perforation cut by the sensor edge
+/// (measured 132 px against a 286 px median) and one-column artifacts are both
+/// normal, and the holes that remain still say where the film between them is.
+/// A band left with too few holes after that is refused outright.
+fn regular_holes(holes: &[[f32; 4]]) -> Vec<[f32; 4]> {
+    let widths = |holes: &[[f32; 4]]| -> Vec<f32> {
+        let mut values: Vec<f32> = holes.iter().map(|hole| hole[2] - hole[0]).collect();
+        values.sort_by(f32::total_cmp);
+        values
+    };
+
+    let mut widths = widths(holes);
+    if widths.len() < PUNCH_MIN_HOLES {
+        return Vec::new();
+    }
+    let median_width = widths[widths.len() / 2];
+    if median_width <= 0.0 {
+        return Vec::new();
+    }
+
+    let fitted: Vec<[f32; 4]> = holes
+        .iter()
+        .copied()
+        .filter(|hole| (hole[2] - hole[0] - median_width).abs() <= PUNCH_TOLERANCE * median_width)
+        .collect();
+    if fitted.len() < PUNCH_MIN_HOLES {
+        return Vec::new();
+    }
+
+    let mut pitches: Vec<f32> = fitted
+        .windows(2)
+        .map(|pair| f32::midpoint(pair[1][0], pair[1][2]) - f32::midpoint(pair[0][0], pair[0][2]))
+        .collect();
+    pitches.sort_by(f32::total_cmp);
+    let median_pitch = pitches[pitches.len() / 2];
+    if median_pitch <= 0.0 {
+        return Vec::new();
+    }
+
+    let regular = pitches
+        .iter()
+        .all(|pitch| (pitch - median_pitch).abs() <= PUNCH_TOLERANCE * median_pitch);
+    let duty = median_width / median_pitch;
+    if !regular || !(PUNCH_DUTY_MIN..=PUNCH_DUTY_MAX).contains(&duty) {
+        return Vec::new();
+    }
+
+    widths.clear();
+    fitted
+}
+
+/// How far apart two samples' values may sit, per channel, and still count as
+/// the same film, as a fraction of their mean.
+///
+/// Clear film is one colour: the mask's channel ratios are enormous by
+/// comparison, and a sample on the wrong side of the strip, on a hole, or on a
+/// light leak differs far beyond this. It also absorbs the light's falloff
+/// across a frame, which is a few percent corner to corner.
+const SAMPLE_AGREEMENT: f32 = 0.15;
+
+/// Fewest samples that must agree before their value is taken as the base.
+///
+/// Below this there is not enough film read to be a measurement, and the caller
+/// has to ask the operator rather than be handed a guess.
+const SAMPLE_MIN: usize = 3;
+
+/// Whether two samples read as the same film.
+fn agrees(a: [f32; 3], b: [f32; 3]) -> bool {
+    a.iter()
+        .zip(b)
+        .all(|(&left, right)| (left - right).abs() <= SAMPLE_AGREEMENT * f32::midpoint(left, right))
+}
+
+/// Fewest perforations for a band's spacing to mean anything.
+const PUNCH_MIN_HOLES: usize = 3;
+
+/// How far a hole's width or a gap's size may sit from the band's median, as a
+/// fraction of it.
+const PUNCH_TOLERANCE: f32 = 0.25;
+
+/// The share of a punch's pitch that a hole occupies, as measured on 35 mm and
+/// on the maintainer's scans.
+const PUNCH_DUTY_MIN: f32 = 0.20;
+const PUNCH_DUTY_MAX: f32 = 0.60;
+
+/// The brightness that separates a hole from the film between holes.
+///
+/// The film is the majority of a punch band's area, so the median column reads
+/// film; bare light through a hole is [`HOLE_BRIGHTNESS`] times that, the same
+/// bar the frame detector uses for the holes.
+fn sprocket_bar(columns: &[SprocketColumn]) -> Option<f32> {
+    if columns.is_empty() {
+        return None;
+    }
+    let mut levels: Vec<f32> = columns.iter().map(SprocketColumn::least).collect();
+    levels.sort_unstable_by(f32::total_cmp);
+    let median = levels[levels.len() / 2];
+    let brightest = levels[levels.len() - 1];
+    if std::env::var("GRAINBASE_TRACE").is_ok() {
+        println!(
+            "trace: band columns {} median {median:.4} brightest {brightest:.4}",
+            levels.len()
+        );
+    }
+    if median <= 0.0 || brightest < median * HOLE_BRIGHTNESS {
+        return None;
+    }
+    Some(median * HOLE_BRIGHTNESS)
+}
+
+/// Bare light reads this many times the clear-film level.
+const HOLE_BRIGHTNESS: f32 = 2.0;
+
+/// Columns read across each punch band, before thinning for a drawing.
+const COLUMN_SAMPLE_TARGET: usize = 512;
+
+/// The columns of each punch band, with the mean of the band's rows at each.
+///
+/// A column of a punch band is either a hole or the film between two holes, so
+/// one mean per column is one reading of one or the other, and the row range
+/// comes from the band's own measured edges rather than from a level.
+#[must_use]
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "band rows are clamped to the image's pixel count before the index \
+              casts, and source coordinates are photograph-sized"
+)]
+fn sprocket_columns(image: &LinearImage, band: &FilmRegion) -> Vec<SprocketColumn> {
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if pixels.is_empty() || width == 0 || height == 0 {
+        return Vec::new();
+    }
+
+    let center_x = coordinate(width) / 2.0;
+    let last_row = height.saturating_sub(1) as f32;
+    let column_stride = (width / COLUMN_SAMPLE_TARGET).max(1);
+
+    let mut columns = Vec::new();
+    for x in (0..width).step_by(column_stride) {
+        let x_f = coordinate(x);
+        let y_center = band.center_y + band.slope * (x_f - center_x);
+        let y_low = (y_center - band.half_height).ceil().max(0.0);
+        let y_high = (y_center + band.half_height).floor().min(last_row);
+        if y_low > y_high {
+            continue;
+        }
+
+        let mut sums = [0.0f32; 3];
+        let mut count = 0usize;
+        for y in y_low as usize..=y_high as usize {
+            let pixel = pixels[y * width + x];
+            for (sum, channel) in sums.iter_mut().zip(pixel) {
+                *sum += channel;
+            }
+            count += 1;
+        }
+        if count == 0 {
+            continue;
+        }
+        let count = coordinate(count);
+        columns.push(SprocketColumn {
+            at: [x_f, f32::midpoint(y_low, y_high)],
+            y_low,
+            y_high,
+            value: sums.map(|sum| sum / count),
+        });
+    }
+    columns
 }
 
 /// Chooses a stride so that the region sample is roughly [`SAMPLE_TARGET`]
