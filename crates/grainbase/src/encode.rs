@@ -105,6 +105,20 @@ pub fn to_srgb16(linear: f32) -> u16 {
     (encoded * f32::from(u16::MAX)).round() as u16
 }
 
+/// Decodes one encoded sRGB sample to linear light.
+///
+/// The inverse of [`to_srgb16`], from the same IEC 61966-2-1 transfer
+/// function: power segment above the linear knee.
+#[must_use]
+pub fn from_srgb16(encoded: f32) -> f32 {
+    let encoded = encoded.clamp(0.0, 1.0);
+    if encoded <= 12.92 * 0.003_130_8 {
+        encoded / 12.92
+    } else {
+        ((encoded + 0.055) / 1.055).powf(2.4)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
