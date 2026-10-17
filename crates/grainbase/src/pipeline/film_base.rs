@@ -20,16 +20,16 @@
 //!   assumed to be the light table, not film. That is enough for cropped frames
 //!   and for scans where the rebate dominates, but it fails when the light table
 //!   itself is a large share of the uncropped sensor.
-//! * [`FilmBase::detect_in_regions`] samples only the rebate bands that
-//!   [`crate::geometry`] identifies mechanically. The rebate is clear film *by
-//!   the film's own structure*: the sprocket holes bound it on one side and the
-//!   picture bounds it on the other. Sampling there excludes both the holes and
-//!   the light table by construction, so the percentile lands on clear film even
-//!   when a whole-frame detector would land in glare.
+//! * [`FilmBase::detect_between_sprockets`] samples the film *between the
+//!   perforations*, on the punch band's own rows. That film is unexposed by
+//!   construction — the camera's gate never reaches the strip's edge — so it is
+//!   clear film by the film's geometry alone, and the holes, the exposure and
+//!   the light table are all excluded by *where* the samples are taken.
 //!
-//! The region path is preferred whenever geometry can find the strip. The
-//! whole-image detector is kept as a trustworthy fallback for frames where the
-//! band machinery does not apply.
+//! The whole-image detector is not a conversion source: on the maintainer's
+//! scans it lands in the hole population for red and renders the frame pink. It
+//! is kept as a utility for the geometry pass, which needs a clear-film level
+//! before it has a frame.
 
 use crate::image::LinearImage;
 
@@ -126,7 +126,7 @@ impl FilmBase {
     /// This is the whole-image fallback. It is reliable when the rebate is the
     /// dominant bright area and the light table is only a small sliver; for
     /// uncropped scans where the light table is large, prefer
-    /// [`Self::detect_in_regions`].
+    /// [`Self::detect_between_sprockets`].
     #[must_use]
     pub fn detect(image: &LinearImage, percentile: f32) -> Self {
         let (pixels, _remainder) = image.data.as_chunks::<3>();
@@ -292,116 +292,6 @@ impl FilmBase {
         points.into_iter().step_by(step).collect()
     }
 
-    /// Estimates the base from mechanically identified rebate regions.
-    ///
-    /// Only pixels inside `regions` are sampled. The regions come from the film's
-    /// own structure (sprocket holes on one side, picture on the other), so the
-    /// light table and the holes are excluded by geometry rather than by a level
-    /// heuristic. This is the path to use for uncropped scans with glare, where
-    /// the whole-image detector would land in the bright population.
-    ///
-    /// Returns [`FilmBase::IDENTITY`] when `regions` is empty or covers no
-    /// pixels; callers should fall back to [`Self::detect`] in that case.
-    #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "region rows are clamped to the image's pixel count before the \
-                  index casts, and sample coordinates are photograph-sized, so \
-                  f32 keeps the integer values exact"
-    )]
-    pub fn detect_in_regions(image: &LinearImage, regions: &[FilmRegion], percentile: f32) -> Self {
-        let (pixels, _remainder) = image.data.as_chunks::<3>();
-        if pixels.is_empty() || regions.is_empty() {
-            return Self::IDENTITY;
-        }
-
-        let width = image.width as usize;
-        let height = image.height as usize;
-        let stride = region_stride(regions, width, height);
-        let center_x = coordinate(width) / 2.0;
-        let last_row = height.saturating_sub(1) as f32;
-
-        let mut transmittance = [1.0f32; 3];
-        for (channel, slot) in transmittance.iter_mut().enumerate() {
-            let mut samples = Vec::new();
-            for x in (0..width).step_by(stride) {
-                let x_f = coordinate(x);
-                for region in regions {
-                    let y_center = region.center_y + region.slope * (x_f - center_x);
-                    let y_low = (y_center - region.half_height).ceil().max(0.0);
-                    let y_high = (y_center + region.half_height).floor().min(last_row);
-                    if y_low > y_high {
-                        continue;
-                    }
-                    for y in (y_low as usize..=y_high as usize).step_by(stride) {
-                        samples.push(pixels[y * width + x][channel]);
-                    }
-                }
-            }
-            *slot = if samples.is_empty() {
-                1.0
-            } else {
-                measure_channel(&samples, percentile)
-            };
-        }
-
-        Self { transmittance }
-    }
-
-    /// The source points one region's sample reads, thinned to `limit` of them.
-    ///
-    /// Exactly the points [`Self::detect_in_regions`] reads — the same stride,
-    /// the same rows — so a diagnostic drawing of these is a drawing of the
-    /// measurement rather than an impression of it. Thinned because the sampler
-    /// reads a quarter of a million points and a drawing of those is a filled
-    /// rectangle.
-    #[must_use]
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "region rows are clamped to the image's pixel count before the \
-                  index casts, and source coordinates are photograph-sized"
-    )]
-    pub fn region_sample_points(
-        image: &LinearImage,
-        region: &FilmRegion,
-        limit: usize,
-    ) -> Vec<[f32; 2]> {
-        let width = image.width as usize;
-        let height = image.height as usize;
-        if width == 0 || height == 0 || limit == 0 {
-            return Vec::new();
-        }
-
-        let center_x = coordinate(width) / 2.0;
-        let last_row = height.saturating_sub(1) as f32;
-        let stride = region_stride(std::slice::from_ref(region), width, height);
-
-        let mut points = Vec::new();
-        for x in (0..width).step_by(stride) {
-            let y_center = region.center_y + region.slope * (coordinate(x) - center_x);
-            let y_low = (y_center - region.half_height).ceil().max(0.0);
-            let y_high = (y_center + region.half_height).floor().min(last_row);
-            if y_low > y_high {
-                continue;
-            }
-            for y in (y_low as usize..=y_high as usize).step_by(stride) {
-                points.push([coordinate(x), coordinate(y)]);
-            }
-        }
-
-        if points.len() <= limit {
-            return points;
-        }
-        // Evenly spread, so the drawing shows the sample's shape rather than its
-        // beginning.
-        let step = points.len().div_ceil(limit);
-        points.into_iter().step_by(step).collect()
-    }
-
     /// Estimates the base from an authoritative axis-aligned rectangle.
     ///
     /// `rect` is `[x0, y0, x1, y1]` in fractions of the image width and height.
@@ -409,8 +299,8 @@ impl FilmBase {
     /// where the rebate sits: a rectangle over the rebate beats every heuristic
     /// on glare-heavy rigs.
     ///
-    /// This uses the same film-level machinery as [`Self::detect_in_regions`];
-    /// the only difference is that the sample area is bounded in both axes.
+    /// This uses the same film-level machinery as [`Self::detect`]; the only
+    /// difference is that the sample area is bounded in both axes.
     #[must_use]
     pub fn detect_in_rect(image: &LinearImage, rect: [f32; 4], percentile: f32) -> Self {
         let (pixels, _remainder) = image.data.as_chunks::<3>();
@@ -751,30 +641,6 @@ fn sprocket_columns(image: &LinearImage, band: &FilmRegion) -> Vec<SprocketColum
     columns
 }
 
-/// Chooses a stride so that the region sample is roughly [`SAMPLE_TARGET`]
-/// pixels, without oversampling small regions.
-fn region_stride(regions: &[FilmRegion], width: usize, height: usize) -> usize {
-    let area: f32 = regions
-        .iter()
-        .map(|region| {
-            let h = region.half_height * 2.0;
-            let vertical = h.min(coordinate(height));
-            vertical * coordinate(width)
-        })
-        .sum();
-    if area <= 0.0 {
-        return 1;
-    }
-    let stride = (area / coordinate(SAMPLE_TARGET)).sqrt().max(1.0);
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "stride is clamped to >= 1.0 before casting, so the value is a small positive integer"
-    )]
-    let stride = stride as usize;
-    stride.max(1)
-}
-
 /// Measures one channel from a collected sample set.
 fn measure_channel(samples: &[f32], percentile: f32) -> f32 {
     let mut sorted: Vec<f32> = samples.to_vec();
@@ -965,152 +831,6 @@ mod tests {
     }
 
     #[test]
-    fn region_sampling_recovers_the_rebate_level() {
-        // A 200x100 strip: bright light table margins, hole bands, a thin rebate
-        // at the base level, then dark picture. The whole-image detector would
-        // see a large bright population and pick the light table; the region
-        // path must ignore everything outside the rebate bands.
-        let width = 200u32;
-        let height = 100u32;
-        let base_level = [0.32f32, 0.12, 0.05];
-        let hole = [0.9f32; 3];
-        let light_table = [1.0f32; 3];
-        let picture = [0.03f32; 3];
-
-        let mut data = vec![0.0f32; width as usize * height as usize * 3];
-        for y in 0..height {
-            let row_value = if y < 8 {
-                light_table
-            } else if y < 16 {
-                hole
-            } else if y < 22 {
-                base_level
-            } else if y < 78 {
-                picture
-            } else if y < 84 {
-                base_level
-            } else if y < 92 {
-                hole
-            } else {
-                light_table
-            };
-            for x in 0..width {
-                let idx = (y as usize * width as usize + x as usize) * 3;
-                data[idx..idx + 3].copy_from_slice(&row_value);
-            }
-        }
-
-        let image = LinearImage::new(width, height, data).expect("well-formed");
-
-        // Whole-image detector fails: the light table is most of the frame.
-        let whole = FilmBase::detect(&image, DEFAULT_PERCENTILE);
-        assert!(
-            (whole.transmittance[0] - 1.0).abs() < 1e-3,
-            "sanity: whole-image detector should land in the light table, got {whole:?}"
-        );
-
-        // Tight regions over the flat rebate rows only: rows 16..21 and 78..83.
-        let regions = [
-            FilmRegion {
-                center_y: 18.5,
-                half_height: 2.5,
-                slope: 0.0,
-            },
-            FilmRegion {
-                center_y: 80.5,
-                half_height: 2.5,
-                slope: 0.0,
-            },
-        ];
-        let base = FilmBase::detect_in_regions(&image, &regions, DEFAULT_PERCENTILE);
-        for (channel, &expected) in base_level.iter().enumerate() {
-            assert!(
-                (base.transmittance[channel] - expected).abs() < 1e-3,
-                "channel {channel}: expected {expected}, got {base:?}"
-            );
-        }
-    }
-
-    #[test]
-    #[expect(
-        clippy::approx_constant,
-        reason = "0.318 is the measured DSC02063 red base, not pi"
-    )]
-    fn region_sampling_excludes_bright_ends_and_soft_glare() {
-        // Mirrors the DSC02063 failure shape: the rebate is clear film at the
-        // known base, but the top and bottom of the strip are bright light table
-        // and the transition into the rebate is a soft glare ramp rather than a
-        // step. The region path must still recover the rebate level.
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "test grid coordinates are small, integer-exact in f32"
-        )]
-        fn fraction(value: u32, total: u32) -> f32 {
-            value as f32 / total as f32
-        }
-
-        let width = 400u32;
-        let height = 300u32;
-        let base_level = [0.318f32, 0.123, 0.050];
-
-        let mut data = vec![0.0f32; width as usize * height as usize * 3];
-        for y in 0..height {
-            let row_frac = fraction(y, height);
-            let row_value = if row_frac < 0.12 {
-                // Top light table.
-                [1.0f32; 3]
-            } else if row_frac < 0.18 {
-                // Soft glare ramp down into the rebate.
-                let t = (row_frac - 0.12) / 0.06;
-                base_level.map(|channel| channel + (1.0 - channel) * (1.0 - t))
-            } else if row_frac < 0.22 {
-                // Top rebate.
-                base_level
-            } else if row_frac < 0.78 {
-                // Picture.
-                [0.02f32; 3]
-            } else if row_frac < 0.82 {
-                // Bottom rebate.
-                base_level
-            } else if row_frac < 0.88 {
-                // Soft glare ramp down to bottom light table.
-                let t = (row_frac - 0.82) / 0.06;
-                base_level.map(|channel| channel + (1.0 - channel) * t)
-            } else {
-                // Bottom light table.
-                [1.0f32; 3]
-            };
-            for x in 0..width {
-                let idx = (y as usize * width as usize + x as usize) * 3;
-                data[idx..idx + 3].copy_from_slice(&row_value);
-            }
-        }
-
-        let image = LinearImage::new(width, height, data).expect("well-formed");
-
-        // Sample only the flat rebate core, not the surrounding glare ramps.
-        let regions = [
-            FilmRegion {
-                center_y: 60.0,
-                half_height: 5.0,
-                slope: 0.0,
-            },
-            FilmRegion {
-                center_y: 240.0,
-                half_height: 5.0,
-                slope: 0.0,
-            },
-        ];
-        let base = FilmBase::detect_in_regions(&image, &regions, DEFAULT_PERCENTILE);
-        for (channel, &expected) in base_level.iter().enumerate() {
-            assert!(
-                (base.transmittance[channel] - expected).abs() < 0.02,
-                "channel {channel}: expected {expected}, got {base:?}"
-            );
-        }
-    }
-
-    #[test]
     fn manual_rect_override_samples_only_the_rect() {
         let mut data = vec![0.0f32; 100 * 100 * 3];
         for y in 0..100 {
@@ -1129,72 +849,5 @@ mod tests {
         let image = LinearImage::new(100, 100, data).expect("well-formed");
         let base = FilmBase::detect_in_rect(&image, [0.25, 0.25, 0.75, 0.75], DEFAULT_PERCENTILE);
         assert!((base.transmittance[0] - 0.3).abs() < 1e-3, "got {base:?}");
-    }
-
-    #[test]
-    fn empty_regions_fall_back_to_identity() {
-        let image = LinearImage::new(10, 10, vec![0.5f32; 300]).expect("well-formed");
-        assert_eq!(
-            FilmBase::detect_in_regions(&image, &[], DEFAULT_PERCENTILE),
-            FilmBase::IDENTITY
-        );
-    }
-
-    #[test]
-    fn region_sampling_honors_tilt() {
-        // A narrow band tilted by slope 0.1. A horizontal band misses it; the
-        // correct slope samples the right rows.
-        let width = 200u32;
-        let height = 200u32;
-        let slope = 0.1f32;
-        let center_y_at_mid = 100.0f32;
-        let half_height = 5.0f32;
-        let base_level = [0.4f32; 3];
-
-        let mut data = vec![0.0f32; width as usize * height as usize * 3];
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "test grid coordinates are small, integer-exact in f32"
-        )]
-        let to_f32 = |v: u32| v as f32;
-        for y in 0..height {
-            for x in 0..width {
-                let x_f = to_f32(x);
-                let y_center = center_y_at_mid + slope * (x_f - 100.0);
-                let in_band = (to_f32(y) - y_center).abs() <= half_height;
-                let idx = (y as usize * width as usize + x as usize) * 3;
-                data[idx..idx + 3].copy_from_slice(if in_band {
-                    &base_level
-                } else {
-                    &[0.02f32; 3]
-                });
-            }
-        }
-
-        let image = LinearImage::new(width, height, data).expect("well-formed");
-
-        // A horizontal region placed well away from the tilted band should not
-        // pick it up.
-        let flat = FilmRegion {
-            center_y: 50.0,
-            half_height,
-            slope: 0.0,
-        };
-        let flat_base = FilmBase::detect_in_regions(&image, &[flat], DEFAULT_PERCENTILE);
-        assert!(
-            flat_base.transmittance[0] < 0.1,
-            "a flat region should miss the tilted band, got {flat_base:?}"
-        );
-
-        let tilted = FilmRegion {
-            center_y: center_y_at_mid,
-            half_height,
-            slope,
-        };
-        let tilted_base = FilmBase::detect_in_regions(&image, &[tilted], DEFAULT_PERCENTILE);
-        assert!(
-            (tilted_base.transmittance[0] - 0.4).abs() < 1e-3,
-            "a tilted region should recover the band, got {tilted_base:?}"
-        );
     }
 }

@@ -455,12 +455,7 @@ fn roll_frame_base(
             film_base::DEFAULT_PERCENTILE,
         ));
     }
-    let region = frame.film?;
-    Some(FilmBase::detect_in_regions(
-        uncropped,
-        std::slice::from_ref(&region),
-        film_base::DEFAULT_PERCENTILE,
-    ))
+    measured_between_sprockets(uncropped, frame)
 }
 
 /// The base measured from the film between the sprocket holes, when the scan
