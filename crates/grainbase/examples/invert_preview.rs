@@ -1,40 +1,30 @@
 //! Writes a viewable preview of a converted scan, for judging quality by eye.
 //!
 //! ```text
-//! cargo run --example invert_preview -- <scan.raw> <out.png> [--flip-h] [--flip-v]
+//! cargo run --example invert_preview -- [--profile <path>] [--base-sample x0,y0,x1,y1] <scan.raw> <out.png> [--flip-h] [--flip-v] [--no-crop]
 //! ```
 //!
 //! This is an inspection aid, not the engine's encoder. It applies display gamma
 //! and 8-bit quantisation, neither of which belongs to the engine: the real
 //! `encode` unit writes 16-bit color-managed output, and the `look` unit owns
 //! grading. Keep it around for eyeballing conversion changes before those land.
+//!
+//! The frame is found first, then the film base is measured from the frame's
+//! rebate regions when geometry could locate them. A manual `--base-sample`
+//! rectangle overrides that: it is the operator's statement of where the rebate
+//! sits, and beats every heuristic on glare-heavy rigs. The crop still happens
+//! after the base measurement, because cropping discards the rebate and the
+//! rebate is the clear film the base is measured from.
 
 use grainbase::decode;
 use grainbase::pipeline::{self, FilmBase, Settings, film_base, percentile};
+use grainbase::profile::Profile;
 use grainbase::{LinearImage, encode, geometry};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut positional = Vec::new();
-    let mut flip_h = false;
-    let mut flip_v = false;
-    let mut no_crop = false;
-    let mut negative_stage = false;
+    let options = parse_options()?;
 
-    for argument in std::env::args().skip(1) {
-        match argument.as_str() {
-            "--flip-h" => flip_h = true,
-            "--flip-v" => flip_v = true,
-            "--no-crop" => no_crop = true,
-            "--negative" => negative_stage = true,
-            _ => positional.push(argument),
-        }
-    }
-
-    let [input, output] = positional.as_slice() else {
-        return Err("usage: invert_preview <scan.raw> <out.png> [--flip-h] [--flip-v]".into());
-    };
-
-    let scan = decode::decode(input)?;
+    let scan = decode::decode(&options.input)?;
     println!(
         "decoded {}x{} from {} {} (EXIF orientation {:?})",
         scan.linear.width,
@@ -43,38 +33,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         scan.meta.model,
         scan.meta.orientation
     );
-    let mut negative = scan.linear;
 
-    if flip_h {
+    // Orient first, then find: the frame is a property of the film, and the
+    // flips are the operator's orientation fix, not part of the scan.
+    let mut negative = scan.linear;
+    if options.flip_h {
         negative = negative.flipped_horizontal();
         println!("mirrored left to right");
     }
-    if flip_v {
+    if options.flip_v {
         negative = negative.flipped_vertical();
         println!("mirrored top to bottom");
     }
 
+    let frame = geometry::find(&negative).unwrap_or_else(|| geometry::Frame::whole(&negative));
+    println!(
+        "frame: centre {:.0},{:.0}  size {:.0}x{:.0}  skew {:.4} rad ({:.2} deg)",
+        frame.center[0],
+        frame.center[1],
+        frame.size[0],
+        frame.size[1],
+        frame.skew,
+        frame.skew.to_degrees()
+    );
+
+    // Base on the oriented scan, still uncropped, by the documented source
+    // precedence (spec step 3): hand-supplied values, hand-placed rectangle,
+    // mechanical rebate regions, whole-frame statistics. The whole-frame tier
+    // is VueScan's documented default estimate; its known limit is light-table
+    // glare on copy-stand scans, for which the manual inputs are the answer.
+    let base = if let Some(values) = options.film_base {
+        println!("film base (manual values)");
+        FilmBase {
+            transmittance: values.map(|value| value.max(f32::MIN_POSITIVE)),
+        }
+    } else if let Some(rect) = options.base_sample {
+        println!("film base (manual sample rectangle)");
+        FilmBase::detect_in_rect(&negative, rect, film_base::DEFAULT_PERCENTILE)
+    } else if let Some(regions) = frame.film {
+        println!("film base (clear-film regions)");
+        for (side, region) in ["top", "bottom"].iter().zip(&regions) {
+            println!(
+                "  region {side}: center_y {:.1} ±{:.1} slope {:.5}",
+                region.center_y, region.half_height, region.slope
+            );
+        }
+        FilmBase::detect_in_regions(&negative, &regions, film_base::DEFAULT_PERCENTILE)
+    } else {
+        println!("film base (whole-frame statistics)");
+        FilmBase::detect(&negative, film_base::DEFAULT_PERCENTILE)
+    };
+
     // Orientation first, then the frame: the frame is a property of the film, and
     // rotating the scan does not move it relative to the picture.
-    if let Some(frame) = geometry::find(&negative) {
-        println!(
-            "frame: centre {:.0},{:.0}  size {:.0}x{:.0}  skew {:.4} rad ({:.2} deg)",
-            frame.center[0],
-            frame.center[1],
-            frame.size[0],
-            frame.size[1],
-            frame.skew,
-            frame.skew.to_degrees()
-        );
-        if !no_crop {
-            negative = geometry::apply(&negative, &frame);
-            println!("cropped to {}x{}", negative.width, negative.height);
-        }
+    if !options.no_crop {
+        negative = geometry::apply(&negative, &frame);
+        println!("cropped to {}x{}", negative.width, negative.height);
     }
 
     trace_min_channel(&negative);
-
-    let base = FilmBase::detect(&negative, film_base::DEFAULT_PERCENTILE);
     trace_densities(&negative, &base);
 
     println!(
@@ -82,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         base.transmittance[0], base.transmittance[1], base.transmittance[2]
     );
 
-    let positive = pipeline::invert(&negative, &base, &Settings::default());
+    let positive = pipeline::invert(&negative, &base, &options.settings);
 
     report("negative", &negative, &base);
     report("positive", &positive, &base);
@@ -92,17 +109,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     trace_tail(&negative);
 
     encode::encode(
-        &if negative_stage {
+        &if options.negative_stage {
             // The negative itself is worth writing out, since a RAW file cannot be
             // opened in the usual viewers: this is the scan as captured.
             negative
         } else {
             positive
         },
-        output,
+        &options.output,
     )?;
-    println!("wrote {output}");
+    println!("wrote {}", options.output);
     Ok(())
+}
+
+/// The preview's parsed command line.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "a diagnostic tool's option switches are independent by nature: \
+              they name operations, not states"
+)]
+struct Options {
+    input: String,
+    output: String,
+    flip_h: bool,
+    flip_v: bool,
+    no_crop: bool,
+    negative_stage: bool,
+    settings: Settings,
+    film_base: Option<[f32; 3]>,
+    base_sample: Option<[f32; 4]>,
+}
+
+/// Parses the preview's arguments, loading any profile eagerly.
+fn parse_options() -> Result<Options, String> {
+    let mut positional = Vec::new();
+    let mut flip_h = false;
+    let mut flip_v = false;
+    let mut no_crop = false;
+    let mut negative_stage = false;
+    let mut profile_path: Option<String> = None;
+    let mut base_sample: Option<[f32; 4]> = None;
+    let mut film_base: Option<[f32; 3]> = None;
+
+    let mut args = std::env::args().skip(1);
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--flip-h" => flip_h = true,
+            "--flip-v" => flip_v = true,
+            "--no-crop" => no_crop = true,
+            "--negative" => negative_stage = true,
+            "--profile" => {
+                let path = args.next().ok_or("--profile requires a path")?;
+                profile_path = Some(path);
+            }
+            "--base-sample" => {
+                let text = args.next().ok_or("--base-sample requires x0,y0,x1,y1")?;
+                base_sample = Some(parse_base_sample(&text)?);
+            }
+            "--film-base" => {
+                let text = args.next().ok_or("--film-base requires r,g,b")?;
+                film_base = Some(parse_base_rgb(&text)?);
+            }
+            _ => positional.push(argument),
+        }
+    }
+
+    let [input, output] = positional.as_slice() else {
+        return Err(
+            "usage: invert_preview [--profile <path>] [--base-sample x0,y0,x1,y1] <scan.raw> <out.png> [--flip-h] [--flip-v] [--no-crop]"
+                .into(),
+        );
+    };
+
+    let settings = if let Some(path) = &profile_path {
+        let text = std::fs::read_to_string(path)
+            .map_err(|err| format!("could not read profile {path}: {err}"))?;
+        Profile::parse(&text)
+            .map_err(|err| format!("bad profile {path}: {err}"))?
+            .settings
+    } else {
+        Settings::default()
+    };
+
+    Ok(Options {
+        input: input.clone(),
+        output: output.clone(),
+        flip_h,
+        flip_v,
+        no_crop,
+        negative_stage,
+        settings,
+        film_base,
+        base_sample,
+    })
 }
 
 /// Traces the per-channel density distributions the auto bounds read.
@@ -395,6 +494,37 @@ fn channel_means(image: &LinearImage) -> [f64; 3] {
     }
     let count = count.max(1) as f64;
     [sums[0] / count, sums[1] / count, sums[2] / count]
+}
+
+/// Parses `--base-sample x0,y0,x1,y1` as fractions of the image.
+fn parse_base_sample(text: &str) -> Result<[f32; 4], String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 4 {
+        return Err("--base-sample expects four comma-separated fractions".into());
+    }
+    let mut out = [0.0f32; 4];
+    for (i, part) in parts.iter().enumerate() {
+        out[i] = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("--base-sample value `{part}` is not a number"))?;
+    }
+    Ok(out)
+}
+
+fn parse_base_rgb(text: &str) -> Result<[f32; 3], String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 3 {
+        return Err("--film-base expects three comma-separated channel values".into());
+    }
+    let mut out = [0.0f32; 3];
+    for (i, part) in parts.iter().enumerate() {
+        out[i] = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("--film-base value `{part}` is not a number"))?;
+    }
+    Ok(out)
 }
 
 /// Minimum, median, and maximum of a set of samples.

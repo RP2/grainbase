@@ -19,6 +19,7 @@
 //! transmittance is multiplicative in the film but we perceive it
 //! logarithmically, so a linear inversion washes out the highlights.
 
+pub mod chart;
 pub mod film_base;
 pub mod fit;
 pub mod percentile;
@@ -163,7 +164,7 @@ pub const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0
 /// The curve is a two-piece power map around the pivot: every piece is a
 /// gamma curve whose value and slope meet at the pivot, so a gray renders at
 /// the reference gray and the toe/shoulder bend around it per channel. The
-/// exponent is taken as `1/gamma`, so a gamma ratio above 1 deepens shadows —
+/// exponent is `gamma` itself, so a gamma ratio above 1 deepens shadows —
 /// the print-style convention: gamma is the display-facing contrast.
 #[must_use]
 fn render(
@@ -178,7 +179,7 @@ fn render(
         return linear;
     };
 
-    let (position, exponent) = (pivot[channel], 1.0 / gamma[channel]);
+    let (position, exponent) = (pivot[channel], gamma[channel]);
     let (pivot_value, above) = (REFERENCE_GRAY_POSITIVE, linear > position);
     if above {
         let remaining = (linear - position) / (1.0 - position);
@@ -504,5 +505,158 @@ mod tests {
         let result = invert(&source, &base([0.5, 0.5, 0.5]), &settings());
         assert_eq!((result.width, result.height), (3, 2));
         assert_eq!(result.data.len(), 18);
+    }
+
+    #[test]
+    fn the_pivot_density_renders_at_the_reference_gray() {
+        // Choose settings so the pivot sits at density 1.0 in a 0..2 range.
+        // A transmittance of 10^-1.0 gives exactly that density when base = 1.0.
+        let pivot_density = 1.0f32;
+        let settings = Settings {
+            density_max: Some([2.0f32; 3]),
+            gamma: Some([1.5f32; 3]),
+            pivot_density: Some(pivot_density),
+            ..Settings::default()
+        };
+        let source = image(&[[10f32.powf(-pivot_density); 3]]);
+        let result = invert(&source, &base([1.0f32; 3]), &settings);
+        for channel in &result.data {
+            assert_close(*channel, REFERENCE_GRAY_POSITIVE);
+        }
+    }
+
+    #[test]
+    fn a_gamma_above_one_deepens_shadows_below_the_pivot() {
+        // Below the pivot, gamma > 1 should render darker than the straight line.
+        let pivot_density = 1.0f32;
+        let density = 0.5f32; // below the pivot
+        let source = image(&[[10f32.powf(-density); 3]]);
+
+        let straight = Settings {
+            density_max: Some([2.0f32; 3]),
+            ..Settings::default()
+        };
+        let curved = Settings {
+            density_max: Some([2.0f32; 3]),
+            gamma: Some([1.5f32; 3]),
+            pivot_density: Some(pivot_density),
+            ..Settings::default()
+        };
+
+        let straight_result = invert(&source, &base([1.0f32; 3]), &straight);
+        let curved_result = invert(&source, &base([1.0f32; 3]), &curved);
+        for channel in 0..3 {
+            assert!(
+                curved_result.data[channel] < straight_result.data[channel],
+                "gamma > 1 should deepen shadows: got curved {} vs straight {}",
+                curved_result.data[channel],
+                straight_result.data[channel]
+            );
+        }
+    }
+
+    #[test]
+    fn a_gamma_below_one_lifts_shadows_below_the_pivot() {
+        // Below the pivot, gamma < 1 should render brighter than the straight line.
+        let pivot_density = 1.0f32;
+        let density = 0.5f32;
+        let source = image(&[[10f32.powf(-density); 3]]);
+
+        let straight = Settings {
+            density_max: Some([2.0f32; 3]),
+            ..Settings::default()
+        };
+        let curved = Settings {
+            density_max: Some([2.0f32; 3]),
+            gamma: Some([0.7f32; 3]),
+            pivot_density: Some(pivot_density),
+            ..Settings::default()
+        };
+
+        let straight_result = invert(&source, &base([1.0f32; 3]), &straight);
+        let curved_result = invert(&source, &base([1.0f32; 3]), &curved);
+        for channel in 0..3 {
+            assert!(
+                curved_result.data[channel] > straight_result.data[channel],
+                "gamma < 1 should lift shadows: got curved {} vs straight {}",
+                curved_result.data[channel],
+                straight_result.data[channel]
+            );
+        }
+    }
+
+    #[test]
+    fn per_channel_gamma_diverges_at_the_pivot_stays_pinned() {
+        // Different exponents per channel: same density produces different outputs,
+        // but the pivot density still lands at the reference gray for every channel.
+        let pivot_density = 1.0f32;
+        let settings = Settings {
+            density_max: Some([2.0f32; 3]),
+            gamma: Some([1.2f32, 0.9f32, 1.5f32]),
+            pivot_density: Some(pivot_density),
+            ..Settings::default()
+        };
+        let below = image(&[[10f32.powf(-0.6f32); 3]]);
+        let below_result = invert(&below, &base([1.0f32; 3]), &settings);
+        let eps = 1e-6f32;
+        assert!(
+            (below_result.data[0] - below_result.data[1]).abs() > eps
+                || (below_result.data[1] - below_result.data[2]).abs() > eps,
+            "different channel gammas should diverge"
+        );
+
+        let gray = image(&[[10f32.powf(-pivot_density); 3]]);
+        let gray_result = invert(&gray, &base([1.0f32; 3]), &settings);
+        for channel in &gray_result.data {
+            assert_close(*channel, REFERENCE_GRAY_POSITIVE);
+        }
+    }
+
+    #[test]
+    fn the_print_curve_stays_in_range_and_monotonic_across_an_extreme_sweep() {
+        // Sweep inputs far outside the physical range; the curve must stay bounded
+        // and monotonic even when the gamma/pivot machinery is active.
+        let mut pixels = Vec::new();
+        for i in -20..=40 {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "the loop range fits exactly in f32"
+            )]
+            let density = i as f32 * 0.1f32;
+            pixels.push([10f32.powf(-density); 3]);
+        }
+        let source = LinearImage::new(
+            u32::try_from(pixels.len()).unwrap(),
+            1,
+            pixels.iter().flatten().copied().collect(),
+        )
+        .expect("well-formed");
+        let settings = Settings {
+            density_max: Some([2.0f32; 3]),
+            gamma: Some([1.4f32; 3]),
+            pivot_density: Some(1.0f32),
+            ..Settings::default()
+        };
+        let result = invert(&source, &base([1.0f32; 3]), &settings);
+
+        let pixels_out = result.data.len() / 3;
+        for i in 0..pixels_out {
+            let [red, green, blue] = [
+                result.data[i * 3],
+                result.data[i * 3 + 1],
+                result.data[i * 3 + 2],
+            ];
+            assert!((0.0..=1.0).contains(&red), "red out of range: {red}");
+            assert!((0.0..=1.0).contains(&green), "green out of range: {green}");
+            assert!((0.0..=1.0).contains(&blue), "blue out of range: {blue}");
+            if i > 0 {
+                for channel in 0..3 {
+                    assert!(
+                        result.data[i * 3 + channel] >= result.data[(i - 1) * 3 + channel] - 1e-6,
+                        "channel {channel} is not monotonic at {i}"
+                    );
+                }
+            }
+        }
     }
 }

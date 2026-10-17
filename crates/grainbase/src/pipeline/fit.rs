@@ -48,6 +48,24 @@ pub enum FitError {
     UnderdeterminedCrosstalk,
 }
 
+impl std::fmt::Display for FitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DegenerateAnchors => {
+                write!(
+                    f,
+                    "the dark and light neutral patches do not span a density range"
+                )
+            }
+            Self::UnderdeterminedCrosstalk => {
+                write!(f, "the color patches do not span both other dye columns")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FitError {}
+
 /// One channel's density anchors: the black and white points, as absolute
 /// densities above the film base.
 ///

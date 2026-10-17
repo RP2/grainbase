@@ -5,18 +5,25 @@
 //! the same code.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::Parser;
-use grainbase::driver::{FilmMode, Job, run};
-use grainbase::pipeline::Settings;
+use clap::{Parser, Subcommand};
+use grainbase::decode;
+use grainbase::driver::{FilmMode, Flips, Job, run};
+use grainbase::geometry;
+use grainbase::pipeline::{FilmBase, Settings, film_base};
 use grainbase::profile::Profile;
 
 /// Convert camera-scanned film negatives into finished positives.
 #[derive(Debug, Parser)]
 #[command(name = "grainbase", version, about, long_about = None)]
+#[command(subcommand_negates_reqs = true)]
 struct Cli {
+    /// Fit a calibration profile from a `ColorChecker` capture.
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Folder of camera RAW scans. Treated as one roll.
     input: PathBuf,
 
@@ -38,6 +45,68 @@ struct Cli {
     /// modified, so this only changes what the output contains.
     #[arg(long)]
     no_crop: bool,
+
+    /// Mirror the scans left to right: the emulsion faced the lens.
+    #[arg(long)]
+    flip_h: bool,
+
+    /// Mirror the scans top to bottom: the strip was captured inverted.
+    #[arg(long)]
+    flip_v: bool,
+
+    /// The film base by hand, as per-channel transmittance `r,g,b`.
+    ///
+    /// The reference tools' own escape hatch for a film border that cannot be
+    /// located automatically: sampling the border by hand is their documented
+    /// method, and a hand-supplied base disables every detector.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
+    film_base: Option<[f32; 3]>,
+
+    /// Authoritative base sample rectangle, as fractions `x0,y0,x1,y1` of the
+    /// uncropped scan. Overrides the automatic rebate-region detector.
+    #[arg(long, value_parser = parse_base_sample)]
+    base_sample: Option<[f32; 4]>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Fit a calibration profile from a ColorChecker-class chart capture.
+    Fit(FitArgs),
+}
+
+#[derive(Debug, Parser)]
+struct FitArgs {
+    /// Camera RAW capture of a ColorChecker-class chart.
+    capture: PathBuf,
+
+    /// Film stock the profile is for.
+    #[arg(long)]
+    film: String,
+
+    /// Camera or rig the profile was captured on.
+    #[arg(long)]
+    camera: String,
+
+    /// Mirror the capture left to right.
+    #[arg(long)]
+    flip_h: bool,
+
+    /// Mirror the capture top to bottom.
+    #[arg(long)]
+    flip_v: bool,
+
+    /// The film base by hand, as per-channel transmittance `r,g,b`.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
+    film_base: Option<[f32; 3]>,
+
+    /// Output profile path. Defaults to `<capture stem>.profile`.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Authoritative base sample rectangle, as fractions `x0,y0,x1,y1` of the
+    /// uncropped scan. Overrides the automatic rebate-region detector.
+    #[arg(long, value_parser = parse_base_sample)]
+    base_sample: Option<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -57,6 +126,10 @@ impl From<Mode> for FilmMode {
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
+    if let Some(Command::Fit(args)) = cli.command {
+        return run_fit(args);
+    }
+
     let settings = match load_profile(cli.profile.as_deref()) {
         Ok(settings) => settings,
         Err(message) => {
@@ -71,6 +144,12 @@ fn main() -> ExitCode {
         mode: cli.mode.into(),
         settings,
         crop: !cli.no_crop,
+        flips: Flips {
+            horizontal: cli.flip_h,
+            vertical: cli.flip_v,
+        },
+        base_sample: cli.base_sample,
+        film_base: cli.film_base,
     });
 
     println!(
@@ -91,12 +170,174 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Fits a profile from a chart capture and writes it to disk.
+fn run_fit(args: FitArgs) -> ExitCode {
+    let scan = match decode::decode(&args.capture) {
+        Ok(scan) => scan,
+        Err(err) => {
+            eprintln!("could not decode {}: {err}", args.capture.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "decoded {}x{} from {} {} (EXIF orientation {:?})",
+        scan.linear.width,
+        scan.linear.height,
+        scan.meta.make,
+        scan.meta.model,
+        scan.meta.orientation
+    );
+
+    // Orientation first (spec step 1): the flips are the operator's decision
+    // about which side of the film faced the lens, applied before anything
+    // is detected.
+    let uncropped = scan.linear.flipped(Flips {
+        horizontal: args.flip_h,
+        vertical: args.flip_v,
+    });
+
+    // Find the frame, then measure the base on the still-uncropped scan, by
+    // the documented source precedence (spec step 3).
+    let frame = geometry::find(&uncropped).unwrap_or_else(|| geometry::Frame::whole(&uncropped));
+    println!(
+        "frame: centre {:.0},{:.0}  size {:.0}x{:.0}  skew {:.4} rad ({:.2} deg)",
+        frame.center[0],
+        frame.center[1],
+        frame.size[0],
+        frame.size[1],
+        frame.skew,
+        frame.skew.to_degrees()
+    );
+
+    let base = if let Some(values) = args.film_base {
+        FilmBase {
+            transmittance: values.map(|value| value.max(f32::MIN_POSITIVE)),
+        }
+    } else if let Some(rect) = args.base_sample {
+        FilmBase::detect_in_rect(&uncropped, rect, film_base::DEFAULT_PERCENTILE)
+    } else if let Some(regions) = frame.film {
+        FilmBase::detect_in_regions(&uncropped, &regions, film_base::DEFAULT_PERCENTILE)
+    } else {
+        FilmBase::detect(&uncropped, film_base::DEFAULT_PERCENTILE)
+    };
+
+    let image = geometry::apply(&uncropped, &frame);
+
+    let measurements = match grainbase::pipeline::chart::measure(&image, &base) {
+        Ok(measurements) => measurements,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let profile =
+        match grainbase::pipeline::chart::fit_capture(&measurements, &args.film, &args.camera) {
+            Ok(profile) => profile,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let text = profile.to_string();
+    if let Err(err) = Profile::parse(&text) {
+        eprintln!("generated profile does not round-trip: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    let output = args
+        .out
+        .unwrap_or_else(|| default_profile_path(&args.capture));
+    if let Some(parent) = output.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "could not create output directory {}: {err}",
+            parent.display()
+        );
+        return ExitCode::FAILURE;
+    }
+    if let Err(err) = fs::write(&output, text) {
+        eprintln!("could not write {}: {err}", output.display());
+        return ExitCode::FAILURE;
+    }
+
+    print_fit_summary(&profile);
+    println!("wrote {}", output.display());
+    ExitCode::SUCCESS
+}
+
+/// The default profile path is a sibling of the capture with `.profile` extension.
+fn default_profile_path(capture: &Path) -> PathBuf {
+    let mut path = capture.to_path_buf();
+    path.set_extension("profile");
+    path
+}
+
+/// Prints the fitted anchors and crosstalk matrix in human-readable form.
+fn print_fit_summary(profile: &Profile) {
+    let floors = profile.settings.density_floor.unwrap_or([0.0; 3]);
+    let ceilings = profile
+        .settings
+        .density_max
+        .expect("a fitted profile emits ceilings");
+    let matrix = profile.settings.crosstalk;
+
+    println!("fitted profile for {} on {}", profile.film, profile.camera);
+    println!(
+        "  black point (density)  R {:.4}  G {:.4}  B {:.4}",
+        floors[0], floors[1], floors[2]
+    );
+    println!(
+        "  white point (density)  R {:.4}  G {:.4}  B {:.4}",
+        ceilings[0], ceilings[1], ceilings[2]
+    );
+    println!("  crosstalk matrix (rows = output channels):");
+    for row in matrix {
+        println!("    {:.4} {:.4} {:.4}", row[0], row[1], row[2]);
+    }
+}
+
+/// Parses `--base-sample x0,y0,x1,y1` as fractions of the image.
+fn parse_base_sample(text: &str) -> Result<[f32; 4], String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 4 {
+        return Err("expected four comma-separated fractions".to_owned());
+    }
+    let mut out = [0.0f32; 4];
+    for (i, part) in parts.iter().enumerate() {
+        out[i] = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{part}` is not a number"))?;
+    }
+    Ok(out)
+}
+
+/// Parses `--film-base r,g,b` as per-channel transmittance.
+fn parse_base_rgb(text: &str) -> Result<[f32; 3], String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 3 {
+        return Err("expected three comma-separated channel values".to_owned());
+    }
+    let mut out = [0.0f32; 3];
+    for (i, part) in parts.iter().enumerate() {
+        out[i] = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("`{part}` is not a number"))?;
+    }
+    Ok(out)
+}
+
 /// Reads a profile from disk, or falls back to neutral defaults.
 ///
 /// A profile that cannot be read is a hard error rather than a silent fallback:
 /// converting a whole roll with defaults because a path was mistyped would
 /// produce a folder of wrong output that looks deliberate.
-fn load_profile(path: Option<&std::path::Path>) -> Result<Settings, String> {
+fn load_profile(path: Option<&Path>) -> Result<Settings, String> {
     let Some(path) = path else {
         return Ok(Settings::default());
     };

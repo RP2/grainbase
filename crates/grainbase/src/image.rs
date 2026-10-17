@@ -139,6 +139,23 @@ impl LinearImage {
         self.flipped_horizontal().flipped_vertical()
     }
 
+    /// Applies the scan's operator-chosen orientation.
+    ///
+    /// A color-negative scan's mirror state is a capture fact — which side of
+    /// the film faced the lens — that the operator states once per roll. Both
+    /// flips together are the 180° case.
+    #[must_use]
+    pub fn flipped(&self, flips: Flips) -> Self {
+        let mut image = self.clone();
+        if flips.horizontal {
+            image = image.flipped_horizontal();
+        }
+        if flips.vertical {
+            image = image.flipped_vertical();
+        }
+        image
+    }
+
     /// Reflects the image across its main diagonal, swapping width and height.
     ///
     /// Half of the EXIF orientation values are only expressible as a transpose
@@ -160,6 +177,21 @@ impl LinearImage {
             data,
         }
     }
+}
+
+/// The operator's orientation decision for a scan.
+///
+/// A color-negative scan is mirrored, or not, depending on which face of the
+/// film saw the capture lens; some capture setups also land it upside down.
+/// Both are per-roll facts the operator states once. They are applied before
+/// anything is detected and are never inferred from EXIF, because no
+/// reference tool trusts the tag for this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Flips {
+    /// Mirror left to right: the emulsion faced the lens.
+    pub horizontal: bool,
+    /// Mirror top to bottom: the strip was captured inverted.
+    pub vertical: bool,
 }
 
 #[cfg(test)]

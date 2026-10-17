@@ -13,6 +13,7 @@ use std::{fs, io};
 use rayon::prelude::*;
 
 use crate::geometry;
+pub use crate::image::Flips;
 use crate::image::LinearImage;
 use crate::pipeline::{self, FilmBase, Settings, film_base};
 use crate::{decode, encode};
@@ -53,6 +54,23 @@ pub struct Job {
     /// turning it off gives the raw frame back, and sources are never modified, so
     /// the decision is always reversible.
     pub crop: bool,
+    /// The operator's orientation decision (spec step 1), carried by the whole
+    /// roll: a roll is scanned one way.
+    pub flips: Flips,
+    /// Optional authoritative base sample rectangle, as fractions `[x0, y0, x1,
+    /// y1]` of the uncropped scan.
+    ///
+    /// When supplied, the film base is measured from exactly this rectangle and
+    /// the band machinery is ignored. For glare-heavy rigs a hand-placed
+    /// rebate rectangle beats every heuristic.
+    pub base_sample: Option<[f32; 4]>,
+    /// The film base supplied by hand, as per-channel transmittance.
+    ///
+    /// The reference tools' own escape hatch for a border they cannot locate:
+    /// NLP and `VueScan` both document sampling the film border by hand rather
+    /// than inferring it from frame statistics. When set, it is authoritative
+    /// and no detector runs.
+    pub film_base: Option<[f32; 3]>,
 }
 
 /// What happened to one frame.
@@ -168,18 +186,18 @@ pub fn run(job: &Job) -> Report {
     // Deterministic order, so the sampling below is reproducible.
     inputs.sort();
 
-    let base = roll_base(&inputs);
+    let base = roll_base(&inputs, job.flips, job.base_sample);
 
     let outcomes = inputs
         .par_iter()
-        .map(|input| convert_one(job, input, base.as_ref(), &job.settings))
+        .map(|input| convert_one(job, input, base.as_ref()))
         .collect();
 
     Report { outcomes }
 }
 
 /// Converts one frame, or reports why not.
-fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>, settings: &Settings) -> Outcome {
+fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
     let Some(output) = output_path_for(&job.input, &job.output, input) else {
         return Outcome::Failed(
             input.to_path_buf(),
@@ -191,7 +209,16 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>, settings: &Sett
         return Outcome::Skipped(output);
     }
 
-    match convert_frame(input, &output, settings, base, job.crop) {
+    match convert_frame(
+        input,
+        &output,
+        &job.settings,
+        base,
+        job.flips,
+        job.crop,
+        job.base_sample,
+        job.film_base,
+    ) {
         Ok(()) => Outcome::Converted(output),
         Err(err) => Outcome::Failed(input.to_path_buf(), err.to_string()),
     }
@@ -199,65 +226,96 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>, settings: &Sett
 
 /// Crops to the film frame, when asked and when one can be found.
 ///
-/// Runs before anything measures the film base, and that order is the point: a
-/// base measured over the whole sensor includes the sprocket holes and whatever
-/// bare light is about, and those are not film. Measuring them measures the light
-/// source.
-///
 /// Anything ambiguous leaves the image alone. A bad crop is worse than no crop,
 /// and an underexposed frame has weaker edges.
-fn cropped(image: LinearImage, crop: bool) -> LinearImage {
-    if !crop {
-        return image;
-    }
-    match geometry::find(&image) {
-        Some(frame) => geometry::apply(&image, &frame),
-        None => image,
-    }
+fn cropped(image: &LinearImage, frame: &geometry::Frame) -> LinearImage {
+    geometry::apply(image, frame)
 }
 
-/// Decodes one frame, measures its base, crops it, inverts it, and writes the
-/// positive.
+/// Decodes one frame, locates it, measures its base, crops it, inverts it, and
+/// writes the positive.
 ///
-/// The base is measured **before** the crop, which is the opposite of what the
-/// ordering intuition suggests and was learned the hard way. Cropping keeps the
-/// picture and discards the rebate — and the rebate *is* the clear film the base
-/// is measured from. Measure it after cropping and there is no clear film left, so
-/// the detector falls back to a percentile of the picture itself and the colour
-/// goes wrong.
+/// The order is fixed by the documented lab pipeline (see the private repo's
+/// `docs/protocol/negative-scan-order-of-operations.md`; numbered steps below
+/// cite it):
 ///
-/// The crop still precedes inversion, which is what the ordering was about: a
-/// picture-versus-picture measurement is fine, whereas the *hole* handling that
-/// the base needs is a property of the whole sensor area.
-///
-/// When `base` is `None` the frame measures its own, which is what a single frame
-/// run does.
+/// 1. *Orient first*: the operator's flips — the emulsion-side mirror and any
+///    180° — are applied to the raw scan before anything is detected, one
+///    mirror decision per roll, never derived from EXIF.
+/// 2. *Find the frame* on the oriented scan. The frame carries the mechanical
+///    knowledge of where the film and its rebate are.
+/// 3. *Measure the film base on the still-uncropped scan*, by source
+///    precedence. A caller-supplied roll-level base wins (the roll's base is
+///    one measurement, per the lab tools' border-lock practice); then a
+///    manually supplied per-channel base; then a manually supplied sample
+///    rectangle; then the sprocket-band-anchored rebate regions; then the
+///    whole-frame statistics the scanner tools document as their default
+///    base estimate — whose known limit is light-table glare on copy-stand
+///    scans, for which the manual inputs are the documented answer, not a
+///    further heuristic.
+/// 4. *Crop* to the exposed frame, so the inversion only sees picture pixels.
+/// 5. *Invert*, with the settings (a profile when loaded).
 ///
 /// # Errors
 ///
 /// Propagates decode, encode, and output-directory failures.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the documented order has five measured inputs; collapsing them into \
+              a struct would hide which parameters the caller did not supply"
+)]
 pub fn convert_frame(
     input: &Path,
     output: &Path,
     settings: &Settings,
     base: Option<&FilmBase>,
+    flips: Flips,
     crop: bool,
+    base_sample: Option<[f32; 4]>,
+    film_base: Option<[f32; 3]>,
 ) -> Result<(), Error> {
     let scan = decode::decode(input)?;
-    let uncropped = scan.linear;
 
-    // Measured only when the caller has no roll-level base to supply, and always
-    // on the uncropped frame.
+    // Orient before anything is measured: the flips are the operator's
+    // decision about which side of the film faced the lens.
+    let uncropped = scan.linear.flipped(flips);
+
+    // Find the frame once. The same frame is used for the base measurement
+    // and the crop.
+    let frame = geometry::find(&uncropped).unwrap_or_else(|| geometry::Frame::whole(&uncropped));
+    let cropped = if crop {
+        let c = cropped(&uncropped, &frame);
+        if c.width == 0 || c.height == 0 {
+            None
+        } else {
+            Some(c)
+        }
+    } else {
+        None
+    };
+
+    // The base is always measured on the uncropped scan: neutralizing the
+    // mask precedes the crop in the documented order.
     let measured;
     let base = if let Some(base) = base {
         base
+    } else if let Some(values) = film_base {
+        measured = FilmBase {
+            transmittance: values.map(|value| value.max(f32::MIN_POSITIVE)),
+        };
+        &measured
+    } else if let Some(rect) = base_sample {
+        measured = FilmBase::detect_in_rect(&uncropped, rect, film_base::DEFAULT_PERCENTILE);
+        &measured
+    } else if let Some(regions) = frame.film {
+        measured = FilmBase::detect_in_regions(&uncropped, &regions, film_base::DEFAULT_PERCENTILE);
+        &measured
     } else {
         measured = FilmBase::detect(&uncropped, film_base::DEFAULT_PERCENTILE);
         &measured
     };
 
-    let linear = cropped(uncropped, crop);
-    let positive = pipeline::invert(&linear, base, settings);
+    let positive = pipeline::invert(cropped.as_ref().unwrap_or(&uncropped), base, settings);
 
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)?;
@@ -272,7 +330,7 @@ pub fn convert_frame(
 /// taken, so one odd frame — a blank, a very dense night shot — cannot set the
 /// base for the whole roll. Returns `None` when nothing could be sampled, and
 /// callers then fall back to measuring per frame.
-fn roll_base(inputs: &[PathBuf]) -> Option<FilmBase> {
+fn roll_base(inputs: &[PathBuf], flips: Flips, base_sample: Option<[f32; 4]>) -> Option<FilmBase> {
     if inputs.len() <= 1 {
         // Nothing to pool, and one frame is its own best estimate.
         return None;
@@ -285,12 +343,10 @@ fn roll_base(inputs: &[PathBuf]) -> Option<FilmBase> {
         .take(BASE_SAMPLE)
         .filter_map(|input| {
             let scan = decode::decode(input).ok()?;
-            // Never cropped here either: the rebate the crop discards is the clear
-            // film the base is measured from.
-            Some(FilmBase::detect(
-                &scan.linear,
-                film_base::DEFAULT_PERCENTILE,
-            ))
+            let oriented = scan.linear.flipped(flips);
+            let frame =
+                geometry::find(&oriented).unwrap_or_else(|| geometry::Frame::whole(&oriented));
+            Some(roll_frame_base(&oriented, &frame, base_sample))
         })
         .collect();
 
@@ -313,6 +369,26 @@ fn roll_base(inputs: &[PathBuf]) -> Option<FilmBase> {
     Some(FilmBase {
         transmittance: transmittance.map(|value| value.max(f32::MIN_POSITIVE)),
     })
+}
+
+/// One sampled frame's base for the roll measurement.
+///
+/// The same source ordering as [`convert_frame`], minus the supplied-base
+/// case: a manual rectangle or the film regions on the uncropped scan, else
+/// the cropped picture.
+fn roll_frame_base(
+    uncropped: &LinearImage,
+    frame: &geometry::Frame,
+    base_sample: Option<[f32; 4]>,
+) -> FilmBase {
+    if let Some(rect) = base_sample {
+        return FilmBase::detect_in_rect(uncropped, rect, film_base::DEFAULT_PERCENTILE);
+    }
+    if let Some(regions) = frame.film {
+        return FilmBase::detect_in_regions(uncropped, &regions, film_base::DEFAULT_PERCENTILE);
+    }
+    let cropped = cropped(uncropped, frame);
+    FilmBase::detect(&cropped, film_base::DEFAULT_PERCENTILE)
 }
 
 /// Where the positive for `file` goes: the input tree mirrored, extension `.png`.
@@ -462,6 +538,9 @@ mod tests {
             mode: FilmMode::ColorNegative,
             settings: Settings::default(),
             crop: true,
+            flips: Flips::default(),
+            base_sample: None,
+            film_base: None,
         });
 
         assert!(report.outcomes.is_empty(), "got {:?}", report.outcomes);
@@ -490,6 +569,9 @@ mod tests {
             mode: FilmMode::ColorNegative,
             settings: Settings::default(),
             crop: true,
+            flips: Flips::default(),
+            base_sample: None,
+            film_base: None,
         });
 
         assert_eq!(report.failures().len(), 1);
