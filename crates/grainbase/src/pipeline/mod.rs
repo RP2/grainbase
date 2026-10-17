@@ -118,16 +118,17 @@ pub struct Settings {
     /// exposure compensation — it changes shape, not placement.
     pub gamma: Option<[f32; 3]>,
 
-    /// The density a correctly-exposed gray measures at, for the print
-    /// curve's pivot anchor.
+    /// The density a correctly-exposed gray measures at, per channel, for the
+    /// print curve's pivot anchor.
     ///
     /// Anchors the curve: the pivot density maps to the reference gray
-    /// positive value, both pieces meeting there with continuous slope. This
-    /// is *the stock's* gray-measured density — the maintainer's capture
-    /// protocol fits it per stock (Kodak's generic LAD aims are the fallback
-    /// family value and already the default ceilings). `None` means no
-    /// pivot: no curve was requested, which pairs with `gamma: None`.
-    pub pivot_density: Option<f32>,
+    /// positive value, both pieces meeting there with continuous slope. Per
+    /// channel because a neutral gray does *not* sit at one density in all
+    /// three layers — that is what Kodak's LAD aims state, and why the generic
+    /// ceilings are already per channel. The maintainer's capture protocol fits
+    /// the stock's own values. `None` means no pivot: no curve was requested,
+    /// which pairs with `gamma: None`.
+    pub pivot_density: Option<[f32; 3]>,
 
     /// Dye crosstalk correction, applied to density before it is scaled.
     ///
@@ -218,9 +219,9 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
                 floor[2] + density_max[2],
             ];
             let pivot_normalized = [
-                ((pivot - floor[0]) / (span[0] - floor[0])).clamp(f32::MIN_POSITIVE, 1.0),
-                ((pivot - floor[1]) / (span[1] - floor[1])).clamp(f32::MIN_POSITIVE, 1.0),
-                ((pivot - floor[2]) / (span[2] - floor[2])).clamp(f32::MIN_POSITIVE, 1.0),
+                ((pivot[0] - floor[0]) / (span[0] - floor[0])).clamp(f32::MIN_POSITIVE, 1.0),
+                ((pivot[1] - floor[1]) / (span[1] - floor[1])).clamp(f32::MIN_POSITIVE, 1.0),
+                ((pivot[2] - floor[2]) / (span[2] - floor[2])).clamp(f32::MIN_POSITIVE, 1.0),
             ];
             let gamma = gamma.map(|value| value.max(f32::MIN_POSITIVE));
             Some((pivot_normalized, gamma))
@@ -515,7 +516,7 @@ mod tests {
         let settings = Settings {
             density_max: Some([2.0f32; 3]),
             gamma: Some([1.5f32; 3]),
-            pivot_density: Some(pivot_density),
+            pivot_density: Some([pivot_density; 3]),
             ..Settings::default()
         };
         let source = image(&[[10f32.powf(-pivot_density); 3]]);
@@ -539,7 +540,7 @@ mod tests {
         let curved = Settings {
             density_max: Some([2.0f32; 3]),
             gamma: Some([1.5f32; 3]),
-            pivot_density: Some(pivot_density),
+            pivot_density: Some([pivot_density; 3]),
             ..Settings::default()
         };
 
@@ -569,7 +570,7 @@ mod tests {
         let curved = Settings {
             density_max: Some([2.0f32; 3]),
             gamma: Some([0.7f32; 3]),
-            pivot_density: Some(pivot_density),
+            pivot_density: Some([pivot_density; 3]),
             ..Settings::default()
         };
 
@@ -593,7 +594,7 @@ mod tests {
         let settings = Settings {
             density_max: Some([2.0f32; 3]),
             gamma: Some([1.2f32, 0.9f32, 1.5f32]),
-            pivot_density: Some(pivot_density),
+            pivot_density: Some([pivot_density; 3]),
             ..Settings::default()
         };
         let below = image(&[[10f32.powf(-0.6f32); 3]]);
@@ -634,7 +635,7 @@ mod tests {
         let settings = Settings {
             density_max: Some([2.0f32; 3]),
             gamma: Some([1.4f32; 3]),
-            pivot_density: Some(1.0f32),
+            pivot_density: Some([1.0f32; 3]),
             ..Settings::default()
         };
         let result = invert(&source, &base([1.0f32; 3]), &settings);

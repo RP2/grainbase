@@ -212,6 +212,10 @@ fn parse_options() -> Result<Options, String> {
     let mut profile_path: Option<String> = None;
     let mut base_sample: Option<[f32; 4]> = None;
     let mut film_base: Option<[f32; 3]> = None;
+    let mut density_max: Option<[f32; 3]> = None;
+    let mut density_floor: Option<[f32; 3]> = None;
+    let mut gamma: Option<[f32; 3]> = None;
+    let mut pivot_density: Option<[f32; 3]> = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
@@ -233,6 +237,22 @@ fn parse_options() -> Result<Options, String> {
                 let text = args.next().ok_or("--film-base requires r,g,b")?;
                 film_base = Some(parse_base_rgb(&text)?);
             }
+            "--density-max" => {
+                let text = args.next().ok_or("--density-max requires r,g,b")?;
+                density_max = Some(parse_base_rgb(&text)?);
+            }
+            "--density-floor" => {
+                let text = args.next().ok_or("--density-floor requires r,g,b")?;
+                density_floor = Some(parse_base_rgb(&text)?);
+            }
+            "--gamma" => {
+                let text = args.next().ok_or("--gamma requires r,g,b")?;
+                gamma = Some(parse_base_rgb(&text)?);
+            }
+            "--pivot-density" => {
+                let text = args.next().ok_or("--pivot-density requires r,g,b")?;
+                pivot_density = Some(parse_base_rgb(&text)?);
+            }
             _ => positional.push(argument),
         }
     }
@@ -252,6 +272,14 @@ fn parse_options() -> Result<Options, String> {
             .settings
     } else {
         Settings::default()
+    };
+    // Flags win over a profile: tuning by eye is the loop this exists for.
+    let settings = Settings {
+        density_max: density_max.or(settings.density_max),
+        density_floor: density_floor.or(settings.density_floor),
+        gamma: gamma.or(settings.gamma),
+        pivot_density: pivot_density.or(settings.pivot_density),
+        ..settings
     };
 
     Ok(Options {

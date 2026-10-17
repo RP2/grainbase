@@ -202,8 +202,8 @@ impl fmt::Display for Profile {
         if let Some([red, green, blue]) = self.settings.gamma {
             writeln!(f, "gamma = {red:.6} {green:.6} {blue:.6}")?;
         }
-        if let Some(pivot) = self.settings.pivot_density {
-            writeln!(f, "pivot_density = {pivot:.6}")?;
+        if let Some([red, green, blue]) = self.settings.pivot_density {
+            writeln!(f, "pivot_density = {red:.6} {green:.6} {blue:.6}")?;
         }
         writeln!(f, "# Rows are output channels, columns are dye densities.")?;
         writeln!(
@@ -267,7 +267,7 @@ impl Profile {
                 "density_max" => density_max = Some(parse_floats::<3>(line, key, value)?),
                 "density_floor" => density_floor = Some(parse_floats::<3>(line, key, value)?),
                 "gamma" => gamma = Some(parse_floats::<3>(line, key, value)?),
-                "pivot_density" => pivot_density = Some(parse_floats::<1>(line, key, value)?[0]),
+                "pivot_density" => pivot_density = Some(parse_floats::<3>(line, key, value)?),
                 "crosstalk" => {
                     let flat = parse_floats::<9>(line, key, value)?;
                     crosstalk = Some([
@@ -433,7 +433,7 @@ mod tests {
         let text = "# c\n# a\nversion = 1\nfilm = \"x\"\ncamera = \"y\"\n\
                     method = fitted\nframes = 3\ndensity_max = 1 2 3\n\
                     density_floor = 0.1 0.2 0.3\ngamma = 1.2 0.9 1.1\n\
-                    pivot_density = 1.45\ncrosstalk = 1 0 0 0 1 0 0 0 1\n";
+                    pivot_density = 1.45 1.45 1.45\ncrosstalk = 1 0 0 0 1 0 0 0 1\n";
         let parsed = Profile::parse(text).expect("parses");
         assert_eq!(
             parsed.settings.gamma,
@@ -442,7 +442,7 @@ mod tests {
         );
         assert_eq!(
             parsed.settings.pivot_density,
-            Some(1.45),
+            Some([1.45; 3]),
             "the pivot's density anchor"
         );
 

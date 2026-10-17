@@ -75,6 +75,29 @@ struct Cli {
     #[arg(long, value_parser = parse_base_sample)]
     base_sample: Option<[f32; 4]>,
 
+    /// Per-channel density white points `r,g,b`, overriding a profile's.
+    ///
+    /// The one knob that moves a color cast: a channel rendering too bright has
+    /// its white point too low. Tune by eye against a known neutral in the
+    /// frame — a white wall, a shirt — because a cast is what the numbers
+    /// cannot name.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
+    density_max: Option<[f32; 3]>,
+
+    /// Per-channel density black points `r,g,b`, overriding a profile's.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
+    density_floor: Option<[f32; 3]>,
+
+    /// Per-channel print-curve contrast `r,g,b`, overriding a profile's. Above
+    /// 1 deepens shadows, below 1 lifts them.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
+    gamma: Option<[f32; 3]>,
+
+    /// Per-channel density a correctly exposed gray measures at `r,g,b`, for
+    /// the print curve's pivot. Needs --gamma.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
+    pivot_density: Option<[f32; 3]>,
+
     /// Write a diagnostic overlay beside each positive: the scan with the
     /// frame, the sprocket bands, and the film-base probe points drawn on it.
     ///
@@ -156,7 +179,13 @@ fn main() -> ExitCode {
         return run_fit(args);
     }
 
-    let settings = match load_profile(cli.profile.as_deref()) {
+    let settings = match load_profile(cli.profile.as_deref()).map(|settings| Settings {
+        density_max: cli.density_max.or(settings.density_max),
+        density_floor: cli.density_floor.or(settings.density_floor),
+        gamma: cli.gamma.or(settings.gamma),
+        pivot_density: cli.pivot_density.or(settings.pivot_density),
+        ..settings
+    }) {
         Ok(settings) => settings,
         Err(message) => {
             eprintln!("{message}");
