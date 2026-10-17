@@ -17,7 +17,7 @@
 //! rebate is the clear film the base is measured from.
 
 use grainbase::decode;
-use grainbase::pipeline::{self, FilmBase, Settings, film_base, percentile};
+use grainbase::pipeline::{self, FilmBase, Settings, film_base, meter, percentile};
 use grainbase::profile::Profile;
 use grainbase::{LinearImage, encode, geometry, overlay};
 
@@ -109,6 +109,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     };
 
+    // Metering is per frame and reads the picture: the frame's integral density is
+    // pulled back toward its own neutral, weighted down when the frame is a scene
+    // that is genuinely one color rather than a film or scanning cast. It runs on
+    // the uncropped scan, before the crop, like every other measurement.
+    let mut settings = options.settings;
+    if options.meter {
+        let region = frame.sample_region().exposure_region(&negative, &base);
+        match meter::meter(&negative, &base, region.rect_fractions(&negative)) {
+            Some(metered) => {
+                println!(
+                    "metering: integral R {:.3} G {:.3} B {:.3}  confidence {:.2}  \
+                     correction R {:+.3} G {:+.3} B {:+.3}",
+                    metered.integral[0],
+                    metered.integral[1],
+                    metered.integral[2],
+                    metered.confidence,
+                    metered.correction[0],
+                    metered.correction[1],
+                    metered.correction[2],
+                );
+                let floor = settings.density_floor.unwrap_or([0.0; 3]);
+                settings.density_floor =
+                    Some([0, 1, 2].map(|channel| floor[channel] - metered.correction[channel]));
+            }
+            None => println!("metering: the analysis region holds no blocks, not metered"),
+        }
+    }
+
     // The overlay is drawn in the uncropped scan's coordinates, so it has to
     // keep a copy when the crop moves the picture underneath it.
     let overlay_scan = if options.overlay && !options.no_crop {
@@ -132,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         base.transmittance[0], base.transmittance[1], base.transmittance[2]
     );
 
-    let positive = pipeline::invert(&negative, &base, &options.settings);
+    let positive = pipeline::invert(&negative, &base, &settings);
 
     report("negative", &negative, &base);
     report("positive", &positive, &base);
@@ -196,6 +224,7 @@ struct Options {
     no_crop: bool,
     negative_stage: bool,
     overlay: bool,
+    meter: bool,
     settings: Settings,
     film_base: Option<[f32; 3]>,
     base_sample: Option<[f32; 4]>,
@@ -209,6 +238,7 @@ fn parse_options() -> Result<Options, String> {
     let mut no_crop = false;
     let mut negative_stage = false;
     let mut overlay = false;
+    let mut meter = false;
     let mut profile_path: Option<String> = None;
     let mut base_sample: Option<[f32; 4]> = None;
     let mut film_base: Option<[f32; 3]> = None;
@@ -225,6 +255,7 @@ fn parse_options() -> Result<Options, String> {
             "--no-crop" => no_crop = true,
             "--negative" => negative_stage = true,
             "--overlay" => overlay = true,
+            "--meter" => meter = true,
             "--profile" => {
                 let path = args.next().ok_or("--profile requires a path")?;
                 profile_path = Some(path);
@@ -290,6 +321,7 @@ fn parse_options() -> Result<Options, String> {
         no_crop,
         negative_stage,
         overlay,
+        meter,
         settings,
         film_base,
         base_sample,

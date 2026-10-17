@@ -391,6 +391,30 @@ impl Frame {
         }
     }
 
+    /// The frame's axis-aligned bounding box, as fractions `[x0, y0, x1, y1]`
+    /// of the image width and height.
+    ///
+    /// The box a per-frame measurement reads over, rather than crops to: the
+    /// meter takes its analysis region this way, so it samples the picture the
+    /// frame bounds without the pixel copy a crop would make. A rotated frame's
+    /// box is the box of its rotated corners, clamped to the image, so the
+    /// region never falls outside the scan.
+    #[must_use]
+    pub fn rect_fractions(self, image: &LinearImage) -> [f32; 4] {
+        let width = coordinate(image.width as usize).max(1.0);
+        let height = coordinate(image.height as usize).max(1.0);
+        let (sin, cos) = self.skew.sin_cos();
+        let half = [self.size[0] / 2.0, self.size[1] / 2.0];
+        let dx = (cos * half[0]).abs() + (sin * half[1]).abs();
+        let dy = (sin * half[0]).abs() + (cos * half[1]).abs();
+        [
+            ((self.center[0] - dx) / width).clamp(0.0, 1.0),
+            ((self.center[1] - dy) / height).clamp(0.0, 1.0),
+            ((self.center[0] + dx) / width).clamp(0.0, 1.0),
+            ((self.center[1] + dy) / height).clamp(0.0, 1.0),
+        ]
+    }
+
     /// The sampling region pulled in until every side reads as picture.
     ///
     /// The frame's long edges are the pair a scan states least reliably, so a

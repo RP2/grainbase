@@ -106,6 +106,15 @@ struct Cli {
     /// from; magenta probes disagreed with the rest and were ignored.
     #[arg(long)]
     overlay: bool,
+
+    /// Meter each frame's integral color and correct a cast before rendering.
+    ///
+    /// The frame's large-area integral density is pulled back toward its own
+    /// neutral, weighted down when the frame is a scene that is genuinely one
+    /// color rather than a film or scanning cast. Off by default while its
+    /// effect on the maintainer's fixtures is measured.
+    #[arg(long)]
+    meter: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -206,6 +215,7 @@ fn main() -> ExitCode {
         base_sample: cli.base_sample,
         film_base: cli.film_base,
         overlay: cli.overlay,
+        meter: cli.meter,
     });
 
     println!(

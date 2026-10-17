@@ -22,9 +22,11 @@
 pub mod chart;
 pub mod film_base;
 pub mod fit;
+pub mod meter;
 pub mod percentile;
 
 pub use film_base::FilmBase;
+pub use meter::{LAD_CAMERA_NEGATIVE, Metering};
 
 use crate::image::LinearImage;
 
@@ -250,7 +252,7 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
 /// while keeping the arithmetic finite. Without a bound, a fully opaque sample
 /// (`transmittance == 0`) yields infinity, and the crosstalk step then computes
 /// `0.0 * infinity`, which is NaN and would poison the whole frame.
-const MAX_DENSITY: f32 = 10.0;
+pub(crate) const MAX_DENSITY: f32 = 10.0;
 
 /// Optical density of one sample relative to the film base.
 fn density_of(value: f32, base: f32) -> f32 {

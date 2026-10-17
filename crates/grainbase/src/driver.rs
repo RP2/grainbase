@@ -74,6 +74,14 @@ pub struct Job {
     /// the frame it found, the punch bands, and the film the base was measured
     /// from. Off by default: it is a debugging surface, not an output.
     pub overlay: bool,
+    /// Whether to meter each frame's integral color before rendering.
+    ///
+    /// The meter pulls the frame's integral density back toward its own
+    /// neutral, so a film or scanning cast is corrected without the scene's own
+    /// light being neutralised; the pull is weighted down when the frame is a
+    /// scene that is genuinely one color rather than a cast. Per frame, because
+    /// the cast moves while the unexposed stock does not.
+    pub meter: bool,
     /// Optional authoritative base sample rectangle, as fractions `[x0, y0, x1,
     /// y1]` of the uncropped scan.
     ///
@@ -251,6 +259,7 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
         job.base_sample,
         job.film_base,
         job.overlay,
+        job.meter,
     ) {
         Ok(()) => Outcome::Converted(output),
         Err(err) => Outcome::Failed(input.to_path_buf(), err.to_string()),
@@ -295,8 +304,9 @@ fn cropped(image: &LinearImage, frame: &geometry::Frame) -> LinearImage {
 /// Propagates decode, encode, and output-directory failures.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the documented order has five measured inputs; collapsing them into \
-              a struct would hide which parameters the caller did not supply"
+    reason = "the documented order has five measured inputs plus the operator's \
+              switches; collapsing them into a struct would hide which \
+              parameters the caller did not supply"
 )]
 pub fn convert_frame(
     input: &Path,
@@ -308,6 +318,7 @@ pub fn convert_frame(
     base_sample: Option<[f32; 4]>,
     film_base: Option<[f32; 3]>,
     overlay: bool,
+    meter: bool,
 ) -> Result<(), Error> {
     let scan = decode::decode(input)?;
 
@@ -354,7 +365,19 @@ pub fn convert_frame(
         return Err(Error::NoFilmBase);
     };
 
-    let positive = pipeline::invert(cropped.as_ref().unwrap_or(&uncropped), base, settings);
+    // The meter pulls the frame's integral back to neutral. It runs here, after
+    // the base is measured and the frame is located, so the region it reads is the
+    // exposure rather than the rebate or the light table.
+    let mut frame_settings = *settings;
+    if meter {
+        frame_settings = metered_settings(&frame_settings, &uncropped, base, &frame);
+    }
+
+    let positive = pipeline::invert(
+        cropped.as_ref().unwrap_or(&uncropped),
+        base,
+        &frame_settings,
+    );
 
     // With the crop off, the output *is* the scan the decisions were made on, so
     // the marks belong on it: one image shows the final frame and where the
@@ -474,6 +497,32 @@ fn measured_between_sprockets(image: &LinearImage, frame: &geometry::Frame) -> O
     // lit punch, or no gap between two holes. That is not a measurement, and
     // converting with it would render every frame wrong in silence.
     (base != FilmBase::IDENTITY).then_some(base)
+}
+
+/// The settings with the frame's metered printer point folded in, or unchanged
+/// when the frame cannot be metered.
+///
+/// The meter's correction is a shift of the density axis, which is exactly a
+/// moved black point: the render already reads a per-channel `density_floor`,
+/// so the printer point is written there and the ceiling — and so the contrast —
+/// is left alone. The analysis region is the frame's own exposure region, the
+/// same region every picture-reading operation samples, so the integral never
+/// counts the rebate, the holes, or the light table.
+fn metered_settings(
+    settings: &Settings,
+    image: &LinearImage,
+    base: &FilmBase,
+    frame: &geometry::Frame,
+) -> Settings {
+    let region = frame.sample_region().exposure_region(image, base);
+    let Some(metering) = pipeline::meter::meter(image, base, region.rect_fractions(image)) else {
+        return *settings;
+    };
+    let floor = settings.density_floor.unwrap_or([0.0; 3]);
+    Settings {
+        density_floor: Some([0, 1, 2].map(|channel| floor[channel] - metering.correction[channel])),
+        ..*settings
+    }
 }
 
 /// Where the diagnostic overlay for an output goes: beside it, marked.
@@ -643,6 +692,7 @@ mod tests {
             crop: true,
             flips: Flips::default(),
             overlay: false,
+            meter: false,
             base_sample: None,
             film_base: None,
         });
@@ -675,6 +725,7 @@ mod tests {
             crop: true,
             flips: Flips::default(),
             overlay: false,
+            meter: false,
             base_sample: None,
             film_base: None,
         });
