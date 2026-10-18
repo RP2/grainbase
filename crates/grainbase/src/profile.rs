@@ -14,7 +14,7 @@
 
 use std::fmt;
 
-use crate::pipeline::{IDENTITY, Settings};
+use crate::pipeline::{FilmMode, IDENTITY, Settings};
 
 /// Format version, so an old profile can be rejected rather than misread.
 pub const VERSION: u32 = 1;
@@ -45,6 +45,29 @@ impl fmt::Display for Method {
             Self::Derived => "derived",
             Self::Tuned => "tuned",
         })
+    }
+}
+
+/// Text keyword for a film family.
+fn family_keyword(mode: FilmMode) -> &'static str {
+    match mode {
+        FilmMode::ColorNegative => "c41",
+        FilmMode::BlackAndWhite => "bw",
+        FilmMode::Slide => "slide",
+    }
+}
+
+/// Parses a film-family keyword, rejecting unknown spellings.
+fn parse_family(line: usize, key: &str, value: &str) -> Result<FilmMode, ParseError> {
+    match value {
+        "c41" => Ok(FilmMode::ColorNegative),
+        "bw" => Ok(FilmMode::BlackAndWhite),
+        "slide" => Ok(FilmMode::Slide),
+        other => Err(ParseError::BadValue {
+            line,
+            key: key.to_owned(),
+            reason: format!("`{other}` is not a family (expected c41, bw or slide)"),
+        }),
     }
 }
 
@@ -81,6 +104,12 @@ pub struct Profile {
     /// Frames the fit used. A fit from three frames and one from sixty are not
     /// equally trustworthy, and should not look identical.
     pub frames: u32,
+    /// Process family this profile was fitted for, if any.
+    ///
+    /// A family-scoped profile (e.g. a rig calibration from a neutral wedge)
+    /// applies to every stock processed through that family. A per-stock
+    /// profile omits the key.
+    pub family: Option<FilmMode>,
     /// The fitted conversion settings.
     ///
     /// Derived `Default` would leave the bounds `None` — meaning *measured* —
@@ -99,6 +128,7 @@ impl Profile {
             camera: String::new(),
             method: Method::Neutral,
             frames: 0,
+            family: None,
             settings: Settings {
                 density_max: Some([crate::pipeline::DEFAULT_DENSITY_MAX; 3]),
                 density_floor: None,
@@ -193,6 +223,9 @@ impl fmt::Display for Profile {
         writeln!(f, "camera = {}", quote(&self.camera))?;
         writeln!(f, "method = {}", self.method)?;
         writeln!(f, "frames = {}", self.frames)?;
+        if let Some(family) = self.family {
+            writeln!(f, "family = {}", family_keyword(family))?;
+        }
         writeln!(f, "density_max = {:.6} {:.6} {:.6}", max[0], max[1], max[2])?;
         // Optional keys stay optional on both sides: an older profile parses
         // as well as a newer one.
@@ -237,6 +270,7 @@ impl Profile {
         let mut camera = None;
         let mut method = None;
         let mut frames = None;
+        let mut family = None;
         let mut density_max = None;
         let mut density_floor = None;
         let mut gamma = None;
@@ -264,6 +298,7 @@ impl Profile {
                 "camera" => camera = Some(unquote(line, key, value)?),
                 "method" => method = Some(Method::parse(line, key, value)?),
                 "frames" => frames = Some(parse_u32(line, key, value)?),
+                "family" => family = Some(parse_family(line, key, value)?),
                 "density_max" => density_max = Some(parse_floats::<3>(line, key, value)?),
                 "density_floor" => density_floor = Some(parse_floats::<3>(line, key, value)?),
                 "gamma" => gamma = Some(parse_floats::<3>(line, key, value)?),
@@ -295,6 +330,7 @@ impl Profile {
             camera: camera.ok_or(ParseError::MissingKey { key: "camera" })?,
             method: method.ok_or(ParseError::MissingKey { key: "method" })?,
             frames: frames.ok_or(ParseError::MissingKey { key: "frames" })?,
+            family,
             settings: Settings {
                 // A parsed profile's bounds are explicit by definition.
                 density_max: Some(
@@ -398,6 +434,7 @@ mod tests {
             camera: "Sony ILCE-6000".to_owned(),
             method: Method::Fitted,
             frames: 12,
+            family: None,
             settings: Settings {
                 density_max: Some([1.85, 1.92, 1.74]),
                 density_floor: None,
@@ -584,5 +621,37 @@ mod tests {
         let parsed = Profile::parse(&profile.to_string()).expect("should parse");
         assert_eq!(parsed.film, profile.film);
         assert_eq!(parsed.camera, profile.camera);
+    }
+
+    #[test]
+    fn family_round_trips_with_each_value() {
+        for family in [
+            FilmMode::ColorNegative,
+            FilmMode::BlackAndWhite,
+            FilmMode::Slide,
+        ] {
+            let mut profile = sample();
+            profile.family = Some(family);
+            let parsed = Profile::parse(&profile.to_string()).expect("should parse");
+            assert_eq!(parsed.family, Some(family));
+        }
+    }
+
+    #[test]
+    fn profile_without_family_round_trips() {
+        let mut profile = sample();
+        profile.family = None;
+        let parsed = Profile::parse(&profile.to_string()).expect("should parse");
+        assert_eq!(parsed.family, None);
+    }
+
+    #[test]
+    fn unknown_family_value_is_rejected() {
+        let text = "version = 1\nfilm = \"x\"\ncamera = \"y\"\nmethod = fitted\nframes = 3\n\
+                    family = e6\ndensity_max = 1 2 3\ncrosstalk = 1 0 0 0 1 0 0 0 1\n";
+        assert!(matches!(
+            Profile::parse(text),
+            Err(ParseError::BadValue { line: 6, .. })
+        ));
     }
 }

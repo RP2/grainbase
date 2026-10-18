@@ -26,6 +26,7 @@ pub mod fit;
 pub mod meter;
 pub mod percentile;
 pub mod slide;
+pub mod wedge;
 
 pub use film_base::FilmBase;
 pub use meter::{LAD_CAMERA_NEGATIVE, Metering};

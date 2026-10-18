@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use grainbase::decode;
 use grainbase::driver::{FilmMode, Flips, Job, run};
 use grainbase::geometry;
-use grainbase::pipeline::{FilmBase, Settings, film_base};
+use grainbase::pipeline::{FilmBase, Settings, film_base, wedge};
 use grainbase::profile::Profile;
 
 /// Convert camera-scanned film negatives into finished positives.
@@ -23,18 +23,17 @@ use grainbase::profile::Profile;
               mirrors, and the diagnostic overlay"
 )]
 #[command(name = "grainbase", version, about, long_about = None)]
-#[command(subcommand_negates_reqs = true)]
 struct Cli {
-    /// Fit a calibration profile from a `ColorChecker` capture.
+    /// A calibration subcommand. When absent, the conversion below runs.
     #[command(subcommand)]
     command: Option<Command>,
 
     /// Folder of camera RAW scans. Treated as one roll.
-    input: PathBuf,
+    input: Option<PathBuf>,
 
     /// Folder for the finished positives. Mirrors the input tree.
     #[arg(short, long)]
-    out: PathBuf,
+    out: Option<PathBuf>,
 
     /// Which film the scans are.
     #[arg(long, value_enum, default_value_t = Mode::ColorNegative)]
@@ -129,6 +128,8 @@ struct Cli {
 enum Command {
     /// Fit a calibration profile from a ColorChecker-class chart capture.
     Fit(FitArgs),
+    /// Fit a rig calibration profile from a neutral gray-wedge capture.
+    CalibrateRig(CalibrateRigArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -164,15 +165,52 @@ struct FitArgs {
     /// uncropped scan. Overrides the automatic rebate-region detector.
     #[arg(long, value_parser = parse_base_sample)]
     base_sample: Option<[f32; 4]>,
+}
 
-    /// Write a diagnostic overlay beside each positive: the scan with the
-    /// frame, the sprocket bands, and the film-base probe points drawn on it.
-    ///
-    /// Irreplaceable when a conversion comes out wrong: it shows exactly where
-    /// the pipeline looked. Yellow probes are the ones the film base was read
-    /// from; magenta probes disagreed with the rest and were ignored.
+#[derive(Debug, Parser)]
+#[command(group = clap::ArgGroup::new("wedge").required(true).args(["wedge_card", "wedge_steps"]))]
+struct CalibrateRigArgs {
+    /// Process family this rig calibration is for.
+    #[arg(long, value_enum)]
+    family: Family,
+
+    /// Registered wedge card to use.
     #[arg(long)]
-    overlay: bool,
+    wedge_card: Option<String>,
+
+    /// Wedge step reflection densities, lightest to darkest, comma-separated.
+    #[arg(long, value_name = "D,D,..", value_parser = parse_wedge_steps)]
+    wedge_steps: Option<Vec<f32>>,
+
+    /// Camera RAW capture of the gray wedge.
+    capture: PathBuf,
+
+    /// Camera or rig the profile was captured on.
+    ///
+    /// Defaults to the decoded camera make and model.
+    #[arg(long)]
+    camera: Option<String>,
+
+    /// Mirror the capture left to right.
+    #[arg(long)]
+    flip_h: bool,
+
+    /// Mirror the capture top to bottom.
+    #[arg(long)]
+    flip_v: bool,
+
+    /// The film base by hand, as per-channel transmittance `r,g,b`.
+    #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
+    film_base: Option<[f32; 3]>,
+
+    /// Output profile path. Defaults to `<capture stem>.profile`.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Authoritative base sample rectangle, as fractions `x0,y0,x1,y1` of the
+    /// uncropped scan. Overrides the automatic rebate-region detector.
+    #[arg(long, value_parser = parse_base_sample)]
+    base_sample: Option<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -195,30 +233,82 @@ impl From<Mode> for FilmMode {
     }
 }
 
+/// Process family a rig calibration is scoped to.
+///
+/// Spelled as the profile's own `family` keyword (`c41`, `bw`, `slide`), with
+/// the `--mode` spelling accepted as an alias so a caller does not have to
+/// remember two vocabularies for the same thing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum Family {
+    /// Color negative film.
+    #[value(name = "c41", alias = "color-negative")]
+    C41,
+    /// Black-and-white negative film.
+    #[value(name = "bw", alias = "black-and-white")]
+    Bw,
+    /// Slide (E-6) film.
+    #[value(name = "slide")]
+    Slide,
+}
+
+impl From<Family> for FilmMode {
+    fn from(family: Family) -> Self {
+        match family {
+            Family::C41 => FilmMode::ColorNegative,
+            Family::Bw => FilmMode::BlackAndWhite,
+            Family::Slide => FilmMode::Slide,
+        }
+    }
+}
+
+/// Human-readable name for a film family, used in warnings.
+fn family_name(family: FilmMode) -> &'static str {
+    match family {
+        FilmMode::ColorNegative => "color-negative",
+        FilmMode::BlackAndWhite => "black-and-white",
+        FilmMode::Slide => "slide",
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if let Some(Command::Fit(args)) = cli.command {
-        return run_fit(args);
+    match cli.command {
+        Some(Command::Fit(args)) => return run_fit(args),
+        Some(Command::CalibrateRig(args)) => return run_calibrate_rig(args),
+        None => {}
     }
 
-    let settings = match load_profile(cli.profile.as_deref()).map(|settings| Settings {
-        density_max: cli.density_max.or(settings.density_max),
-        density_floor: cli.density_floor.or(settings.density_floor),
-        gamma: cli.gamma.or(settings.gamma),
-        pivot_density: cli.pivot_density.or(settings.pivot_density),
-        ..settings
-    }) {
-        Ok(settings) => settings,
-        Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::FAILURE;
-        }
+    // clap does not exempt the parent's positionals when a subcommand runs
+    // (`subcommand_negates_reqs` did not take effect on 4.6.7), so the
+    // conversion inputs are optional at the type level and required here.
+    let (Some(input), Some(output)) = (cli.input, cli.out) else {
+        eprintln!(
+            "a conversion needs an input folder and --out\n\n\
+             usage: grainbase <input> --out <out> [options]\n       \
+             grainbase <command> --help"
+        );
+        return ExitCode::FAILURE;
     };
 
+    let settings =
+        match load_profile(cli.profile.as_deref(), cli.mode.into()).map(|settings| Settings {
+            density_max: cli.density_max.or(settings.density_max),
+            density_floor: cli.density_floor.or(settings.density_floor),
+            gamma: cli.gamma.or(settings.gamma),
+            pivot_density: cli.pivot_density.or(settings.pivot_density),
+            ..settings
+        }) {
+            Ok(settings) => settings,
+            Err(message) => {
+                eprintln!("{message}");
+                return ExitCode::FAILURE;
+            }
+        };
+
     let report = run(&Job {
-        input: cli.input,
-        output: cli.out,
+        input,
+        output,
         mode: cli.mode.into(),
         settings,
         crop: cli.crop,
@@ -278,33 +368,13 @@ fn run_fit(args: FitArgs) -> ExitCode {
         vertical: args.flip_v,
     });
 
-    // Find the frame, then measure the base on the still-uncropped scan, by
-    // the documented source precedence (spec step 3).
-    let frame = geometry::find(&uncropped).unwrap_or_else(|| geometry::Frame::whole(&uncropped));
-    println!(
-        "frame: centre {:.0},{:.0}  size {:.0}x{:.0}  skew {:.4} rad ({:.2} deg)",
-        frame.center[0],
-        frame.center[1],
-        frame.size[0],
-        frame.size[1],
-        frame.skew,
-        frame.skew.to_degrees()
-    );
-
-    let base = if let Some(values) = args.film_base {
-        FilmBase {
-            transmittance: values.map(|value| value.max(f32::MIN_POSITIVE)),
+    let frame = calibration_frame(&uncropped);
+    let base = match calibration_base(&uncropped, &frame, args.film_base, args.base_sample) {
+        Ok(base) => base,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
         }
-    } else if let Some(rect) = args.base_sample {
-        FilmBase::detect_in_rect(&uncropped, rect, film_base::DEFAULT_PERCENTILE)
-    } else if let Some(base) = measured_between_sprockets(&uncropped, &frame) {
-        base
-    } else {
-        eprintln!(
-            "no film base could be measured: the scan shows no sprocket bands to measure \
-             between. Pass --film-base r,g,b or --base-sample x0,y0,x1,y1."
-        );
-        return ExitCode::FAILURE;
     };
 
     let image = geometry::apply(&uncropped, &frame);
@@ -326,32 +396,203 @@ fn run_fit(args: FitArgs) -> ExitCode {
             }
         };
 
-    let text = profile.to_string();
-    if let Err(err) = Profile::parse(&text) {
-        eprintln!("generated profile does not round-trip: {err}");
-        return ExitCode::FAILURE;
-    }
-
-    let output = args
-        .out
-        .unwrap_or_else(|| default_profile_path(&args.capture));
-    if let Some(parent) = output.parent()
-        && let Err(err) = fs::create_dir_all(parent)
-    {
-        eprintln!(
-            "could not create output directory {}: {err}",
-            parent.display()
-        );
-        return ExitCode::FAILURE;
-    }
-    if let Err(err) = fs::write(&output, text) {
-        eprintln!("could not write {}: {err}", output.display());
-        return ExitCode::FAILURE;
-    }
+    let output = match write_profile(&profile, args.out, &args.capture) {
+        Ok(output) => output,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     print_fit_summary(&profile);
     println!("wrote {}", output.display());
     ExitCode::SUCCESS
+}
+
+/// Fits a rig-scoped profile from a gray-wedge capture and writes it to disk.
+fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
+    let scan = match decode::decode(&args.capture) {
+        Ok(scan) => scan,
+        Err(err) => {
+            eprintln!("could not decode {}: {err}", args.capture.display());
+            return ExitCode::FAILURE;
+        }
+    };
+
+    println!(
+        "decoded {}x{} from {} {} (EXIF orientation {:?})",
+        scan.linear.width,
+        scan.linear.height,
+        scan.meta.make,
+        scan.meta.model,
+        scan.meta.orientation
+    );
+
+    // Orientation first (spec step 1): the flips are the operator's decision
+    // about which side of the film faced the lens, applied before anything
+    // is detected.
+    let uncropped = scan.linear.flipped(Flips {
+        horizontal: args.flip_h,
+        vertical: args.flip_v,
+    });
+
+    let frame = calibration_frame(&uncropped);
+    let base = match calibration_base(&uncropped, &frame, args.film_base, args.base_sample) {
+        Ok(base) => base,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let image = geometry::apply(&uncropped, &frame);
+
+    let steps = if let Some(card_name) = &args.wedge_card {
+        wedge::card(card_name)
+            .map(|card| card.steps.to_vec())
+            .ok_or_else(|| {
+                format!(
+                    "unknown wedge card `{card_name}`; known cards: {}",
+                    wedge::card_names().join(", ")
+                )
+            })
+    } else if let Some(steps) = args.wedge_steps {
+        Ok(steps)
+    } else {
+        // The clap group guarantees one of the two is present.
+        unreachable!("--wedge-card or --wedge-steps is required")
+    };
+    let steps = match steps {
+        Ok(steps) => steps,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let measurement = match wedge::measure(&image, &base, &steps) {
+        Ok(measurement) => measurement,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let family = args.family.into();
+    let rig = args.camera.unwrap_or_else(|| {
+        let make = scan.meta.make.trim();
+        let model = scan.meta.model.trim();
+        if make.is_empty() && model.is_empty() {
+            "unknown-rig".to_owned()
+        } else if make.is_empty() {
+            model.to_owned()
+        } else if model.is_empty() {
+            make.to_owned()
+        } else {
+            format!("{make} {model}")
+        }
+    });
+
+    let profile = match wedge::profile(&measurement, family, &rig) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let output = match write_profile(&profile, args.out, &args.capture) {
+        Ok(output) => output,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    print_calibrate_rig_summary(&profile, &measurement);
+    println!("wrote {}", output.display());
+    ExitCode::SUCCESS
+}
+
+/// Finds the frame and reports it, identically for every calibration capture.
+///
+/// Orientation happens before this: the flips are the operator's decision about
+/// which side of the film faced the lens, and are applied before anything is
+/// detected.
+fn calibration_frame(image: &grainbase::LinearImage) -> geometry::Frame {
+    let frame = geometry::find(image).unwrap_or_else(|| geometry::Frame::whole(image));
+    println!(
+        "frame: center {:.0},{:.0}  size {:.0}x{:.0}  skew {:.4} rad ({:.2} deg)",
+        frame.center[0],
+        frame.center[1],
+        frame.size[0],
+        frame.size[1],
+        frame.skew,
+        frame.skew.to_degrees()
+    );
+    frame
+}
+
+/// Measures the calibration base on the still-uncropped scan.
+///
+/// The documented source precedence (spec step 3): hand-supplied values, then a
+/// hand-placed rectangle, then the film between the punch bands. A scan with
+/// none of those is refused — a calibration fitted on an invented base would be
+/// wrong in silence.
+fn calibration_base(
+    image: &grainbase::LinearImage,
+    frame: &geometry::Frame,
+    film_base: Option<[f32; 3]>,
+    base_sample: Option<[f32; 4]>,
+) -> Result<FilmBase, String> {
+    if let Some(values) = film_base {
+        return Ok(FilmBase {
+            transmittance: values.map(|value| value.max(f32::MIN_POSITIVE)),
+        });
+    }
+    if let Some(rect) = base_sample {
+        return Ok(FilmBase::detect_in_rect(
+            image,
+            rect,
+            film_base::DEFAULT_PERCENTILE,
+        ));
+    }
+    if let Some(base) = measured_between_sprockets(image, frame) {
+        return Ok(base);
+    }
+    Err(
+        "no film base could be measured: the scan shows no sprocket bands to measure \
+         between. Pass --film-base r,g,b or --base-sample x0,y0,x1,y1."
+            .to_owned(),
+    )
+}
+
+/// Verifies that a profile round-trips and writes it, reporting where it went.
+///
+/// The round trip is not ceremony: a profile the reader cannot parse is worse
+/// than no profile, because the write would look like success.
+fn write_profile(
+    profile: &Profile,
+    out: Option<PathBuf>,
+    capture: &Path,
+) -> Result<PathBuf, String> {
+    let text = profile.to_string();
+    if let Err(err) = Profile::parse(&text) {
+        return Err(format!("generated profile does not round-trip: {err}"));
+    }
+
+    let output = out.unwrap_or_else(|| default_profile_path(capture));
+    if let Some(parent) = output.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "could not create output directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    fs::write(&output, text)
+        .map_err(|err| format!("could not write {}: {err}", output.display()))?;
+    Ok(output)
 }
 
 /// The base measured from the film between the sprocket holes, or `None` when
@@ -403,6 +644,53 @@ fn print_fit_summary(profile: &Profile) {
     }
 }
 
+/// Prints the rig-calibration summary: family, rig, axis, steps, and the
+/// per-channel fit so a non-straight response is visible.
+fn print_calibrate_rig_summary(profile: &Profile, measurement: &wedge::Measurement) {
+    let floors = profile
+        .settings
+        .density_floor
+        .expect("a wedge fit emits floors");
+    let ceilings = profile
+        .settings
+        .density_max
+        .expect("a wedge fit emits ceilings");
+    let family = profile.family.expect("a rig profile carries a family");
+    let fit = wedge::fit(measurement).expect("measurement already succeeded");
+
+    println!(
+        "rig profile for {} on {}",
+        family_name(family),
+        profile.camera
+    );
+    println!(
+        "  axis: {}  steps: {}",
+        match measurement.axis {
+            wedge::Axis::Vertical => "vertical",
+            wedge::Axis::Horizontal => "horizontal",
+        },
+        measurement.steps.len()
+    );
+    println!(
+        "  black point (density)  R {:.4}  G {:.4}  B {:.4}",
+        floors[0], floors[1], floors[2]
+    );
+    println!(
+        "  white point (density)  R {:.4}  G {:.4}  B {:.4}",
+        ceilings[0], ceilings[1], ceilings[2]
+    );
+    println!(
+        "  slope                  R {:.4}  G {:.4}  B {:.4}",
+        fit.slope[0], fit.slope[1], fit.slope[2]
+    );
+    println!(
+        "  straightness ratio     R {:.4}  G {:.4}  B {:.4}",
+        wedge::straightness_ratio(&fit, 0),
+        wedge::straightness_ratio(&fit, 1),
+        wedge::straightness_ratio(&fit, 2)
+    );
+}
+
 /// Parses `--base-sample x0,y0,x1,y1` as fractions of the image.
 fn parse_base_sample(text: &str) -> Result<[f32; 4], String> {
     let parts: Vec<&str> = text.split(',').collect();
@@ -435,12 +723,28 @@ fn parse_base_rgb(text: &str) -> Result<[f32; 3], String> {
     Ok(out)
 }
 
+/// Parses `--wedge-steps D,D,...` as reflection densities.
+fn parse_wedge_steps(text: &str) -> Result<Vec<f32>, String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() < 2 {
+        return Err("expected at least two comma-separated densities".to_owned());
+    }
+    parts
+        .iter()
+        .map(|part| {
+            part.trim()
+                .parse()
+                .map_err(|_| format!("`{part}` is not a number"))
+        })
+        .collect()
+}
+
 /// Reads a profile from disk, or falls back to neutral defaults.
 ///
 /// A profile that cannot be read is a hard error rather than a silent fallback:
 /// converting a whole roll with defaults because a path was mistyped would
 /// produce a folder of wrong output that looks deliberate.
-fn load_profile(path: Option<&Path>) -> Result<Settings, String> {
+fn load_profile(path: Option<&Path>, expected_family: FilmMode) -> Result<Settings, String> {
     let Some(path) = path else {
         return Ok(Settings::default());
     };
@@ -455,6 +759,16 @@ fn load_profile(path: Option<&Path>) -> Result<Settings, String> {
         "profile: {} on {} ({}), fitted from {} frame(s)",
         profile.film, profile.camera, profile.method, profile.frames
     );
+
+    if let Some(family) = profile.family
+        && family != expected_family
+    {
+        eprintln!(
+            "warning: profile family {} does not match job family {}",
+            family_name(family),
+            family_name(expected_family)
+        );
+    }
 
     Ok(profile.settings)
 }

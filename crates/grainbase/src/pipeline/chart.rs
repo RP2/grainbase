@@ -167,34 +167,34 @@ const MIN_DIMENSION: u32 = 80;
 /// Separators are clear film, so they read at or just below the base level.
 /// A small margin below base catches slight underexposure and noise without
 /// letting dark patch interiors qualify.
-const SEPARATOR_BRIGHTNESS: f32 = 0.90;
+pub(crate) const SEPARATOR_BRIGHTNESS: f32 = 0.90;
 
 /// Window size for smoothing the 1-D separator projection.
-const SMOOTH_RADIUS: usize = 1;
+pub(crate) const SMOOTH_RADIUS: usize = 1;
 
 /// Fraction of a cell's width/height left as margin outside the sample window.
 ///
 /// The central 50% of each cell is averaged, keeping the bright separator
 /// borders out of the measurement.
-const SAMPLE_INSET: f32 = 0.25;
+pub(crate) const SAMPLE_INSET: f32 = 0.25;
 
 /// Maximum allowed ratio of max sample to mean sample inside a patch window.
 ///
 /// A uniform patch gives a ratio near 1.0; a window that crosses a separator
 /// or edge gives a much larger ratio. The bound is generous to tolerate real
 /// grain while still catching a misaligned grid.
-const MAX_SPREAD_RATIO: f32 = 2.5;
+pub(crate) const MAX_SPREAD_RATIO: f32 = 2.5;
 
 /// Minimum fraction of the projection axis that must read as separator along
 /// the detected lines for the lattice to be trusted.
 ///
 /// Real separators span almost the full axis; a random-noise image cannot
 /// produce a coherent set of equally spaced lines that scores this high.
-const MIN_LINE_FILL: f32 = 0.70;
+pub(crate) const MIN_LINE_FILL: f32 = 0.70;
 
 /// Maximum proportional deviation of detected spacing from the ideal equal
 /// spacing for a card that fills the frame.
-const MAX_SPACING_TOL: f32 = 0.15;
+pub(crate) const MAX_SPACING_TOL: f32 = 0.15;
 
 /// Locates the `ColorChecker` grid in `image` and measures per-patch densities.
 ///
@@ -243,13 +243,14 @@ fn detect_lattice(
     let (vertical_proj, horizontal_proj) = separator_projections(image, threshold);
 
     let vertical =
-        find_lines_1d(&vertical_proj, COLS + 1).map_err(|reason| ChartError::NoLattice {
+        find_lines_1d(&vertical_proj, COLS + 1, COLS).map_err(|reason| ChartError::NoLattice {
             reason: format!("vertical separators: {reason}"),
         })?;
-    let horizontal =
-        find_lines_1d(&horizontal_proj, ROWS + 1).map_err(|reason| ChartError::NoLattice {
+    let horizontal = find_lines_1d(&horizontal_proj, ROWS + 1, COLS).map_err(|reason| {
+        ChartError::NoLattice {
             reason: format!("horizontal separators: {reason}"),
-        })?;
+        }
+    })?;
 
     Ok((vertical, horizontal))
 }
@@ -259,7 +260,7 @@ fn detect_lattice(
 /// A pixel qualifies as separator-like when all three channels are above the
 /// threshold. Using the least channel would let a bright channel from a colored
 /// patch qualify; requiring all channels keeps the bar on clear film.
-fn separator_projections(image: &LinearImage, threshold: f32) -> (Vec<f32>, Vec<f32>) {
+pub(crate) fn separator_projections(image: &LinearImage, threshold: f32) -> (Vec<f32>, Vec<f32>) {
     let width = image.width as usize;
     let height = image.height as usize;
     let (pixels, _remainder) = image.data.as_chunks::<3>();
@@ -290,7 +291,11 @@ fn separator_projections(image: &LinearImage, threshold: f32) -> (Vec<f32>, Vec<
     clippy::cast_precision_loss,
     reason = "search indices are bounded by the small projection length"
 )]
-fn find_lines_1d(projection: &[f32], count: usize) -> Result<Vec<f32>, String> {
+pub(crate) fn find_lines_1d(
+    projection: &[f32],
+    count: usize,
+    cell_count: usize,
+) -> Result<Vec<f32>, String> {
     if count < 2 || projection.len() < count {
         return Err("projection too short".to_owned());
     }
@@ -307,7 +312,13 @@ fn find_lines_1d(projection: &[f32], count: usize) -> Result<Vec<f32>, String> {
     let ideal_step = len as f32 / (count - 1) as f32;
     let step_min = ideal_step * (1.0 - MAX_SPACING_TOL);
     let step_max = ideal_step * (1.0 + MAX_SPACING_TOL);
-    let start_max = ideal_step * 0.5;
+    // A lattice's offset is periodic in its spacing: an offset of one full
+    // period is the same set of lines, so the search covers a whole period
+    // rather than half of one. Half a period assumes the card fills the axis to
+    // within half a cell, which a real capture — and a 20-step wedge in
+    // particular — does not guarantee, and a missed offset then refines onto
+    // cell edges instead of separators.
+    let start_max = ideal_step;
 
     let mut best_score = f32::NEG_INFINITY;
     let mut best_lines: Option<Vec<f32>> = None;
@@ -339,7 +350,7 @@ fn find_lines_1d(projection: &[f32], count: usize) -> Result<Vec<f32>, String> {
     // Refine each line to the nearest local maximum in the smoothed projection.
     let refined: Vec<f32> = lines
         .iter()
-        .map(|&pos| refine_to_peak(&smoothed, pos))
+        .map(|&pos| refine_to_peak(&smoothed, pos, cell_count))
         .collect();
 
     let refined_score = refined
@@ -371,7 +382,7 @@ fn find_lines_1d(projection: &[f32], count: usize) -> Result<Vec<f32>, String> {
     clippy::cast_sign_loss,
     reason = "interpolation indices are clamped to the projection bounds"
 )]
-fn sample_smooth(smoothed: &[f32], pos: f32) -> f32 {
+pub(crate) fn sample_smooth(smoothed: &[f32], pos: f32) -> f32 {
     let len = smoothed.len();
     if len == 0 {
         return 0.0;
@@ -390,10 +401,10 @@ fn sample_smooth(smoothed: &[f32], pos: f32) -> f32 {
     clippy::cast_sign_loss,
     reason = "projection indices are small positive integers derived from the image width"
 )]
-fn refine_to_peak(smoothed: &[f32], pos: f32) -> f32 {
+pub(crate) fn refine_to_peak(smoothed: &[f32], pos: f32, cell_count: usize) -> f32 {
     let len = smoothed.len();
     let center = pos.round().clamp(0.0, (len - 1) as f32) as usize;
-    let search_radius = (len as f32 / (COLS as f32 * 4.0)).max(2.0) as usize;
+    let search_radius = (len as f32 / (cell_count as f32 * 4.0)).max(2.0) as usize;
 
     let mut best = center;
     let mut best_value = smoothed[center];
@@ -427,7 +438,7 @@ fn refine_to_peak(smoothed: &[f32], pos: f32) -> f32 {
     clippy::cast_precision_loss,
     reason = "the box count is a small positive integer, well within f32 precision"
 )]
-fn smooth(values: &[f32], radius: usize) -> Vec<f32> {
+pub(crate) fn smooth(values: &[f32], radius: usize) -> Vec<f32> {
     if values.is_empty() {
         return Vec::new();
     }
@@ -447,7 +458,7 @@ fn smooth(values: &[f32], radius: usize) -> Vec<f32> {
     clippy::cast_precision_loss,
     reason = "the search grid count is a small integer"
 )]
-fn linspace(start: f32, end: f32, n: usize) -> impl Iterator<Item = f32> {
+pub(crate) fn linspace(start: f32, end: f32, n: usize) -> impl Iterator<Item = f32> {
     if n <= 1 {
         return vec![start].into_iter();
     }
@@ -501,11 +512,11 @@ fn sample_cells(
 
 /// A rectangular sample window in fractional pixel coordinates.
 #[derive(Clone, Copy)]
-struct Window {
-    x0: f32,
-    x1: f32,
-    y0: f32,
-    y1: f32,
+pub(crate) struct Window {
+    pub(crate) x0: f32,
+    pub(crate) x1: f32,
+    pub(crate) y0: f32,
+    pub(crate) y1: f32,
 }
 
 /// Averages transmittance over a window and returns optical density.
@@ -518,7 +529,11 @@ struct Window {
     clippy::cast_sign_loss,
     reason = "window bounds are clamped to non-negative image dimensions before truncation"
 )]
-fn sample_window(image: &LinearImage, base: &FilmBase, window: &Window) -> Result<[f32; 3], usize> {
+pub(crate) fn sample_window(
+    image: &LinearImage,
+    base: &FilmBase,
+    window: &Window,
+) -> Result<[f32; 3], usize> {
     let width = image.width as usize;
     let height = image.height as usize;
     let (pixels, _remainder) = image.data.as_chunks::<3>();
@@ -671,6 +686,7 @@ pub fn fit_capture(
     Ok(Profile {
         film: film.to_owned(),
         camera: camera.to_owned(),
+        family: None,
         method: Method::Fitted,
         frames: 1,
         settings,
