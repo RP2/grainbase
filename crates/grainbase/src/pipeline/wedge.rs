@@ -8,7 +8,7 @@
 //!
 //! Detection has two paths. A wedge whose steps are separated by dark lines
 //! (which read as clear film on a negative) is located with the same 1-D lattice
-//! machinery as [`chart`](super::chart). A printed gray scale whose steps abut —
+//! machinery as [`chart`]. A printed gray scale whose steps abut —
 //! the Kodak Q-13/Q-14 shape — has no such lines, so the frame is divided into
 //! equal cells instead, which requires the strip to fill the exposure. Both
 //! paths try a vertical layout (steps left-to-right) and then a horizontal one
@@ -38,49 +38,79 @@ use std::fmt;
 
 use crate::image::LinearImage;
 use crate::pipeline::FilmBase;
+use crate::pipeline::chart;
 use crate::pipeline::chart::{SAMPLE_INSET, SEPARATOR_BRIGHTNESS};
 use crate::pipeline::chart::{Window, find_lines_1d, sample_window, separator_projections};
 use crate::profile::{Method, Profile};
 
-/// A registered gray-wedge card: named reflection-density steps plus citation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// How a registered card is laid out, which decides how it is found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CardLayout {
+    /// A 1-D strip of neutral steps across the frame.
+    Strip,
+    /// The neutral row of a `ColorChecker` Classic, inside the chart's grid.
+    ChartNeutralRow,
+}
+
+/// A registered neutral card: named reflection-density steps plus citation.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WedgeCard {
     /// Registry name used with `--wedge-card`.
     pub name: &'static str,
     /// Nominal reflection density of each step, lightest to darkest.
-    pub steps: &'static [f32],
+    pub steps: Vec<f32>,
     /// Where the step values come from.
     pub cite: &'static str,
+    /// How the card is laid out.
+    pub layout: CardLayout,
 }
 
-/// Kodak Gray Scale (Q-13 / Q-14) neutral wedge.
+/// Kodak Gray Scale (Q-13 / Q-14) neutral wedge, and where its numbers come from.
+const KODAK_STEPS: &[f32] = &[
+    0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15, 1.25, 1.35, 1.45, 1.55,
+    1.65, 1.75, 1.85, 1.95,
+];
+const KODAK_CITE: &str = "Kodak Gray Scale, Q-13 / Q-14 (Kodak Publication No. Q-14): 20 neutral \
+                          steps in nominal 0.10 reflection-density increments, white ~0.05 to \
+                          black ~1.95.";
+
+/// The `ColorChecker` Classic neutral row, and where its numbers come from.
+const NEUTRAL_ROW_CITE: &str = "Gretag-Macbeth / X-Rite published ColorChecker Classic neutral \
+                                row: six neutral patches whose published sRGB values are \
+                                linearized through IEC 61966-2-1, the same convention the \
+                                chromatic patches are fitted under.";
+
+/// Every registered card name, in the order a help message should list them.
+const CARD_NAMES: &[&str] = &["kodak-gray-scale", "colorchecker-neutral-row"];
+
+/// Looks up a registered card by name.
 ///
-/// Kodak Gray Scale, Q-13 / Q-14 (Kodak Publication No. Q-14): 20 neutral steps
-/// in nominal 0.10 reflection-density increments, white ~0.05 to black ~1.95.
-const KODAK_GRAY_SCALE: WedgeCard = WedgeCard {
-    name: "kodak-gray-scale",
-    steps: &[
-        0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95, 1.05, 1.15, 1.25, 1.35, 1.45,
-        1.55, 1.65, 1.75, 1.85, 1.95,
-    ],
-    cite: "Kodak Gray Scale, Q-13 / Q-14 (Kodak Publication No. Q-14): 20 neutral \
-           steps in nominal 0.10 reflection-density increments, white ~0.05 to \
-           black ~1.95.",
-};
-
-/// All wedge cards shipped with the engine.
-const CARDS: &[WedgeCard] = &[KODAK_GRAY_SCALE];
-
-/// Looks up a registered wedge card by name.
+/// The `ColorChecker` neutral row's step densities are *derived* from the
+/// published patch values at this point rather than copied here, so the numbers
+/// cannot drift from the citation.
 #[must_use]
-pub fn card(name: &str) -> Option<&'static WedgeCard> {
-    CARDS.iter().find(|card| card.name == name)
+pub fn card(name: &str) -> Option<WedgeCard> {
+    match name {
+        "kodak-gray-scale" => Some(WedgeCard {
+            name: "kodak-gray-scale",
+            steps: KODAK_STEPS.to_vec(),
+            cite: KODAK_CITE,
+            layout: CardLayout::Strip,
+        }),
+        "colorchecker-neutral-row" => Some(WedgeCard {
+            name: "colorchecker-neutral-row",
+            steps: chart::neutral_row_densities().to_vec(),
+            cite: NEUTRAL_ROW_CITE,
+            layout: CardLayout::ChartNeutralRow,
+        }),
+        _ => None,
+    }
 }
 
-/// Names of all registered wedge cards, for error messages.
+/// Names of all registered cards, for error messages.
 #[must_use]
-pub fn card_names() -> Vec<&'static str> {
-    CARDS.iter().map(|card| card.name).collect()
+pub fn card_names() -> &'static [&'static str] {
+    CARD_NAMES
 }
 
 /// Which way the wedge steps run across the frame.
@@ -140,6 +170,8 @@ pub enum WedgeError {
         /// Channel that failed the spread gate.
         channel: usize,
     },
+    /// The chart a neutral row belongs to could not be measured.
+    Chart(crate::pipeline::chart::ChartError),
     /// The fit collapsed (all nominal densities equal, or all measured
     /// densities equal).
     DegenerateFit,
@@ -151,10 +183,10 @@ impl fmt::Display for WedgeError {
             Self::TooFewSteps { got } => {
                 write!(f, "a wedge needs at least 2 steps, got {got}")
             }
-            Self::NoLattice { reason } => write!(
-                f,
-                "could not locate the wedge separators: {reason}. Check that the wedge fills the frame, is in focus, and is evenly lit."
-            ),
+            Self::NoLattice { reason } => {
+                write!(f, "could not locate the neutral steps: {reason}")
+            }
+            Self::Chart(err) => write!(f, "{err}"),
             Self::StepSpread { step, channel } => write!(
                 f,
                 "step {step} has uneven samples in channel {channel}; the grid may be misaligned"
@@ -267,7 +299,7 @@ pub fn measure(
 
     Err(WedgeError::NoLattice {
         reason: "no evenly spaced separator lattice or varying step sequence was found in \
-                 either direction"
+                 either direction; a contiguous strip has to fill the exposure and be evenly lit"
             .to_owned(),
     })
 }
@@ -322,6 +354,56 @@ fn steps_differ(cells: &[[f32; 3]]) -> bool {
     }
 
     widest > MIN_STEP_SPREAD
+}
+
+/// Measures a registered card, by the detection its layout calls for.
+///
+/// # Errors
+///
+/// Propagates [`WedgeError`] from the detection the card's layout selects.
+pub fn measure_for_card(
+    image: &LinearImage,
+    base: &FilmBase,
+    card: &WedgeCard,
+) -> Result<Measurement, WedgeError> {
+    match card.layout {
+        CardLayout::Strip => measure(image, base, &card.steps),
+        CardLayout::ChartNeutralRow => measure_chart_neutral_row(image, base, &card.steps),
+    }
+}
+
+/// Reads the neutral row out of a `ColorChecker` Classic capture.
+///
+/// The row is the chart's own white-to-black ramp, so the chart detector does the
+/// locating and this takes its bottom row. A chart is found anywhere in the
+/// frame, which is what makes this the practical neutral reference: the card does
+/// not have to fill the frame, and it is the same capture the stock fit uses.
+fn measure_chart_neutral_row(
+    image: &LinearImage,
+    base: &FilmBase,
+    steps: &[f32],
+) -> Result<Measurement, WedgeError> {
+    let chart = chart::measure(image, base).map_err(WedgeError::Chart)?;
+    let cells: Vec<[f32; 3]> = chart.cells[chart::NEUTRAL_ROW_START..].to_vec();
+    if cells.len() != steps.len() {
+        return Err(WedgeError::NoLattice {
+            reason: format!(
+                "the chart's neutral row has {} patches, the card lists {}",
+                cells.len(),
+                steps.len()
+            ),
+        });
+    }
+    if !steps_differ(&cells) {
+        return Err(WedgeError::NoLattice {
+            reason: "the chart's neutral row does not span a density range".to_owned(),
+        });
+    }
+    Ok(Measurement {
+        cells,
+        steps: steps.to_vec(),
+        axis: Axis::Vertical,
+    })
 }
 
 /// Tries to find `steps + 1` evenly spaced lines in one projection.
@@ -711,13 +793,33 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_name_resolves_and_the_neutral_row_spans_a_range() {
+        for name in card_names() {
+            let registered =
+                card(name).unwrap_or_else(|| panic!("`{name}` is listed but not registered"));
+            assert_eq!(registered.name, *name);
+            assert!(
+                registered.steps.len() >= 2,
+                "`{name}` needs at least two steps"
+            );
+            assert!(!registered.cite.is_empty(), "`{name}` needs a citation");
+        }
+
+        let row = card("colorchecker-neutral-row").expect("registered");
+        assert_eq!(row.layout, CardLayout::ChartNeutralRow);
+        assert_eq!(row.steps.len(), 6);
+        let span = row.steps[5] - row.steps[0];
+        assert!(span > 1.0, "the row should span white to black, got {span}");
+    }
+
+    #[test]
     fn synthetic_wedge_recovers_known_floor_and_ceiling() {
         let steps = card("kodak-gray-scale").unwrap().steps;
         let floor = [0.25f32, 0.30, 0.35];
         let ceiling = [1.80f32, 1.90, 2.00];
-        let (image, base) = synthetic_wedge(steps, floor, ceiling, SEPARATOR_SHARE);
+        let (image, base) = synthetic_wedge(&steps, floor, ceiling, SEPARATOR_SHARE);
 
-        let measurement = measure(&image, &base, steps).expect("wedge should be found");
+        let measurement = measure(&image, &base, &steps).expect("wedge should be found");
         assert_eq!(measurement.cells.len(), steps.len());
         assert_eq!(measurement.axis, Axis::Vertical);
 

@@ -409,6 +409,14 @@ fn run_fit(args: FitArgs) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Where the rig calibration's neutral steps come from.
+enum WedgeSource {
+    /// A registered card, which knows its own step values and how to find itself.
+    Card(wedge::WedgeCard),
+    /// Step densities given on the command line, found as a 1-D strip.
+    Steps(Vec<f32>),
+}
+
 /// Fits a rig-scoped profile from a gray-wedge capture and writes it to disk.
 fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
     let scan = match decode::decode(&args.capture) {
@@ -447,30 +455,30 @@ fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
 
     let image = geometry::apply(&uncropped, &frame);
 
-    let steps = if let Some(card_name) = &args.wedge_card {
-        wedge::card(card_name)
-            .map(|card| card.steps.to_vec())
-            .ok_or_else(|| {
-                format!(
-                    "unknown wedge card `{card_name}`; known cards: {}",
-                    wedge::card_names().join(", ")
-                )
-            })
+    // The card decides both the step values and how the card is found, so a
+    // registered card is carried as a card rather than flattened to its steps.
+    let source = if let Some(card_name) = &args.wedge_card {
+        if let Some(card) = wedge::card(card_name) {
+            WedgeSource::Card(card)
+        } else {
+            eprintln!(
+                "unknown wedge card `{card_name}`; known cards: {}",
+                wedge::card_names().join(", ")
+            );
+            return ExitCode::FAILURE;
+        }
     } else if let Some(steps) = args.wedge_steps {
-        Ok(steps)
+        WedgeSource::Steps(steps)
     } else {
         // The clap group guarantees one of the two is present.
         unreachable!("--wedge-card or --wedge-steps is required")
     };
-    let steps = match steps {
-        Ok(steps) => steps,
-        Err(message) => {
-            eprintln!("{message}");
-            return ExitCode::FAILURE;
-        }
-    };
 
-    let measurement = match wedge::measure(&image, &base, &steps) {
+    let measurement = match &source {
+        WedgeSource::Card(card) => wedge::measure_for_card(&image, &base, card),
+        WedgeSource::Steps(steps) => wedge::measure(&image, &base, steps),
+    };
+    let measurement = match measurement {
         Ok(measurement) => measurement,
         Err(err) => {
             eprintln!("{err}");

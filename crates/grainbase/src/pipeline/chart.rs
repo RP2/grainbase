@@ -152,6 +152,27 @@ fn srgb_eotf(nonlinear: f32) -> f32 {
     }
 }
 
+/// Index of the first patch of the `ColorChecker`'s neutral row (its bottom row).
+///
+/// The row is the chart's own white-to-black ramp, which is what makes it usable
+/// as a neutral reference without a second card.
+pub(crate) const NEUTRAL_ROW_START: usize = (ROWS - 1) * COLS;
+
+/// Reflection densities of the neutral row, derived from the published values.
+///
+/// The patches are neutral, so one channel carries them. A published sRGB value
+/// goes through the IEC 61966-2-1 EOTF to linear light — which for a diffuse
+/// patch under even light is its reflectance — and then to reflection density.
+/// Deriving rather than copying is what keeps these numbers tied to the citation
+/// in `docs/ATTRIBUTION.md`.
+#[must_use]
+pub(crate) fn neutral_row_densities() -> [f32; COLS] {
+    std::array::from_fn(|index| {
+        let reflectance = srgb_eotf(PATCHES_SRGB[NEUTRAL_ROW_START + index][0]);
+        -(reflectance.max(f32::MIN_POSITIVE)).log10()
+    })
+}
+
 /// Linear-light sRGB targets for the 18 chromatic patches.
 #[must_use]
 fn chromatic_targets() -> [[f32; 3]; 18] {
@@ -1253,6 +1274,40 @@ mod tests {
                     &format!("ceiling at span {span}"),
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_chart_neutral_row_feeds_the_rig_fit() {
+        // A ColorChecker capture has to serve both artifacts: the stock fit
+        // above, and the rig calibration from the chart's own white-to-black
+        // row. This lives here because the synthetic chart generator does.
+        //
+        // It checks the plumbing, not the numbers. The generator places the
+        // neutral row at print tones, so recovering the anchors would need a
+        // generator built on reflection densities; a real capture is the first
+        // honest test of that.
+        let floor = [0.25f32; 3];
+        let ceiling = [2.0f32; 3];
+        let settings = crate::pipeline::Settings {
+            density_max: Some(ceiling),
+            density_floor: Some(floor),
+            crosstalk: IDENTITY,
+            ..crate::pipeline::Settings::default()
+        };
+        let (image, base) = synthetic_checker_in_scene(&settings, [0.7, 0.7], [0.2, 0.6]);
+        let card = crate::pipeline::wedge::card("colorchecker-neutral-row").expect("registered");
+        let measurement = crate::pipeline::wedge::measure_for_card(&image, &base, &card)
+            .expect("the neutral row should be measured");
+        assert_eq!(measurement.cells.len(), 6);
+
+        let fit = crate::pipeline::wedge::fit(&measurement).expect("fit should succeed");
+        for channel in 0..3 {
+            assert!(
+                fit.slope[channel] < 0.0,
+                "a negative's density falls as the patch darkens, got {}",
+                fit.slope[channel]
+            );
         }
     }
 
