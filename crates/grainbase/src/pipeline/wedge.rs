@@ -6,11 +6,14 @@
 //! crosstalk. The resulting profile is therefore family-scoped (C-41, black and
 //! white, or slide) rather than stock-scoped.
 //!
-//! Detection reuses the 1-D lattice machinery from [`chart`](super::chart): a
-//! wedge fills the frame with equally wide neutral steps separated by bright
-//! clear-film lines. The detector tries a vertical lattice (steps left-to-right)
-//! and then a horizontal one (steps top-to-bottom), keeping the first that
-//! yields the expected number of evenly spaced separator lines.
+//! Detection has two paths. A wedge whose steps are separated by dark lines
+//! (which read as clear film on a negative) is located with the same 1-D lattice
+//! machinery as [`chart`](super::chart). A printed gray scale whose steps abut —
+//! the Kodak Q-13/Q-14 shape — has no such lines, so the frame is divided into
+//! equal cells instead, which requires the strip to fill the exposure. Both
+//! paths try a vertical layout (steps left-to-right) and then a horizontal one
+//! (steps top-to-bottom), and the axis is chosen by whether the sampled steps
+//! actually vary.
 //!
 //! Model under fit:
 //!
@@ -234,11 +237,61 @@ pub fn measure(
         });
     }
 
+    // A printed gray scale has no dark separators between its steps: the patches
+    // abut, and the only structure is the step change itself. When no separator
+    // lattice is found, the frame is divided into equal cells instead — what a
+    // strip framed to fill the exposure gives. The wrong axis is rejected by the
+    // same test as the lattice: its cells would all span the real steps and so
+    // would not differ.
+    for axis in [Axis::Vertical, Axis::Horizontal] {
+        let Ok(cells) = equal_cells(image, base, steps.len(), axis) else {
+            continue;
+        };
+        if !steps_differ(&cells) {
+            continue;
+        }
+        return Ok(Measurement {
+            cells,
+            steps: steps.to_vec(),
+            axis,
+        });
+    }
+
     Err(WedgeError::NoLattice {
-        reason: "no evenly spaced separator lattice with varying steps was found in either \
-                 direction"
+        reason: "no evenly spaced separator lattice or varying step sequence was found in \
+                 either direction"
             .to_owned(),
     })
+}
+
+/// Divides the frame into `steps` equal cells, for a strip whose steps abut.
+///
+/// The strip must fill the frame: the cells are the frame divided equally, so a
+/// margin shifts every sample. That is the documented capture requirement for a
+/// contiguous printed card.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the axis length and step count are photograph-sized, well inside f32's \
+              exact-integer range"
+)]
+fn equal_cells(
+    image: &LinearImage,
+    base: &FilmBase,
+    steps: usize,
+    axis: Axis,
+) -> Result<Vec<[f32; 3]>, WedgeError> {
+    let length = match axis {
+        Axis::Vertical => image.width,
+        Axis::Horizontal => image.height,
+    };
+    let lines: Vec<f32> = (0..=steps)
+        .map(|index| length as f32 * index as f32 / steps as f32)
+        .collect();
+
+    match axis {
+        Axis::Vertical => sample_vertical_cells(image, base, &lines, steps),
+        Axis::Horizontal => sample_horizontal_cells(image, base, &lines, steps),
+    }
 }
 
 /// Whether the sampled steps span a density range at all.
@@ -536,11 +589,15 @@ mod tests {
         );
     }
 
+    /// Separator width used by the synthetic cards that have one.
+    const SEPARATOR_SHARE: f32 = 0.06;
+
     /// Generates a synthetic negative of a vertical gray wedge.
     ///
     /// `floor` and `ceiling` are the per-channel densities at the darkest and
-    /// lightest steps. The image contains bright separator lines between the
-    /// steps.
+    /// lightest steps. `separator_share` is the width of the bright separator
+    /// between steps as a fraction of a cell; zero makes the steps abut, which is
+    /// the printed-gray-scale shape.
     #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
@@ -551,6 +608,7 @@ mod tests {
         steps: &[f32],
         floor: [f32; 3],
         ceiling: [f32; 3],
+        separator_share: f32,
     ) -> (LinearImage, FilmBase) {
         let width = 1200u32;
         let height = 800u32;
@@ -583,7 +641,7 @@ mod tests {
         let left = margin_x;
         let right = width as f32 - margin_x;
         let cell_w = (right - left) / steps.len() as f32;
-        let sep_w = cell_w * 0.06f32;
+        let sep_w = cell_w * separator_share;
 
         for y in 0..height as usize {
             for x in 0..width as usize {
@@ -649,7 +707,7 @@ mod tests {
         let steps = card("kodak-gray-scale").unwrap().steps;
         let floor = [0.25f32, 0.30, 0.35];
         let ceiling = [1.80f32, 1.90, 2.00];
-        let (image, base) = synthetic_wedge(steps, floor, ceiling);
+        let (image, base) = synthetic_wedge(steps, floor, ceiling, SEPARATOR_SHARE);
 
         let measurement = measure(&image, &base, steps).expect("wedge should be found");
         assert_eq!(measurement.cells.len(), steps.len());
@@ -667,7 +725,7 @@ mod tests {
         let steps = &[0.1f32, 0.5, 1.0, 1.5];
         let floor = [0.2f32; 3];
         let ceiling = [2.0f32; 3];
-        let (image, base) = synthetic_wedge(steps, floor, ceiling);
+        let (image, base) = synthetic_wedge(steps, floor, ceiling, SEPARATOR_SHARE);
 
         let measurement = measure(&image, &base, steps).expect("wedge should be found");
         let fit = fit(&measurement).expect("fit should succeed");
@@ -713,7 +771,7 @@ mod tests {
         let steps = &[0.1f32, 0.5, 1.0, 1.5];
         let floor = [0.2f32; 3];
         let ceiling = [2.0f32; 3];
-        let (image, base) = synthetic_wedge(steps, floor, ceiling);
+        let (image, base) = synthetic_wedge(steps, floor, ceiling, SEPARATOR_SHARE);
         let measurement = measure(&image, &base, steps).expect("wedge should be found");
 
         let profile = profile(
@@ -752,7 +810,7 @@ mod tests {
         let steps = &[0.1f32, 0.5, 1.0, 1.5];
         let floor = [0.2f32; 3];
         let ceiling = [2.0f32; 3];
-        let (image, base) = synthetic_wedge(steps, floor, ceiling);
+        let (image, base) = synthetic_wedge(steps, floor, ceiling, SEPARATOR_SHARE);
         let transposed = image.transposed();
 
         let measurement = measure(&transposed, &base, steps).expect("wedge should be found");
@@ -775,5 +833,25 @@ mod tests {
             axis: Axis::Vertical,
         };
         assert_eq!(fit(&measurement), Err(WedgeError::DegenerateFit));
+    }
+
+    #[test]
+    fn a_contiguous_strip_is_divided_equally() {
+        // A printed gray scale (Kodak Q-13/Q-14) has no dark separators between
+        // its steps: the patches abut. The equal-division path is the one that
+        // finds it, so it is the path a real card exercises.
+        let steps = &[0.1f32, 0.5, 1.0, 1.5];
+        let floor = [0.2f32; 3];
+        let ceiling = [2.0f32; 3];
+        let (image, base) = synthetic_wedge(steps, floor, ceiling, 0.0);
+
+        let measurement = measure(&image, &base, steps).expect("contiguous strip should be found");
+        assert_eq!(measurement.axis, Axis::Vertical);
+
+        let fit = fit(&measurement).expect("fit should succeed");
+        for channel in 0..3 {
+            close(fit.floor[channel], floor[channel], "floor");
+            close(fit.ceiling[channel], ceiling[channel], "ceiling");
+        }
     }
 }
