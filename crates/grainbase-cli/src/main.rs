@@ -115,6 +115,14 @@ struct Cli {
     /// effect on the maintainer's fixtures is measured.
     #[arg(long)]
     meter: bool,
+
+    /// Normalize a slide scan by its clear film base.
+    ///
+    /// Only applies to slide mode. Off by default: the scan is the positive.
+    /// When on, each channel is divided by the measured base transmittance as a
+    /// per-channel white balance of the film's Dmin.
+    #[arg(long)]
+    normalize: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -171,12 +179,18 @@ struct FitArgs {
 enum Mode {
     /// Color negative film.
     ColorNegative,
+    /// Black-and-white negative film.
+    BlackAndWhite,
+    /// Slide (E-6) film.
+    Slide,
 }
 
 impl From<Mode> for FilmMode {
     fn from(mode: Mode) -> Self {
         match mode {
             Mode::ColorNegative => FilmMode::ColorNegative,
+            Mode::BlackAndWhite => FilmMode::BlackAndWhite,
+            Mode::Slide => FilmMode::Slide,
         }
     }
 }
@@ -216,6 +230,7 @@ fn main() -> ExitCode {
         film_base: cli.film_base,
         overlay: cli.overlay,
         meter: cli.meter,
+        slide_normalize: cli.normalize,
     });
 
     println!(

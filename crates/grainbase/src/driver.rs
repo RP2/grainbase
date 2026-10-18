@@ -19,6 +19,8 @@ use crate::overlay;
 use crate::pipeline::{self, FilmBase, Settings, film_base};
 use crate::{decode, encode};
 
+pub use crate::pipeline::FilmMode;
+
 /// Extensions treated as camera RAW input, matched case-insensitively.
 const RAW_EXTENSIONS: &[&str] = &[
     "arw", "dng", "cr2", "cr3", "nef", "nrw", "rw2", "raf", "orf", "pef", "srw",
@@ -38,15 +40,13 @@ const OVERLAY_SAMPLE_MARKS: usize = 400;
 /// across the folder so one unusual frame cannot set the base for the roll.
 const BASE_SAMPLE: usize = 3;
 
-/// Which kind of film is being converted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FilmMode {
-    /// Color negative. The only mode implemented so far.
-    ColorNegative,
-}
-
 /// What to convert, and where to put it.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool names an independent operator decision; the alternatives \
+              would obscure which decisions are active"
+)]
 pub struct Job {
     /// Folder of scans. Treated as one roll.
     pub input: PathBuf,
@@ -78,10 +78,20 @@ pub struct Job {
     ///
     /// The meter pulls the frame's integral density back toward its own
     /// neutral, so a film or scanning cast is corrected without the scene's own
-    /// light being neutralised; the pull is weighted down when the frame is a
+    /// light being neutralized; the pull is weighted down when the frame is a
     /// scene that is genuinely one color rather than a cast. Per frame, because
     /// the cast moves while the unexposed stock does not.
+    ///
+    /// Applies only to [`FilmMode::ColorNegative`] and [`FilmMode::BlackAndWhite`];
+    /// slide is already a positive, so the integral-to-neutral model does not
+    /// apply.
     pub meter: bool,
+    /// Whether to normalize a slide scan by its clear film base.
+    ///
+    /// Only meaningful for [`FilmMode::Slide`]; for color and B&W negatives the
+    /// base is always used to neutralize the film. Off by default: the scan is
+    /// the positive.
+    pub slide_normalize: bool,
     /// Optional authoritative base sample rectangle, as fractions `[x0, y0, x1,
     /// y1]` of the uncropped scan.
     ///
@@ -210,6 +220,19 @@ impl From<io::Error> for Error {
     }
 }
 
+/// Whether a job needs a measured film base.
+///
+/// Color negative and black-and-white always need a base to neutralize the
+/// film. Slide needs a base only when normalization is requested; otherwise the
+/// scan is the output.
+#[must_use]
+fn needs_measured_base(mode: FilmMode, slide_normalize: bool) -> bool {
+    match mode {
+        FilmMode::ColorNegative | FilmMode::BlackAndWhite => true,
+        FilmMode::Slide => slide_normalize,
+    }
+}
+
 /// Converts every scan in the job's folder.
 ///
 /// Frames are processed in parallel. A frame that fails does not stop the run:
@@ -226,7 +249,13 @@ pub fn run(job: &Job) -> Report {
     // Deterministic order, so the sampling below is reproducible.
     inputs.sort();
 
-    let base = pooled_base(job, &inputs);
+    // Slide without normalization needs no base: skip the expensive pooled
+    // measurement and the per-frame detection entirely.
+    let base = if needs_measured_base(job.mode, job.slide_normalize) {
+        pooled_base(job, &inputs)
+    } else {
+        None
+    };
 
     let outcomes = inputs
         .par_iter()
@@ -260,6 +289,8 @@ fn convert_one(job: &Job, input: &Path, base: Option<&FilmBase>) -> Outcome {
         job.film_base,
         job.overlay,
         job.meter,
+        job.mode,
+        job.slide_normalize,
     ) {
         Ok(()) => Outcome::Converted(output),
         Err(err) => Outcome::Failed(input.to_path_buf(), err.to_string()),
@@ -307,6 +338,12 @@ fn cropped(image: &LinearImage, frame: &geometry::Frame) -> LinearImage {
               switches; collapsing them into a struct would hide which \
               parameters the caller did not supply"
 )]
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "each bool parameter names an independent operator decision; \
+              replacing them with enums would add indirection without \
+              clarifying the call sites"
+)]
 pub fn convert_frame(
     input: &Path,
     output: &Path,
@@ -318,6 +355,8 @@ pub fn convert_frame(
     film_base: Option<[f32; 3]>,
     overlay: bool,
     meter: bool,
+    mode: FilmMode,
+    slide_normalize: bool,
 ) -> Result<(), Error> {
     let scan = decode::decode(input)?;
 
@@ -341,24 +380,27 @@ pub fn convert_frame(
     };
 
     // The base is always measured on the uncropped scan: neutralizing the
-    // mask precedes the crop in the documented order.
+    // mask precedes the crop in the documented order. Slide without
+    // normalization needs no base at all, so the whole measurement is skipped.
     let measured;
-    let base = if let Some(base) = base {
-        base
+    let base: Option<&FilmBase> = if !needs_measured_base(mode, slide_normalize) {
+        None
+    } else if let Some(base) = base {
+        Some(base)
     } else if let Some(values) = film_base {
         measured = FilmBase {
             transmittance: values.map(|value| value.max(f32::MIN_POSITIVE)),
         };
-        &measured
+        Some(&measured)
     } else if let Some(rect) = base_sample {
         measured = FilmBase::detect_in_rect(&uncropped, rect, film_base::DEFAULT_PERCENTILE);
-        &measured
+        Some(&measured)
     } else if let Some(base) = measured_between_sprockets(&uncropped, &frame) {
         // The base is the unexposed film. The punch rows between the
         // perforations are where it is guaranteed to be: outside the exposure,
         // and clear of the light table. Nothing here reads the picture.
         measured = base;
-        &measured
+        Some(&measured)
     } else {
         // Nothing to measure from: refuse rather than invent a base.
         return Err(Error::NoFilmBase);
@@ -366,17 +408,20 @@ pub fn convert_frame(
 
     // The meter pulls the frame's integral back to neutral. It runs here, after
     // the base is measured and the frame is located, so the region it reads is the
-    // exposure rather than the rebate or the light table.
+    // exposure rather than the rebate or the light table. The model is for
+    // negatives/film casts only, so it is skipped for slide.
     let mut frame_settings = *settings;
-    if meter {
+    if meter
+        && mode != FilmMode::Slide
+        && let Some(base) = base
+    {
         frame_settings = metered_settings(&frame_settings, &uncropped, base, &frame);
     }
 
-    let positive = pipeline::invert(
-        cropped.as_ref().unwrap_or(&uncropped),
-        base,
-        &frame_settings,
-    );
+    // One dispatcher for every mode; slide's normalize option rides alongside
+    // the settings, since it is not part of the color model.
+    let source = cropped.as_ref().unwrap_or(&uncropped);
+    let positive = pipeline::convert(source, base, &frame_settings, mode, slide_normalize);
 
     // With the crop off, the output *is* the scan the decisions were made on, so
     // the marks belong on it: one image shows the final frame and where the
@@ -387,12 +432,13 @@ pub fn convert_frame(
         let bands: Vec<film_base::FilmRegion> = frame.holes.iter().flatten().copied().collect();
         let samples = FilmBase::sprocket_sample_points(&uncropped, &bands, OVERLAY_SAMPLE_MARKS);
         let sprockets = FilmBase::sprocket_holes(&uncropped, &bands);
+        let color_region = base.map(|base| frame.sample_region().exposure_region(&uncropped, base));
         let marks = overlay::Marks {
             holes: &frame.holes,
             sprockets: &sprockets,
             film: frame.film.as_ref(),
             samples: &samples,
-            color_region: Some(&frame.sample_region().exposure_region(&uncropped, base)),
+            color_region: color_region.as_ref(),
             crop: if crop { Some(&frame) } else { None },
         };
         if cropped.is_some() {
@@ -707,6 +753,7 @@ mod tests {
             meter: false,
             base_sample: None,
             film_base: None,
+            slide_normalize: false,
         });
 
         assert!(report.outcomes.is_empty(), "got {:?}", report.outcomes);
@@ -740,6 +787,7 @@ mod tests {
             meter: false,
             base_sample: None,
             film_base: None,
+            slide_normalize: false,
         });
 
         assert_eq!(report.failures().len(), 1);
@@ -764,6 +812,7 @@ mod tests {
             meter: false,
             base_sample: None,
             film_base: Some([0.8, 0.5, 0.3]),
+            slide_normalize: false,
         };
 
         assert_eq!(
@@ -771,5 +820,17 @@ mod tests {
             None,
             "a manual base must not be overridden by the pool"
         );
+    }
+
+    #[test]
+    fn base_is_needed_for_color_negative_and_black_and_white() {
+        assert!(needs_measured_base(FilmMode::ColorNegative, false));
+        assert!(needs_measured_base(FilmMode::BlackAndWhite, false));
+    }
+
+    #[test]
+    fn base_is_needed_for_slide_only_when_normalizing() {
+        assert!(!needs_measured_base(FilmMode::Slide, false));
+        assert!(needs_measured_base(FilmMode::Slide, true));
     }
 }

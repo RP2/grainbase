@@ -1,4 +1,4 @@
-//! The pure conversion core: film-base neutralisation and inversion.
+//! The pure conversion core: film-base neutralization and inversion.
 //!
 //! No I/O, no per-frame state: the same input always produces the same output,
 //! so results can be golden-tested. This is the primary seam for conversion
@@ -19,16 +19,37 @@
 //! transmittance is multiplicative in the film but we perceive it
 //! logarithmically, so a linear inversion washes out the highlights.
 
+pub mod bw;
 pub mod chart;
 pub mod film_base;
 pub mod fit;
 pub mod meter;
 pub mod percentile;
+pub mod slide;
 
 pub use film_base::FilmBase;
 pub use meter::{LAD_CAMERA_NEGATIVE, Metering};
 
 use crate::image::LinearImage;
+
+/// Which film pipeline to run.
+///
+/// Each mode is a different pipeline, not a preset: the physics of the three
+/// stocks differ enough that they are implemented separately. The enum lives
+/// here because it selects the conversion pipeline; [`crate::driver`] re-exports
+/// it for callers that already import from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilmMode {
+    /// Color negative film (C-41). The scan is inverted after neutralizing the
+    /// orange mask.
+    ColorNegative,
+    /// Black-and-white negative film. No mask: the image collapses to a single
+    /// silver density rendered as gray.
+    BlackAndWhite,
+    /// Slide film (E-6). The scan is already the positive; only optional
+    /// normalization is applied.
+    Slide,
+}
 
 /// Density mapped to the positive's white point by default, in log10 units.
 ///
@@ -67,7 +88,7 @@ const REFERENCE_GRAY_POSITIVE: f32 = 0.636;
 ///
 /// [1.5723, 2.2800, 2.4371] — H-387-derived, this repo's arithmetic.
 #[must_use]
-fn default_density_max() -> [f32; 3] {
+pub(crate) fn default_density_max() -> [f32; 3] {
     LAD_GRAY_STATUS_M.map(|aim| aim / REFERENCE_GRAY_POSITIVE)
 }
 
@@ -161,6 +182,37 @@ impl Default for Settings {
 /// The identity matrix: leaves density untouched.
 pub const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
+/// Builds the print curve description from the settings that request one.
+///
+/// Kept as a separate helper so the black-and-white pipeline can reuse the
+/// exact same arithmetic on its single channel. The normalized pivot position
+/// and the clamped gamma are character-for-character the same values the color
+/// negative core used before this helper existed.
+#[must_use]
+pub(crate) fn curve_from_settings(
+    settings: &Settings,
+    floor: [f32; 3],
+    density_max: [f32; 3],
+) -> Option<([f32; 3], [f32; 3])> {
+    match (settings.gamma, settings.pivot_density) {
+        (Some(gamma), Some(pivot)) => {
+            let span = [
+                floor[0] + density_max[0],
+                floor[1] + density_max[1],
+                floor[2] + density_max[2],
+            ];
+            let pivot_normalized = [
+                ((pivot[0] - floor[0]) / (span[0] - floor[0])).clamp(f32::MIN_POSITIVE, 1.0),
+                ((pivot[1] - floor[1]) / (span[1] - floor[1])).clamp(f32::MIN_POSITIVE, 1.0),
+                ((pivot[2] - floor[2]) / (span[2] - floor[2])).clamp(f32::MIN_POSITIVE, 1.0),
+            ];
+            let gamma = gamma.map(|value| value.max(f32::MIN_POSITIVE));
+            Some((pivot_normalized, gamma))
+        }
+        _ => None,
+    }
+}
+
 /// Renders one channel's corrected density through the linear floor/ceiling
 /// map, then through the print curve when one was requested.
 ///
@@ -170,7 +222,7 @@ pub const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0
 /// exponent is `gamma` itself, so a gamma ratio above 1 deepens shadows —
 /// the print-style convention: gamma is the display-facing contrast.
 #[must_use]
-fn render(
+pub(crate) fn render(
     density: f32,
     floor: f32,
     ceiling: f32,
@@ -192,7 +244,7 @@ fn render(
     }
 }
 
-/// Neutralises the film base and inverts a negative into a positive.
+/// Neutralizes the film base and inverts a negative into a positive.
 ///
 /// Each channel is divided by the base, converted to optical density, corrected
 /// for dye crosstalk, and scaled so the base becomes black and
@@ -213,23 +265,7 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
     // The print curve: only meaningful when both a pivot density and an
     // exponent are supplied. The pivot's normalized position maps to the
     // reference gray; the pieces meet there with continuous slope.
-    let curve = match (settings.gamma, settings.pivot_density) {
-        (Some(gamma), Some(pivot)) => {
-            let span = [
-                floor[0] + density_max[0],
-                floor[1] + density_max[1],
-                floor[2] + density_max[2],
-            ];
-            let pivot_normalized = [
-                ((pivot[0] - floor[0]) / (span[0] - floor[0])).clamp(f32::MIN_POSITIVE, 1.0),
-                ((pivot[1] - floor[1]) / (span[1] - floor[1])).clamp(f32::MIN_POSITIVE, 1.0),
-                ((pivot[2] - floor[2]) / (span[2] - floor[2])).clamp(f32::MIN_POSITIVE, 1.0),
-            ];
-            let gamma = gamma.map(|value| value.max(f32::MIN_POSITIVE));
-            Some((pivot_normalized, gamma))
-        }
-        _ => None,
-    };
+    let curve = curve_from_settings(settings, floor, density_max);
 
     image.map_rgb(|[red, green, blue]| {
         let density = [
@@ -246,6 +282,41 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
     })
 }
 
+/// Dispatches to the pipeline selected by [`FilmMode`].
+///
+/// `slide_normalize` is meaningful only for [`FilmMode::Slide`] and is ignored
+/// by the two negative pipelines; it is a parameter here rather than a field of
+/// [`Settings`] because it is not part of the color model. The function is total:
+/// every mode has an arm, so a caller never has to know which modes it may pass.
+///
+/// # Panics
+///
+/// Panics when called for [`FilmMode::ColorNegative`] or
+/// [`FilmMode::BlackAndWhite`] without a measured base, because both modes
+/// require one and a missing base is a caller error.
+#[must_use]
+pub fn convert(
+    image: &LinearImage,
+    base: Option<&FilmBase>,
+    settings: &Settings,
+    mode: FilmMode,
+    slide_normalize: bool,
+) -> LinearImage {
+    match mode {
+        FilmMode::ColorNegative => invert(
+            image,
+            base.expect("ColorNegative needs a measured base"),
+            settings,
+        ),
+        FilmMode::BlackAndWhite => bw::render(
+            image,
+            base.expect("BlackAndWhite needs a measured base"),
+            settings,
+        ),
+        FilmMode::Slide => slide::render(image, base, slide_normalize),
+    }
+}
+
 /// Density beyond which a sample is simply opaque.
 ///
 /// A real negative tops out near 3 log10; 10 is safely past anything physical
@@ -255,7 +326,7 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
 pub(crate) const MAX_DENSITY: f32 = 10.0;
 
 /// Optical density of one sample relative to the film base.
-fn density_of(value: f32, base: f32) -> f32 {
+pub(crate) fn density_of(value: f32, base: f32) -> f32 {
     // `decode` rejects non-finite samples, so anything else arriving here is a bug
     // in the caller rather than bad data. This is worth stating because the
     // arithmetic below is only accidentally safe against NaN: `f32::min` returns
@@ -660,6 +731,59 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn dispatcher_color_negative_equals_invert() {
+        // The C-41 path must stay byte-identical when reached through the
+        // dispatcher.
+        let source = image(&[[0.7, 0.4, 0.2], [0.1, 0.9, 0.3]]);
+        let base = base([0.8, 0.5, 0.3]);
+        let direct = invert(&source, &base, &settings());
+        let dispatched = convert(
+            &source,
+            Some(&base),
+            &settings(),
+            FilmMode::ColorNegative,
+            false,
+        );
+        assert_eq!(direct.data, dispatched.data);
+    }
+
+    #[test]
+    fn dispatcher_black_and_white_renders_gray() {
+        let source = image(&[[0.9, 0.4, 0.2]]);
+        let result = convert(
+            &source,
+            Some(&base([1.0, 1.0, 1.0])),
+            &settings(),
+            FilmMode::BlackAndWhite,
+            false,
+        );
+        assert!((result.data[0] - result.data[1]).abs() < 1e-6);
+        assert!((result.data[1] - result.data[2]).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dispatcher_slide_is_the_scan_and_honours_normalize() {
+        let source = image(&[[0.5, 0.25, 0.125]]);
+        let settings = settings();
+
+        // Normalization off: the scan is the output.
+        let as_captured = convert(&source, None, &settings, FilmMode::Slide, false);
+        assert_eq!(as_captured.data, source.data);
+
+        // Normalization on: the base goes to 1.0 per channel.
+        let normalized = convert(
+            &source,
+            Some(&base([0.5, 0.25, 0.125])),
+            &settings,
+            FilmMode::Slide,
+            true,
+        );
+        for channel in normalized.data {
+            assert_close(channel, 1.0);
         }
     }
 }
