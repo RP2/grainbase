@@ -226,7 +226,7 @@ pub fn run(job: &Job) -> Report {
     // Deterministic order, so the sampling below is reproducible.
     inputs.sort();
 
-    let base = roll_base(&inputs, job.flips, job.base_sample);
+    let base = pooled_base(job, &inputs);
 
     let outcomes = inputs
         .par_iter()
@@ -290,12 +290,11 @@ fn cropped(image: &LinearImage, frame: &geometry::Frame) -> LinearImage {
 ///    precedence. A caller-supplied roll-level base wins (the roll's base is
 ///    one measurement, per the lab tools' border-lock practice); then a
 ///    manually supplied per-channel base; then a manually supplied sample
-///    rectangle; then the clear film just outside the frame's own boundary,
-///    which is the film's mechanical answer and needs neither a rebate region
-///    nor a punch band to be recognised; then the whole-frame statistics the
-///    scanner tools document as their default base estimate —
-///    whose known limit is light-table glare on copy-stand scans, for which
-///    the manual inputs are the documented answer, not a further heuristic.
+///    rectangle; then the film between the punch bands, which the film's own
+///    geometry locates. Nothing else: a scan whose bands cannot be found is
+///    refused, because the operator's hand measurement is the documented
+///    fallback there — a further heuristic would be a guess in the one place
+///    the reference tools say not to guess.
 /// 4. *Crop* to the exposed frame, so the inversion only sees picture pixels.
 /// 5. *Invert*, with the settings (a profile when loaded).
 ///
@@ -411,6 +410,19 @@ pub fn convert_frame(
     }
     encode::encode(&positive, output)?;
     Ok(())
+}
+
+/// The base a run starts from: the pool, or `None` when one was supplied by hand.
+///
+/// A hand-supplied base is authoritative. The documented precedence puts the
+/// operator's value ahead of every detector, and the base is a roll property, so
+/// supplying it disables the pooled estimate for the whole run — not only for the
+/// frames the pool would have failed to measure.
+fn pooled_base(job: &Job, inputs: &[PathBuf]) -> Option<FilmBase> {
+    if job.film_base.is_some() {
+        return None;
+    }
+    roll_base(inputs, job.flips, job.base_sample)
 }
 
 /// Measures the roll's film base from a spread of frames.
@@ -732,5 +744,32 @@ mod tests {
 
         assert_eq!(report.failures().len(), 1);
         assert_eq!(report.converted(), 0);
+    }
+
+    #[test]
+    fn a_hand_supplied_base_disables_the_pooled_estimate() {
+        // The failure this guards: the pool ran before the manual value was
+        // consulted, so on a multi-frame folder the automatic base overrode
+        // --film-base even though the field documents the manual value as
+        // authoritative. Two inputs, so a pool *would* be attempted.
+        let inputs = [PathBuf::from("/roll/a.arw"), PathBuf::from("/roll/b.arw")];
+        let job = Job {
+            input: PathBuf::from("/roll"),
+            output: PathBuf::from("/out"),
+            mode: FilmMode::ColorNegative,
+            settings: Settings::default(),
+            crop: false,
+            flips: Flips::default(),
+            overlay: false,
+            meter: false,
+            base_sample: None,
+            film_base: Some([0.8, 0.5, 0.3]),
+        };
+
+        assert_eq!(
+            pooled_base(&job, &inputs),
+            None,
+            "a manual base must not be overridden by the pool"
+        );
     }
 }
