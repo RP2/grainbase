@@ -70,10 +70,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Base on the oriented scan, still uncropped, by the documented source
     // precedence (spec step 3): hand-supplied values, hand-placed rectangle,
-    // the clear film just outside the frame, whole-frame statistics. The
-    // whole-frame tier is VueScan's documented default estimate; its known
-    // limit is light-table glare on copy-stand scans, for which the manual
-    // inputs are the answer.
+    // then the film between the punch bands, which the film's own geometry
+    // locates. There is no whole-frame tier: a scan whose bands cannot be
+    // found is refused, and the operator's own measurement is the fallback.
     if std::env::var("GRAINBASE_TRACE").is_ok() {
         diagnose_base(&negative);
         trace_tail(&negative);
