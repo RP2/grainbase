@@ -172,6 +172,14 @@ impl std::error::Error for WedgeError {}
 /// Smallest image dimension the detector will attempt to grid.
 const MIN_DIMENSION: u32 = 80;
 
+/// Smallest span fraction the wedge separator search will accept.
+///
+/// The strip path deliberately requires the wedge to fill the frame, because
+/// its perpendicular extent is the full frame and a strip that did not span it
+/// would sample windows straddling the strip edge. This value preserves the
+/// original `+/- 15%` step tolerance around a full-frame lattice.
+const MIN_WEDGE_SPAN_FRACTION: f32 = 0.85;
+
 /// Locates the wedge in `image` and measures per-step densities.
 ///
 /// `base` is the measured film base for the uncropped scan. Densities are
@@ -296,10 +304,10 @@ fn equal_cells(
 
 /// Whether the sampled steps span a density range at all.
 ///
-/// The lattice finder normalizes its confidence by the brightest separator, so a
-/// uniform field scores a perfect lattice: every pixel is as bright as the
-/// separator. The gate that a real wedge passes and a flat field fails is that
-/// its steps actually differ, so it is applied to the samples rather than to the
+/// Even with a separator-contrast gate in the lattice finder, a uniform field
+/// could still be divided into equal cells that all read the same density. The
+/// gate that a real wedge passes and a flat field fails is that its steps
+/// actually differ, so it is applied to the samples rather than to the
 /// projection.
 fn steps_differ(cells: &[[f32; 3]]) -> bool {
     let mut widest = 0.0f32;
@@ -322,7 +330,7 @@ fn try_lattice(projection: &[f32], steps: usize, axis: Axis) -> Option<Vec<f32>>
         Axis::Vertical => "vertical",
         Axis::Horizontal => "horizontal",
     };
-    find_lines_1d(projection, steps + 1, steps)
+    find_lines_1d(projection, steps + 1, steps, MIN_WEDGE_SPAN_FRACTION)
         .map_err(|reason| format!("{label}: {reason}"))
         .ok()
 }

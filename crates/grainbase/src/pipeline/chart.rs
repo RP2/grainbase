@@ -11,6 +11,11 @@
 //! lines, not for patch colors. Level ratios are only used as bars against the
 //! measured film base, mirroring the rest of the detector family.
 //!
+//! The projection detector assumes the card is nearly axis-aligned with the
+//! frame. A few degrees of rotation is tolerable; larger angles smear the
+//! separator lines across many columns and the lattice will not be found. This
+//! implementation does not search over rotation.
+//!
 //! Orientation is validated after sampling by the densities themselves: the
 //! white patch (bottom-left in a correctly oriented capture) is the densest
 //! cell on a negative, and the black patch (bottom-right) is the least dense.
@@ -185,16 +190,27 @@ pub(crate) const SAMPLE_INSET: f32 = 0.25;
 /// grain while still catching a misaligned grid.
 pub(crate) const MAX_SPREAD_RATIO: f32 = 2.5;
 
-/// Minimum fraction of the projection axis that must read as separator along
-/// the detected lines for the lattice to be trusted.
+/// Minimum span fraction of the axis that a chart lattice may occupy.
 ///
-/// Real separators span almost the full axis; a random-noise image cannot
-/// produce a coherent set of equally spaced lines that scores this high.
-pub(crate) const MIN_LINE_FILL: f32 = 0.70;
+/// A rangefinder-framed `ColorChecker` can leave a margin on every side; this
+/// bound allows a card down to about 30% of the frame axis to be found.
+pub(crate) const MIN_CHART_SPAN_FRACTION: f32 = 0.30;
 
-/// Maximum proportional deviation of detected spacing from the ideal equal
-/// spacing for a card that fills the frame.
-pub(crate) const MAX_SPACING_TOL: f32 = 0.15;
+/// Maximum span fraction searched on either axis.
+///
+/// Keeps the old upper bound: a lattice may be up to 15% larger than the
+/// ideal full-frame spacing.
+pub(crate) const MAX_SPAN_FRACTION: f32 = 1.15;
+
+/// Minimum separator-to-cell contrast required after line refinement.
+///
+/// A lattice is defined by lines that are brighter than the patches between
+/// them. Requiring the mean line response to exceed the mean cell-center
+/// response rejects a flat field by construction and does not depend on the
+/// frame's brightest pixel. The value leaves headroom for thin negatives where
+/// patch transmittance is close to the base level, while still being safely
+/// above the 1.0 ratio a uniform field produces.
+pub(crate) const SEPARATOR_CONTRAST: f32 = 1.15;
 
 /// Locates the `ColorChecker` grid in `image` and measures per-patch densities.
 ///
@@ -242,16 +258,15 @@ fn detect_lattice(
 
     let (vertical_proj, horizontal_proj) = separator_projections(image, threshold);
 
-    let vertical =
-        find_lines_1d(&vertical_proj, COLS + 1, COLS).map_err(|reason| ChartError::NoLattice {
+    let vertical = find_lines_1d(&vertical_proj, COLS + 1, COLS, MIN_CHART_SPAN_FRACTION).map_err(
+        |reason| ChartError::NoLattice {
             reason: format!("vertical separators: {reason}"),
-        })?;
-    let horizontal = find_lines_1d(&horizontal_proj, ROWS + 1, COLS).map_err(|reason| {
-        ChartError::NoLattice {
+        },
+    )?;
+    let horizontal = find_lines_1d(&horizontal_proj, ROWS + 1, COLS, MIN_CHART_SPAN_FRACTION)
+        .map_err(|reason| ChartError::NoLattice {
             reason: format!("horizontal separators: {reason}"),
-        }
-    })?;
-
+        })?;
     Ok((vertical, horizontal))
 }
 
@@ -281,12 +296,23 @@ pub(crate) fn separator_projections(image: &LinearImage, threshold: f32) -> (Vec
     (vertical, horizontal)
 }
 
+/// Number of span-fraction candidates sampled between the minimum and maximum
+/// span fraction.
+const SPAN_FRACTION_SAMPLES: usize = 40;
+
+/// Half-width jitter around each span fraction for sub-fraction precision.
+const SPAN_FRACTION_JITTER: f32 = 0.02;
+
+/// Number of start offsets sampled across the possible lattice positions.
+const START_OFFSET_SAMPLES: usize = 64;
+
 /// Finds `count` equally spaced lines in a 1-D projection.
 ///
-/// The capture protocol fills the frame with the card, so the grid spans nearly
-/// the full axis and the lines are at integer fractions of it. The search
-/// looks for the start offset and spacing that put the most separator mass on
-/// the expected line positions.
+/// The lattice may occupy only part of the axis, so the search covers both the
+/// lattice's span fraction `f` (the step is `f * ideal_step`, where
+/// `ideal_step` is the spacing for a card that fills the axis) and the phase
+/// within one step. `min_span_fraction` is the smallest `f` examined; the
+/// largest is always [`MAX_SPAN_FRACTION`].
 #[expect(
     clippy::cast_precision_loss,
     reason = "search indices are bounded by the small projection length"
@@ -295,84 +321,143 @@ pub(crate) fn find_lines_1d(
     projection: &[f32],
     count: usize,
     cell_count: usize,
+    min_span_fraction: f32,
 ) -> Result<Vec<f32>, String> {
     if count < 2 || projection.len() < count {
         return Err("projection too short".to_owned());
     }
+    if !(min_span_fraction > 0.0 && min_span_fraction <= MAX_SPAN_FRACTION) {
+        return Err("invalid span fraction range".to_owned());
+    }
 
     let len = projection.len();
-    let max_value = projection
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max)
-        .max(f32::MIN_POSITIVE);
     let smoothed = smooth(projection, SMOOTH_RADIUS);
 
     // Ideal spacing for a card that fills the axis.
     let ideal_step = len as f32 / (count - 1) as f32;
-    let step_min = ideal_step * (1.0 - MAX_SPACING_TOL);
-    let step_max = ideal_step * (1.0 + MAX_SPACING_TOL);
-    // A lattice's offset is periodic in its spacing: an offset of one full
-    // period is the same set of lines, so the search covers a whole period
-    // rather than half of one. Half a period assumes the card fills the axis to
-    // within half a cell, which a real capture — and a 20-step wedge in
-    // particular — does not guarantee, and a missed offset then refines onto
-    // cell edges instead of separators.
-    let start_max = ideal_step;
 
     let mut best_score = f32::NEG_INFINITY;
     let mut best_lines: Option<Vec<f32>> = None;
 
-    for step in linspace(step_min, step_max, 24) {
-        if step <= 0.0 {
-            continue;
-        }
-        for start in linspace(0.0, start_max, 12) {
-            let lines: Vec<f32> = (0..count).map(|i| start + i as f32 * step).collect();
-            if *lines.last().expect("count >= 2") > (len - 1) as f32 {
+    for base_f in linspace(min_span_fraction, MAX_SPAN_FRACTION, SPAN_FRACTION_SAMPLES) {
+        for delta in [-SPAN_FRACTION_JITTER, 0.0, SPAN_FRACTION_JITTER] {
+            let f = (base_f + delta).clamp(min_span_fraction, MAX_SPAN_FRACTION);
+            let step = f * ideal_step;
+            if step <= 0.0 {
                 continue;
             }
-            let score = lines
-                .iter()
-                .map(|&pos| sample_smooth(&smoothed, pos))
-                .sum::<f32>();
-            if score > best_score {
-                best_score = score;
-                best_lines = Some(lines);
+            // The lattice may start anywhere in the projection, not just near
+            // the origin, so the start offset covers every position that keeps
+            // the whole lattice inside the image.
+            let start_max = ((len - 1) as f32 - (count - 1) as f32 * step).max(0.0);
+            for start in linspace(0.0, start_max, START_OFFSET_SAMPLES) {
+                let lines: Vec<f32> = (0..count).map(|i| start + i as f32 * step).collect();
+                if *lines.last().expect("count >= 2") > (len - 1) as f32 {
+                    continue;
+                }
+                // Score the lines *after* refinement, not at their coarse
+                // positions. A coarse offset that lands between two separators
+                // scores low even when refinement would snap it onto the right
+                // one, so scoring the coarse positions biases the search toward
+                // whichever candidate happens to align with the wider peaks —
+                // which is how a lattice shifted by one cell wins over the true
+                // one. Refinement is a small window scan, and the candidate
+                // count is in the thousands, so this is cheap.
+                let refined: Vec<f32> = lines
+                    .iter()
+                    .map(|&pos| refine_to_peak(&smoothed, pos, cell_count))
+                    .collect();
+                // Even spacing is a constraint on a candidate, not a filter
+                // applied to the winner. A candidate that is not evenly spaced
+                // is not a lattice at all, and scoring it lets one very bright
+                // line — a lit edge of the frame, say — buy its way into the
+                // winner's place by inflating the mean of the line values.
+                if !evenly_spaced(&refined) {
+                    continue;
+                }
+                let score = lattice_contrast(&smoothed, &refined);
+                if score > best_score {
+                    best_score = score;
+                    best_lines = Some(refined);
+                }
             }
         }
     }
 
-    let Some(lines) = best_lines else {
+    let Some(refined) = best_lines else {
         return Err("no line candidate fit inside the image".to_owned());
     };
 
-    // Refine each line to the nearest local maximum in the smoothed projection.
-    let refined: Vec<f32> = lines
-        .iter()
-        .map(|&pos| refine_to_peak(&smoothed, pos, cell_count))
-        .collect();
-
-    let refined_score = refined
+    let line_values: Vec<f32> = refined
         .iter()
         .map(|&pos| sample_smooth(&smoothed, pos))
-        .sum::<f32>();
-    let fill = refined_score / (count as f32 * max_value);
-    if fill < MIN_LINE_FILL {
+        .collect();
+    let line_mean = line_values.iter().sum::<f32>() / count as f32;
+    let cell_centers: Vec<f32> = refined
+        .windows(2)
+        .map(|w| f32::midpoint(w[0], w[1]))
+        .collect();
+    let cell_mean = cell_centers
+        .iter()
+        .map(|&pos| sample_smooth(&smoothed, pos))
+        .sum::<f32>()
+        / cell_centers.len() as f32;
+    if line_mean < SEPARATOR_CONTRAST * cell_mean {
         return Err(format!(
-            "separator response too weak ({:.0}%); expected strong bright lines",
-            fill * 100.0
+            "separator contrast too weak ({:.2}); expected bright lines against darker cells",
+            line_mean / cell_mean.max(f32::MIN_POSITIVE)
         ));
     }
 
-    let spacings: Vec<f32> = refined.windows(2).map(|w| w[1] - w[0]).collect();
-    let min_spacing = spacings.iter().copied().fold(f32::INFINITY, f32::min);
-    let max_spacing = spacings.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    if max_spacing <= 0.0 || min_spacing / max_spacing < 0.75 {
-        return Err("detected lines are not evenly spaced".to_owned());
-    }
-
     Ok(refined)
+}
+
+/// Whether a candidate's lines are evenly enough spaced to be a lattice.
+fn evenly_spaced(lines: &[f32]) -> bool {
+    if lines.len() < 2 {
+        return false;
+    }
+    let mut min_spacing = f32::INFINITY;
+    let mut max_spacing = f32::NEG_INFINITY;
+    for pair in lines.windows(2) {
+        let spacing = pair[1] - pair[0];
+        min_spacing = min_spacing.min(spacing);
+        max_spacing = max_spacing.max(spacing);
+    }
+    max_spacing > 0.0 && min_spacing / max_spacing >= MIN_SPACING_RATIO
+}
+
+/// Smallest ratio of closest to widest spacing a candidate lattice may show and
+/// still count as evenly spaced.
+const MIN_SPACING_RATIO: f32 = 0.75;
+
+/// The separator contrast a candidate lattice shows: the mean of the smoothed
+/// projection at its lines, minus the mean at the cell centres between them.
+///
+/// The search maximizes this rather than the raw sum at the lines. A raw sum is
+/// maximized by putting lines on the brightest pixels in the frame — which, for
+/// a card in a scene, is the scene and not the card — so a bright background
+/// would outvote a perfectly visible lattice. The contrast is what actually
+/// identifies a lattice, and it is the same quantity the final gate tests.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the line count is at most seven, far inside f32's exact-integer range"
+)]
+fn lattice_contrast(smoothed: &[f32], lines: &[f32]) -> f32 {
+    if lines.len() < 2 {
+        return f32::NEG_INFINITY;
+    }
+    let line_mean = lines
+        .iter()
+        .map(|&pos| sample_smooth(smoothed, pos))
+        .sum::<f32>()
+        / lines.len() as f32;
+    let cell_mean = lines
+        .windows(2)
+        .map(|pair| sample_smooth(smoothed, f32::midpoint(pair[0], pair[1])))
+        .sum::<f32>()
+        / (lines.len() - 1) as f32;
+    line_mean - cell_mean
 }
 
 /// Samples a smoothed projection at a fractional position.
@@ -807,6 +892,154 @@ mod tests {
         )
     }
 
+    /// Generates a synthetic `ColorChecker` that occupies only part of the frame,
+    /// as when the card is photographed inside a scene.
+    ///
+    /// `span_fraction` gives the card size as a fraction of each image axis.
+    /// `offset_fraction` places the top-left corner as a fraction of the
+    /// remaining margin. The background is a deterministic, non-uniform pattern
+    /// whose peak is brighter than the card separators, so an old
+    /// global-maximum fill gate would reject the lattice.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "synthetic image dimensions are small and coordinates are clamped before truncation"
+    )]
+    fn synthetic_checker_in_scene(
+        settings: &crate::pipeline::Settings,
+        span_fraction: [f32; 2],
+        offset_fraction: [f32; 2],
+    ) -> (LinearImage, FilmBase) {
+        let width = 1200u32;
+        let height = 800u32;
+        let mut data = vec![0.0f32; width as usize * height as usize * 3];
+
+        let floor = settings.density_floor.unwrap_or([0.0f32; 3]);
+        let ceiling = settings
+            .density_max
+            .unwrap_or([crate::pipeline::DEFAULT_DENSITY_MAX; 3]);
+        let range = [
+            ceiling[0] - floor[0],
+            ceiling[1] - floor[1],
+            ceiling[2] - floor[2],
+        ];
+        let inv = invert_matrix(settings.crosstalk);
+
+        let targets = chromatic_targets();
+        let mut patch_densities = [[0.0f32; 3]; CELLS];
+        for i in 0..18 {
+            patch_densities[i] = density_from_target(targets[i], floor, range, inv);
+        }
+        patch_densities[18] = density_from_target([fit::LIGHT_PRINT_TONE; 3], floor, range, inv);
+        patch_densities[23] = density_from_target([fit::DARK_PRINT_TONE; 3], floor, range, inv);
+        patch_densities[19] = density_from_target([0.75f32; 3], floor, range, inv);
+        patch_densities[20] = density_from_target([0.55f32; 3], floor, range, inv);
+        patch_densities[21] = density_from_target([0.35f32; 3], floor, range, inv);
+        patch_densities[22] = density_from_target([0.20f32; 3], floor, range, inv);
+
+        let base_transmittance = [0.8f32, 0.6f32, 0.4f32];
+        let base = FilmBase {
+            transmittance: base_transmittance,
+        };
+
+        let remaining_x = width as f32 * (1.0 - span_fraction[0]);
+        let remaining_y = height as f32 * (1.0 - span_fraction[1]);
+        let left = remaining_x * offset_fraction[0];
+        let top = remaining_y * offset_fraction[1];
+        let right = left + width as f32 * span_fraction[0];
+        let bottom = top + height as f32 * span_fraction[1];
+        let cell_w = (right - left) / COLS as f32;
+        let cell_h = (bottom - top) / ROWS as f32;
+        let sep_w = cell_w * 0.06f32;
+        let sep_h = cell_h * 0.06f32;
+
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let xf = x as f32;
+                let yf = y as f32;
+
+                let value = if xf < left || xf >= right || yf < top || yf >= bottom {
+                    scene_background(xf, yf, base_transmittance)
+                } else {
+                    let col = ((xf - left) / cell_w) as usize;
+                    let row = ((yf - top) / cell_h) as usize;
+                    let in_sep_x = (xf - left) - col as f32 * cell_w < sep_w
+                        || (left + (col + 1) as f32 * cell_w) - xf < sep_w;
+                    let in_sep_y = (yf - top) - row as f32 * cell_h < sep_h
+                        || (top + (row + 1) as f32 * cell_h) - yf < sep_h;
+                    let col = col.min(COLS - 1);
+                    let row = row.min(ROWS - 1);
+
+                    if in_sep_x || in_sep_y {
+                        base_transmittance
+                    } else {
+                        transmittance_from_density(
+                            patch_densities[row * COLS + col],
+                            base_transmittance,
+                        )
+                    }
+                };
+
+                let idx = (y * width as usize + x) * 3;
+                data[idx] = value[0];
+                data[idx + 1] = value[1];
+                data[idx + 2] = value[2];
+            }
+        }
+
+        // Brighten the top image border. It is brighter than the card separators
+        // and guarantees the old global-maximum fill gate would fail on the
+        // horizontal projection, while a single border line cannot outscore the
+        // coherent five-line horizontal card lattice.
+        let border_scale = 1.2;
+        let border_value = [
+            base_transmittance[0] * border_scale,
+            base_transmittance[1] * border_scale,
+            base_transmittance[2] * border_scale,
+        ];
+        for x in 0..width as usize {
+            let top = x * 3;
+            data[top] = border_value[0];
+            data[top + 1] = border_value[1];
+            data[top + 2] = border_value[2];
+        }
+
+        (
+            LinearImage::new(width, height, data).expect("well-formed"),
+            base,
+        )
+    }
+
+    /// Deterministic non-uniform background for the scene around the card.
+    ///
+    /// The interior is random and never exceeds the separator brightness, so it
+    /// does not form a lattice of its own. The image border is brightened
+    /// separately to a value above the separators, guaranteeing the old
+    /// global-maximum fill gate would fail.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "synthetic pixel coordinates are small positive values used only for test noise"
+    )]
+    fn scene_background(xf: f32, yf: f32, base: [f32; 3]) -> [f32; 3] {
+        let x = xf as u32;
+        let y = yf as u32;
+        let mut state = x
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(y.wrapping_mul(0x85EB_CA6B))
+            .wrapping_add(0x1234_5678);
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        let n = state as f32 / u32::MAX as f32;
+        // Keep the interior well below the separator brightness so it cannot
+        // form false lines; contrast comes from the card, not the background.
+        let scale = 0.20 + 0.40 * n;
+        [base[0] * scale, base[1] * scale, base[2] * scale]
+    }
+
     fn density_from_target(
         target: [f32; 3],
         floor: [f32; 3],
@@ -933,6 +1166,94 @@ mod tests {
             msg.contains("--flip-h"),
             "error should suggest --flip-h: {msg}"
         );
+    }
+
+    #[test]
+    fn part_frame_checker_recovers_known_settings() {
+        // Card occupies about 65% of each axis at a non-centered offset, on a
+        // non-uniform background whose peak is brighter than the separators.
+        // The old global-maximum fill gate would reject this; the contrast gate
+        // should not.
+        let floor = [0.2f32; 3];
+        let ceiling = [2.2f32; 3];
+        let settings = crate::pipeline::Settings {
+            density_max: Some(ceiling),
+            density_floor: Some(floor),
+            crosstalk: IDENTITY,
+            ..crate::pipeline::Settings::default()
+        };
+        let (image, base) = synthetic_checker_in_scene(&settings, [0.65, 0.65], [0.3, 0.7]);
+        let measurements = measure(&image, &base).expect("checker should be found");
+        assert_eq!(measurements.cells.len(), CELLS);
+
+        let profile = fit_capture(&measurements, "test", "test").expect("fit should succeed");
+        let fitted_floor = profile.settings.density_floor.expect("fit emits floor");
+        let fitted_ceiling = profile.settings.density_max.expect("fit emits ceiling");
+        for channel in 0..3 {
+            close(fitted_floor[channel], floor[channel], "floor");
+            close(fitted_ceiling[channel], ceiling[channel], "ceiling");
+        }
+    }
+
+    #[test]
+    fn near_full_frame_checker_is_found() {
+        // About 90% span sits at the transition between the old +/-15% step
+        // tolerance and the new partial-frame search.
+        let floor = [0.2f32; 3];
+        let ceiling = [2.2f32; 3];
+        let settings = crate::pipeline::Settings {
+            density_max: Some(ceiling),
+            density_floor: Some(floor),
+            crosstalk: IDENTITY,
+            ..crate::pipeline::Settings::default()
+        };
+        let (image, base) = synthetic_checker_in_scene(&settings, [0.90, 0.90], [0.2, 0.8]);
+        let measurements = measure(&image, &base).expect("checker should be found");
+        assert_eq!(measurements.cells.len(), CELLS);
+
+        let profile = fit_capture(&measurements, "test", "test").expect("fit should succeed");
+        let fitted_floor = profile.settings.density_floor.expect("fit emits floor");
+        let fitted_ceiling = profile.settings.density_max.expect("fit emits ceiling");
+        for channel in 0..3 {
+            close(fitted_floor[channel], floor[channel], "floor");
+            close(fitted_ceiling[channel], ceiling[channel], "ceiling");
+        }
+    }
+
+    #[test]
+    fn small_span_checker_is_found() {
+        for span in [0.35f32, 0.40, 0.50] {
+            let floor = [0.2f32; 3];
+            let ceiling = [2.2f32; 3];
+            let settings = crate::pipeline::Settings {
+                density_max: Some(ceiling),
+                density_floor: Some(floor),
+                crosstalk: IDENTITY,
+                ..crate::pipeline::Settings::default()
+            };
+            let (image, base) = synthetic_checker_in_scene(&settings, [span, span], [0.3, 0.7]);
+            let measurements = measure(&image, &base)
+                .unwrap_or_else(|err| panic!("checker at {span} should be found: {err}"));
+
+            // Finding *a* grid is not enough: the cells have to land on the
+            // patches, or a lattice shifted by one cell would pass. Recovering
+            // the generating anchors is what proves the sampling.
+            let profile = fit_capture(&measurements, "test", "test").expect("fit should succeed");
+            let fitted_floor = profile.settings.density_floor.expect("fit emits floor");
+            let fitted_ceiling = profile.settings.density_max.expect("fit emits ceiling");
+            for channel in 0..3 {
+                close(
+                    fitted_floor[channel],
+                    floor[channel],
+                    &format!("floor at span {span}"),
+                );
+                close(
+                    fitted_ceiling[channel],
+                    ceiling[channel],
+                    &format!("ceiling at span {span}"),
+                );
+            }
+        }
     }
 
     #[test]
