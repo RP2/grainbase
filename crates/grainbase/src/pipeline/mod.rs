@@ -52,13 +52,13 @@ pub enum FilmMode {
     Slide,
 }
 
-/// Density mapped to the positive's white point by default, in log10 units.
+/// A flat reference density ceiling, in log10 units.
 ///
-/// A real negative's density range depends on the film stock, the exposure, and
-/// the capture. Fixed, existing, deterministic: the conversion does not
-/// compensate for exposure, so a thin scan stays thin — the maintainer's
-/// accuracy rule. A fitted calibration profile replaces the ceiling with the
-/// stock's measured value.
+/// This is **not** the render's default. The default is `default_density_max()`,
+/// the per-channel cones derived from Kodak's published LAD aims, because a
+/// shared ceiling leaves a channel whose content runs denser with its whites
+/// unfulfilled. This constant is the single scalar a synthetic fixture or a test
+/// wants when it needs a ceiling at all; nothing on the render path reads it.
 pub const DEFAULT_DENSITY_MAX: f32 = 2.0;
 
 /// The Kodak LAD aims for a mid-scale neutral, per channel, in Status-M
@@ -101,7 +101,7 @@ pub(crate) fn default_density_max() -> [f32; 3] {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settings {
     /// Density at which each channel reaches the positive's white point, or
-    /// `None` to use [`DEFAULT_DENSITY_MAX`].
+    /// `None` to use the pipeline's own default, `default_density_max()`.
     ///
     /// Per channel, and that is the point: the negative's three dye layers
     /// develop to slightly different contrasts. Any per-channel error grows

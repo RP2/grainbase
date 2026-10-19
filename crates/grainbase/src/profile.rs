@@ -112,31 +112,23 @@ pub struct Profile {
     pub family: Option<FilmMode>,
     /// The fitted conversion settings.
     ///
-    /// Derived `Default` would leave the bounds `None` — meaning *measured* —
-    /// which cannot serialise: a profile text is explicit by definition.
-    /// Overridden here so the neutral default round-trips.
+    /// A profile text is explicit by definition, so these always carry concrete
+    /// values: a neutral profile states the pipeline's own defaults rather than
+    /// leaving the bounds unset, and `Default` therefore serialises.
     pub settings: Settings,
 }
 
 impl Profile {
-    /// The neutral built-in profile: no fit, no correction, explicit
-    /// defaults.
+    /// The neutral built-in profile: exactly the pipeline's default render.
+    ///
+    /// It exists because a profile text is explicit by definition — the reader
+    /// requires `density_max` — so a profile that means "no fit" still has to say
+    /// what it means. What it means is [`Settings::default`]'s own ceilings, not
+    /// a flat 2.0: a neutral profile that renders differently from no profile at
+    /// all is a different profile wearing the name.
     #[must_use]
     pub fn neutral() -> Self {
-        Self {
-            film: String::new(),
-            camera: String::new(),
-            method: Method::Neutral,
-            frames: 0,
-            family: None,
-            settings: Settings {
-                density_max: Some([crate::pipeline::DEFAULT_DENSITY_MAX; 3]),
-                density_floor: None,
-                gamma: None,
-                pivot_density: None,
-                crosstalk: crate::pipeline::IDENTITY,
-            },
-        }
+        Self::default()
     }
 }
 
@@ -426,7 +418,6 @@ pub const NO_CROSSTALK: [[f32; 3]; 3] = IDENTITY;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::DEFAULT_DENSITY_MAX;
 
     fn sample() -> Profile {
         Profile {
@@ -458,11 +449,31 @@ mod tests {
         let text = Profile::neutral().to_string();
         let parsed = Profile::parse(&text).expect("should parse");
 
-        assert_eq!(parsed.settings.density_max, Some([DEFAULT_DENSITY_MAX; 3]));
+        // The one thing a neutral profile must do: render exactly like no
+        // profile. Loading one used to write a flat 2.0 into every ceiling, which
+        // made "neutral" a different look rather than the absence of one.
+        assert_eq!(parsed.settings.density_floor, None);
+        assert_eq!(parsed.settings.gamma, None);
+        assert_eq!(parsed.settings.pivot_density, None);
         assert_eq!(
             parsed.settings.crosstalk, IDENTITY,
             "default means no correction"
         );
+
+        let ceilings = parsed
+            .settings
+            .density_max
+            .expect("a neutral profile states its ceilings");
+        let defaults = crate::pipeline::default_density_max();
+        for channel in 0..3 {
+            assert!(
+                (ceilings[channel] - defaults[channel]).abs() < 1e-5,
+                "a neutral profile carries the pipeline's own ceilings, within the \
+                 profile text's precision: got {} for channel {channel}, expected {}",
+                ceilings[channel],
+                defaults[channel]
+            );
+        }
     }
 
     #[test]
@@ -570,6 +581,33 @@ mod tests {
     fn the_built_in_default_declares_itself_unfitted() {
         assert_eq!(Profile::default().method, Method::Neutral);
         assert_eq!(Profile::default().frames, 0);
+    }
+
+    #[test]
+    fn a_neutral_profile_renders_like_no_profile_at_output_precision() {
+        // The profile text carries six decimals, so a written neutral profile's
+        // values are within rounding of the defaults rather than bit-identical.
+        // What matters is that they are indistinguishable in the 16-bit output the
+        // encoder writes — a neutral profile must not be a look.
+        let source = crate::image::LinearImage::new(2, 1, vec![0.6, 0.4, 0.2, 0.1, 0.9, 0.3])
+            .expect("well-formed");
+        let base = crate::pipeline::FilmBase {
+            transmittance: [0.8, 0.5, 0.3],
+        };
+
+        let default = crate::pipeline::invert(&source, &base, &Settings::default());
+        let parsed = Profile::parse(&Profile::neutral().to_string()).expect("parses");
+        let neutral = crate::pipeline::invert(&source, &base, &parsed.settings);
+
+        for (plain, from_profile) in default.data.iter().zip(&neutral.data) {
+            let plain = i32::from(crate::encode::to_srgb16(*plain));
+            let from_profile = i32::from(crate::encode::to_srgb16(*from_profile));
+            assert!(
+                (plain - from_profile).abs() <= 1,
+                "a neutral profile must be indistinguishable at the encoder's \
+                 resolution: {plain} vs {from_profile}"
+            );
+        }
     }
 
     #[test]
