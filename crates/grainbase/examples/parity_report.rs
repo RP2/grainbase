@@ -1,33 +1,59 @@
 //! `parity_report`: measured per-channel difference between two same-sized
 //! display-encoded sRGB images.
 //!
-//! The first cut of the parity harness (U8): ours versus a reference render
-//! of the same frame. Both files are read as encoded sRGB PNG values, so the
-//! comparison is pixel-to-pixel with no transfer-function guessing. The
-//! reference must be aligned to ours first (a resize, which biases large
-//! gradients); alignment is the caller's job, and the tool refuses to
-//! compare different sizes.
+//! The parity harness (U8): ours versus a reference render of the same frame.
+//! Both files are read as encoded sRGB PNG values, so the comparison is
+//! pixel-to-pixel with no transfer-function guessing. The reference must be
+//! aligned to ours first (a resize, which biases large gradients); alignment is
+//! the caller's job, and the tool refuses to compare different sizes.
+//!
+//! ## What it scores, and why not means
+//!
+//! A frame mean collapses three channels and the scene's own colours into one
+//! number. It cannot see a per-channel error, and it reports a scene change as a
+//! pipeline change — which is how four bad changes once looked like progress.
+//! This tool therefore reports:
+//!
+//! - **each channel's distribution**, p5 / p50 / p95, ours against the reference;
+//! - **a neutral reference, per channel**, as G/R and B/R against 1.0, when
+//!   `--neutral` names a patch known to be neutral in the scene.
+//!
+//! The neutral readout is the one that matters: it is the only place the tool can
+//! tell a film or scanning cast from a scene that is genuinely one colour.
 //!
 //! ```text
-//! cargo run --example parity_report -- [--rotate180] ours.png reference.png
+//! cargo run --example parity_report -- [--rotate180] \
+//!   [--neutral x0,y0,x1,y1] ours.png reference.png
 //! ```
 
 fn main() -> Result<(), String> {
     let mut positional = Vec::new();
     let mut rotate = false;
-    for argument in std::env::args().skip(1) {
+    let mut neutral: Option<[f32; 4]> = None;
+    let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--rotate180" => rotate = true,
+            "--neutral" => {
+                let text = arguments
+                    .next()
+                    .ok_or("--neutral requires x0,y0,x1,y1 as fractions")?;
+                neutral = Some(parse_rect(&text)?);
+            }
             _ => positional.push(argument),
         }
     }
     let [ours_path, reference_path] = positional.as_slice() else {
-        return Err("usage: parity_report [--rotate180] ours.png reference.png".into());
+        return Err(
+            "usage: parity_report [--rotate180] [--neutral x0,y0,x1,y1] ours.png reference.png"
+                .into(),
+        );
     };
 
     let mut ours = decode_png(std::path::Path::new(ours_path))?;
     if rotate {
         ours.0 = ours.0.rotated_180();
+        ours.1 = rotate_display(&ours.1, ours.0.width, ours.0.height);
     }
     let reference = decode_png(std::path::Path::new(reference_path))?;
 
@@ -39,17 +65,46 @@ fn main() -> Result<(), String> {
     }
 
     let name = |channel: usize| ["red", "green", "blue"][channel];
+    println!("per-channel distribution (display values, 0..1):");
     for channel in 0..3 {
-        let ours_stats = statistics(&ours.1, channel);
-        let reference_stats = statistics(&reference.1, channel);
+        let ours_stats = distribution(&ours.1, channel);
+        let reference_stats = distribution(&reference.1, channel);
         println!(
-            "{:5} channel  ours mean {:.4} med {:.4}  ref mean {:.4} med {:.4}  mean-diff {:+.4}",
+            "  {:5}  ours p5 {:.3} p50 {:.3} p95 {:.3}   ref p5 {:.3} p50 {:.3} p95 {:.3}   delta p5 {:+.3} p50 {:+.3} p95 {:+.3}",
             name(channel),
-            ours_stats.mean,
-            ours_stats.median,
-            reference_stats.mean,
-            reference_stats.median,
-            ours_stats.mean - reference_stats.mean
+            ours_stats.p5,
+            ours_stats.p50,
+            ours_stats.p95,
+            reference_stats.p5,
+            reference_stats.p50,
+            reference_stats.p95,
+            ours_stats.p5 - reference_stats.p5,
+            ours_stats.p50 - reference_stats.p50,
+            ours_stats.p95 - reference_stats.p95,
+        );
+    }
+
+    if let Some(rect) = neutral {
+        let here = region_mean(&ours.0, &ours.1, rect);
+        let there = region_mean(&reference.0, &reference.1, rect);
+        match (here, there) {
+            (Some(here), Some(there)) => {
+                println!("neutral patch (fractions {rect:?}) — G/R and B/R against 1.0:");
+                print_neutral("ours", &here);
+                print_neutral("ref ", &there);
+                println!(
+                    "  delta     G/R {:+.3}  B/R {:+.3}",
+                    ratio(here[1], here[0]) - ratio(there[1], there[0]),
+                    ratio(here[2], here[0]) - ratio(there[2], there[0]),
+                );
+            }
+            _ => println!("neutral patch: the rectangle covers no pixels; check the fractions"),
+        }
+    } else {
+        println!(
+            "neutral patch: not given. Pass --neutral x0,y0,x1,y1 over a patch known to be \
+             neutral in the scene; without it this report cannot separate a cast from a scene \
+             that is genuinely one colour."
         );
     }
 
@@ -58,8 +113,130 @@ fn main() -> Result<(), String> {
         "color distance (delta-E76, first cut): mean {:.2}  p50 {:.2}  p95 {:.2}  p99 {:.2}",
         color_diff.mean, color_diff.median, color_diff.p95, color_diff.p99
     );
-    println!("ratio check: ours-vs-reference structured relation reported per channel above");
     Ok(())
+}
+
+/// A display value's G/R or B/R, guarding a zero red channel.
+fn ratio(channel: f32, red: f32) -> f32 {
+    channel / red.max(f32::MIN_POSITIVE)
+}
+
+/// Prints one image's neutral-patch means and their channel ratios.
+fn print_neutral(label: &str, means: &[f32; 3]) {
+    println!(
+        "  {label}  R {:.3} G {:.3} B {:.3}   G/R {:.3}  B/R {:.3}",
+        means[0],
+        means[1],
+        means[2],
+        ratio(means[1], means[0]),
+        ratio(means[2], means[0]),
+    );
+}
+
+/// Parses `--neutral x0,y0,x1,y1` as fractions of the image.
+fn parse_rect(text: &str) -> Result<[f32; 4], String> {
+    let parts: Vec<&str> = text.split(',').collect();
+    if parts.len() != 4 {
+        return Err("--neutral expects four comma-separated fractions".to_owned());
+    }
+    let mut out = [0.0f32; 4];
+    for (index, part) in parts.iter().enumerate() {
+        out[index] = part
+            .trim()
+            .parse()
+            .map_err(|_| format!("--neutral value `{part}` is not a number"))?;
+    }
+    Ok(out)
+}
+
+/// Reverses a display buffer in the same way [`LinearImage::rotated_180`] does.
+///
+/// The two buffers are decoded separately, so rotating one has to rotate the
+/// other; otherwise the pixels compared would be ours-rotated against
+/// reference-unrotated.
+fn rotate_display(display: &[[f32; 3]], width: u32, height: u32) -> Vec<[f32; 3]> {
+    let mut out = Vec::with_capacity(display.len());
+    for row in (0..height as usize).rev() {
+        for column in (0..width as usize).rev() {
+            out.push(display[row * width as usize + column]);
+        }
+    }
+    out
+}
+
+/// The mean display value per channel inside a fractional rectangle.
+fn region_mean(
+    image: &grainbase::LinearImage,
+    display: &[[f32; 3]],
+    rect: [f32; 4],
+) -> Option<[f32; 3]> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    if width == 0 || height == 0 || display.len() != width * height {
+        return None;
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rectangle bounds are clamped to the image and truncated to pixel indices"
+    )]
+    let span = |fraction: f32, extent: usize| -> usize {
+        (fraction.clamp(0.0, 1.0) * extent as f32).floor() as usize
+    };
+
+    let x0 = span(rect[0], width);
+    let y0 = span(rect[1], height);
+    let x1 = span(rect[2], width).min(width);
+    let y1 = span(rect[3], height).min(height);
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+
+    let mut sums = [0.0f64; 3];
+    let mut count = 0usize;
+    for row in y0..y1 {
+        for column in x0..x1 {
+            let pixel = display[row * width + column];
+            for (sum, value) in sums.iter_mut().zip(pixel) {
+                *sum += f64::from(value);
+            }
+            count += 1;
+        }
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "the pixel count of a patch is far below f64's exact-integer range"
+    )]
+    let count = count as f64;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a mean of display values in 0..=1 narrows to f32 with room to spare"
+    )]
+    let means = sums.map(|sum| (sum / count) as f32);
+    Some(means)
+}
+
+/// A channel's p5 / p50 / p95 display value.
+struct Distribution {
+    p5: f32,
+    p50: f32,
+    p95: f32,
+}
+
+fn distribution(display_sets: &[[f32; 3]], channel: usize) -> Distribution {
+    let mut values: Vec<f32> = display_sets.iter().map(|pixel| pixel[channel]).collect();
+    values.sort_by(f32::total_cmp);
+    let at = |percentile: f32| {
+        grainbase::pipeline::percentile::value_at_sorted(&values, percentile).unwrap_or(f32::NAN)
+    };
+    Distribution {
+        p5: at(5.0),
+        p50: at(50.0),
+        p95: at(95.0),
+    }
 }
 
 fn decode_png(path: &std::path::Path) -> Result<(grainbase::LinearImage, Vec<[f32; 3]>), String> {
@@ -115,26 +292,6 @@ fn decode_png(path: &std::path::Path) -> Result<(grainbase::LinearImage, Vec<[f3
     Ok((image, display))
 }
 
-struct Stats {
-    mean: f32,
-    median: f32,
-}
-
-fn statistics(display_sets: &[[f32; 3]], channel: usize) -> Stats {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "mean of up to 40 million samples needs no f32 mantissa exactness"
-    )]
-    let scale = |count: usize| count as f32;
-    let mut values: Vec<f32> = display_sets.iter().map(|p| p[channel]).collect();
-    let mean = values.iter().sum::<f32>() / scale(values.len());
-    values.sort_by(f32::total_cmp);
-    Stats {
-        mean,
-        median: values[values.len() / 2],
-    }
-}
-
 struct ColorDiff {
     mean: f32,
     median: f32,
@@ -180,7 +337,7 @@ fn color_metric(ours: &[[f32; 3]], reference: &[[f32; 3]]) -> ColorDiff {
     }
 }
 
-/// Stored (display) sRGB to CIELAB, D65, first cut: dekode to linear, sRGB
+/// Stored (display) sRGB to CIELAB, D65, first cut: decode to linear, sRGB
 /// matrix to XYZ, then the standard Lab transform.
 fn lab(display: &[f32; 3]) -> [f32; 3] {
     let linear: [f32; 3] = display.map(grainbase::encode::from_srgb16);
