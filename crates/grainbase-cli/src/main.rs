@@ -168,7 +168,7 @@ struct FitArgs {
 }
 
 #[derive(Debug, Parser)]
-#[command(group = clap::ArgGroup::new("wedge").required(true).args(["wedge_card", "wedge_steps"]))]
+#[command(group = clap::ArgGroup::new("wedge").required(true).args(["wedge_card", "wedge_steps", "neutral_rect"]))]
 struct CalibrateRigArgs {
     /// Process family this rig calibration is for.
     #[arg(long, value_enum)]
@@ -211,6 +211,18 @@ struct CalibrateRigArgs {
     /// uncropped scan. Overrides the automatic rebate-region detector.
     #[arg(long, value_parser = parse_base_sample)]
     base_sample: Option<[f32; 4]>,
+
+    /// A neutral patch in the frame, as fractions `x0,y0,x1,y1` **of the cropped
+    /// frame** — the rectangle is read from the image the frame detector cuts to,
+    /// which is what a preview shows.
+    ///
+    /// The manual tier for a scene that has a known grey but no chart. The
+    /// profile takes the per-channel ratios from the patch and the level from the
+    /// pipeline's default cone, so it removes a cast without becoming exposure
+    /// compensation. The patch has to be lit by a **neutral** light: under
+    /// tungsten the patch records the lamp and the profile would neutralise it.
+    #[arg(long, value_name = "x0,y0,x1,y1", value_parser = parse_base_sample)]
+    neutral_rect: Option<[f32; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -415,6 +427,8 @@ enum WedgeSource {
     Card(wedge::WedgeCard),
     /// Step densities given on the command line, found as a 1-D strip.
     Steps(Vec<f32>),
+    /// A neutral patch in the frame, stated by the operator as fractions.
+    NeutralRect([f32; 4]),
 }
 
 /// Fits a rig-scoped profile from a gray-wedge capture and writes it to disk.
@@ -469,44 +483,49 @@ fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
         }
     } else if let Some(steps) = args.wedge_steps {
         WedgeSource::Steps(steps)
+    } else if let Some(rect) = args.neutral_rect {
+        WedgeSource::NeutralRect(rect)
     } else {
-        // The clap group guarantees one of the two is present.
-        unreachable!("--wedge-card or --wedge-steps is required")
+        // The clap group guarantees one of the three is present.
+        unreachable!("--wedge-card, --wedge-steps or --neutral-rect is required")
     };
 
-    let measurement = match &source {
-        WedgeSource::Card(card) => wedge::measure_for_card(&image, &base, card),
-        WedgeSource::Steps(steps) => wedge::measure(&image, &base, steps),
-    };
-    let measurement = match measurement {
-        Ok(measurement) => measurement,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
-        }
-    };
-
+    let rig = rig_name(&scan.meta, args.camera);
     let family = args.family.into();
-    let rig = args.camera.unwrap_or_else(|| {
-        let make = scan.meta.make.trim();
-        let model = scan.meta.model.trim();
-        if make.is_empty() && model.is_empty() {
-            "unknown-rig".to_owned()
-        } else if make.is_empty() {
-            model.to_owned()
-        } else if model.is_empty() {
-            make.to_owned()
-        } else {
-            format!("{make} {model}")
-        }
-    });
 
-    let profile = match wedge::profile(&measurement, family, &rig) {
-        Ok(profile) => profile,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
-        }
+    // A neutral rectangle is measured straight from the frame; a card is located
+    // and fitted. They differ in what they can say: one patch gives the ratios at
+    // its density, a card gives a line.
+    let (profile, measurement) = if let WedgeSource::NeutralRect(rect) = &source {
+        let profile = match wedge::profile_from_neutral(&image, &base, *rect, family, &rig) {
+            Ok(profile) => profile,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        (profile, None)
+    } else {
+        let measurement = match &source {
+            WedgeSource::Card(card) => wedge::measure_for_card(&image, &base, card),
+            WedgeSource::Steps(steps) => wedge::measure(&image, &base, steps),
+            WedgeSource::NeutralRect(_) => unreachable!("handled above"),
+        };
+        let measurement = match measurement {
+            Ok(measurement) => measurement,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let profile = match wedge::profile(&measurement, family, &rig) {
+            Ok(profile) => profile,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        (profile, Some(measurement))
     };
 
     let output = match write_profile(&profile, args.out, &args.capture) {
@@ -517,9 +536,32 @@ fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
         }
     };
 
-    print_calibrate_rig_summary(&profile, &measurement);
+    match &measurement {
+        Some(measurement) => print_calibrate_rig_summary(&profile, measurement),
+        None => print_neutral_summary(&profile),
+    }
     println!("wrote {}", output.display());
     ExitCode::SUCCESS
+}
+
+/// The rig's name: the operator's, or the camera's make and model.
+///
+/// A rig is a camera plus a light table plus a process, so the camera's model
+/// alone does not identify it. This is only the default; the operator can name it.
+fn rig_name(meta: &grainbase::ScanMeta, camera: Option<String>) -> String {
+    camera.unwrap_or_else(|| {
+        let make = meta.make.trim();
+        let model = meta.model.trim();
+        if make.is_empty() && model.is_empty() {
+            "unknown-rig".to_owned()
+        } else if make.is_empty() {
+            model.to_owned()
+        } else if model.is_empty() {
+            make.to_owned()
+        } else {
+            format!("{make} {model}")
+        }
+    })
 }
 
 /// Finds the frame and reports it, identically for every calibration capture.
@@ -650,6 +692,31 @@ fn print_fit_summary(profile: &Profile) {
     for row in matrix {
         println!("    {:.4} {:.4} {:.4}", row[0], row[1], row[2]);
     }
+}
+
+/// Prints the summary for a profile built from one measured neutral patch.
+fn print_neutral_summary(profile: &Profile) {
+    let ceilings = profile
+        .settings
+        .density_max
+        .expect("a neutral fit emits ceilings");
+    let family = profile.family.expect("a rig profile carries a family");
+
+    println!(
+        "rig profile for {} on {}",
+        family_name(family),
+        profile.camera
+    );
+    println!("  from a measured neutral patch");
+    println!(
+        "  white point (density)  R {:.4}  G {:.4}  B {:.4}",
+        ceilings[0], ceilings[1], ceilings[2]
+    );
+    println!(
+        "  ceiling ratios         G/R {:.3}  B/R {:.3}",
+        ceilings[1] / ceilings[0].max(f32::MIN_POSITIVE),
+        ceilings[2] / ceilings[0].max(f32::MIN_POSITIVE)
+    );
 }
 
 /// Prints the rig-calibration summary: family, rig, axis, steps, and the

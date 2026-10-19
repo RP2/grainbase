@@ -652,6 +652,140 @@ pub fn profile(
     })
 }
 
+/// Builds a rig profile from one measured neutral patch in an ordinary frame.
+///
+/// A grey card in a frame is the cheapest neutral reference there is: it needs no
+/// special capture, only that the operator state where it is. That is the
+/// documented manual tier, not a heuristic.
+///
+/// One patch fixes the per-channel **ratios** at its density — which is the cast —
+/// but not the level, because the patch's density also carries the frame's own
+/// exposure. The level therefore comes from the pipeline's default cone, so the
+/// profile removes the cast without turning into exposure compensation.
+///
+/// The assumption it cannot check is the **illuminant**: the patch's densities are
+/// the product of the rig's response and the light's colour. Shoot the reference
+/// under a neutral light (daylight, flash, a calibrated lamp), or the profile
+/// neutralises the lamp.
+///
+/// # Errors
+///
+/// [`WedgeError::NoLattice`] when the rectangle covers no pixels, and
+/// [`WedgeError::DegenerateFit`] when the measured densities are degenerate.
+pub fn profile_from_neutral(
+    image: &LinearImage,
+    base: &FilmBase,
+    rect: [f32; 4],
+    family: crate::pipeline::FilmMode,
+    rig: &str,
+) -> Result<Profile, WedgeError> {
+    let measured = region_density(image, base, rect)?;
+
+    // A neutral patch renders neutral when every channel's ceiling is
+    // proportional to that channel's density there. The constant of
+    // proportionality sets the level, and taking it from the default cone's own
+    // geometric mean leaves the render's brightness where the default put it.
+    let reference = super::default_density_max();
+    let measured_mean = geometric_mean(measured);
+    let reference_mean = geometric_mean(reference);
+    if measured_mean <= f32::MIN_POSITIVE || reference_mean <= f32::MIN_POSITIVE {
+        return Err(WedgeError::DegenerateFit);
+    }
+    let scale = reference_mean / measured_mean;
+    let ceilings = measured.map(|density| (density * scale).max(f32::MIN_POSITIVE));
+
+    Ok(Profile {
+        film: String::new(),
+        camera: rig.to_owned(),
+        family: Some(family),
+        method: Method::Fitted,
+        frames: 1,
+        settings: crate::pipeline::Settings {
+            density_max: Some(ceilings),
+            density_floor: None,
+            gamma: None,
+            pivot_density: None,
+            crosstalk: crate::pipeline::IDENTITY,
+        },
+    })
+}
+
+/// The mean density of a fractional rectangle, per channel, above the film base.
+///
+/// The mean transmittance is taken first and turned into density afterwards, so a
+/// grain-free area averages to the density of the light it passed — the same
+/// arithmetic the meter uses.
+fn region_density(
+    image: &LinearImage,
+    base: &FilmBase,
+    rect: [f32; 4],
+) -> Result<[f32; 3], WedgeError> {
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+    if width == 0 || height == 0 || pixels.is_empty() {
+        return Err(WedgeError::NoLattice {
+            reason: "the image has no pixels".to_owned(),
+        });
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rectangle bounds are clamped to the image and truncated to pixel indices"
+    )]
+    let span = |fraction: f32, extent: usize| -> usize {
+        (fraction.clamp(0.0, 1.0) * extent as f32).floor() as usize
+    };
+
+    let x0 = span(rect[0], width);
+    let y0 = span(rect[1], height);
+    let x1 = span(rect[2], width).min(width);
+    let y1 = span(rect[3], height).min(height);
+    if x1 <= x0 || y1 <= y0 {
+        return Err(WedgeError::NoLattice {
+            reason: "the neutral rectangle covers no pixels".to_owned(),
+        });
+    }
+
+    let mut sums = [0.0f64; 3];
+    let mut count = 0u64;
+    for row in y0..y1 {
+        for column in x0..x1 {
+            let pixel = pixels[row * width + column];
+            for (sum, value) in sums.iter_mut().zip(pixel) {
+                *sum += f64::from(value);
+            }
+            count += 1;
+        }
+    }
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a patch's pixel count is far below f64's exact-integer range"
+    )]
+    let count = count as f64;
+    Ok(std::array::from_fn(|channel| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a mean of samples in 0..=1 narrows to f32 with room to spare"
+        )]
+        let mean = (sums[channel] / count) as f32;
+        let base_channel = base.transmittance[channel].max(f32::MIN_POSITIVE);
+        -((mean / base_channel).clamp(0.0, 1.0).log10()).min(super::MAX_DENSITY)
+    }))
+}
+
+/// The geometric mean of three positive values.
+fn geometric_mean(values: [f32; 3]) -> f32 {
+    let product = values
+        .iter()
+        .map(|value| value.max(f32::MIN_POSITIVE))
+        .product::<f32>();
+    product.cbrt()
+}
+
 /// Straightness ratio of the fit: residual divided by the fitted range.
 ///
 /// A small ratio means the response is straight; a large ratio warns that a
@@ -943,6 +1077,64 @@ mod tests {
             axis: Axis::Vertical,
         };
         assert_eq!(fit(&measurement), Err(WedgeError::DegenerateFit));
+    }
+
+    #[test]
+    fn a_measured_neutral_patch_becomes_a_cast_correcting_profile() {
+        let base = FilmBase {
+            transmittance: [0.8, 0.6, 0.4],
+        };
+        // A neutral patch as the rig actually recorded it: unequal per channel.
+        let density = [0.40f32, 0.55, 0.35];
+        let count = 16u32 * 16;
+        let mut data = Vec::with_capacity((count * 3) as usize);
+        for _ in 0..count {
+            for (channel, transmittance) in base.transmittance.iter().enumerate() {
+                data.push(transmittance * 10f32.powf(-density[channel]));
+            }
+        }
+        let image = LinearImage::new(16, 16, data).expect("well-formed");
+
+        let profile = profile_from_neutral(
+            &image,
+            &base,
+            [0.0, 0.0, 1.0, 1.0],
+            crate::pipeline::FilmMode::ColorNegative,
+            "test-rig",
+        )
+        .expect("a patch should measure");
+
+        let ceilings = profile.settings.density_max.expect("ceilings");
+        let reference = crate::pipeline::default_density_max();
+        assert!(
+            (geometric_mean(ceilings) - geometric_mean(reference)).abs() < 1e-4,
+            "the profile keeps the default cone's level: {ceilings:?} against {reference:?}"
+        );
+
+        let positive = crate::pipeline::invert(&image, &base, &profile.settings);
+        let [red, green, blue] = [positive.data[0], positive.data[1], positive.data[2]];
+        assert!(
+            (red - green).abs() < 1e-4 && (green - blue).abs() < 1e-4,
+            "a measured neutral must render neutral: {red} {green} {blue}"
+        );
+    }
+
+    #[test]
+    fn a_neutral_rectangle_off_the_image_is_refused() {
+        let base = FilmBase {
+            transmittance: [0.8, 0.6, 0.4],
+        };
+        let image = LinearImage::new(16, 16, vec![0.5; 16 * 16 * 3]).expect("well-formed");
+        assert!(matches!(
+            profile_from_neutral(
+                &image,
+                &base,
+                [0.9, 0.9, 0.91, 0.91],
+                crate::pipeline::FilmMode::ColorNegative,
+                "test-rig",
+            ),
+            Err(WedgeError::NoLattice { .. })
+        ));
     }
 
     #[test]
