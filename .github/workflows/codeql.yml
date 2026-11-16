@@ -1,14 +1,11 @@
 name: codeql
 
-# Push to main and a weekly refresh, but NOT on every pull request: CodeQL is by
-# far the slowest thing here, and it hunts for the kind of latent bug that tends
-# to survive a round of review anyway. Weekly plus every merge is enough.
+# Push to main only. CodeQL is by far the slowest thing here, and it hunts
+# for the kind of latent bug that tends to survive a round of review anyway.
 on:
   push:
     branches: [main]
-  schedule:
-    # Mondays 14:20 UTC — staggered away from the other scheduled runs.
-    - cron: "20 14 * * 1"
+  workflow_dispatch:
 
 permissions: {}
 
