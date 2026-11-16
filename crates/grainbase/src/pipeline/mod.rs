@@ -333,17 +333,38 @@ pub fn convert(
     }
 }
 
-/// Denoises the chroma channels of a placed positive, keeping the luma.
+/// Denoises the chroma of a placed positive, keeping the luma and the edges.
 ///
 /// The density transform amplifies per-pixel transmittance noise in the thin
 /// dye channels into large density swings, and the unmix decorrelates the
 /// channels, so the render's chroma noise runs several times the lab's while
-/// the luma grain measures comparable. Following `NegPy`'s documented design
-/// (0.65: "a band split of the color channels that removes color speckle,
-/// keeps color edges and leaves grain alone"), each chroma plane splits into
-/// a low band and a detail band; the detail is soft-shrunk by a threshold
-/// tied to the plane's own robust noise estimate, so the speckle goes, the
-/// edges stay, and the luma grain is never touched.
+/// the luma grain measures comparable. Dark structures — the chart's border
+/// strip, deep scene shadows — sit where per-channel densities clamp at the
+/// base, so their speckle rides on strong chroma edges that an edge-test
+/// denoise keeps wholesale.
+///
+/// The mechanism is non-local means on the CIELAB a*/b* planes (Buades et
+/// al., CVPR 2005): a pixel is averaged with the pixels whose 3x3 chroma
+/// *patches* match its own, wherever they sit in the search window. Speckled
+/// pixels average with their own kind inside a dark structure, a blotch with
+/// other blotches, and a patch-to-border edge matches nothing similar, so it
+/// survives. L* is never touched — the luma grain stays. The noise sigma
+/// that sets the weights is self-calibrated from each plane's own
+/// median absolute deviation.
+///
+/// The search runs at half resolution: chroma is low-frequency, and the
+/// fourfold pixel saving buys the patch search its runtime.
+///
+/// `strength` scales the filter: twice the noise sigma is what a weight of
+/// e^-1 means, and the search radius follows it, so a larger value averages
+/// more aggressively and further.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap,
+    clippy::too_many_lines,
+    reason = "pixel coordinates and the search window are small positive values; the nlm core is one coherent loop nest"
+)]
 fn chroma_denoise(image: &LinearImage, strength: f32) -> LinearImage {
     if strength <= 0.0 {
         return image.clone();
@@ -352,76 +373,198 @@ fn chroma_denoise(image: &LinearImage, strength: f32) -> LinearImage {
     let height = image.height as usize;
     let (pixels, _remainder) = image.data.as_chunks::<3>();
 
-    let weights = [0.2126f32, 0.7152, 0.0722];
-    let mut luma = vec![0.0f32; width * height];
-    // The chroma channels are processed as separate planes: a blur over the
-    // interleaved buffer would smear across channel boundaries.
-    let mut chroma: [Vec<f32>; 3] = [
-        vec![0.0f32; width * height],
-        vec![0.0f32; width * height],
-        vec![0.0f32; width * height],
-    ];
+    let mut luminance = vec![0.0f32; width * height];
+    let mut a_plane = vec![0.0f32; width * height];
+    let mut b_plane = vec![0.0f32; width * height];
     for (index, pixel) in pixels.iter().enumerate() {
-        let y = pixel[0] * weights[0] + pixel[1] * weights[1] + pixel[2] * weights[2];
-        luma[index] = y;
-        for channel in 0..3 {
-            chroma[channel][index] = pixel[channel] - y;
+        let lab = rgb_to_lab(*pixel);
+        luminance[index] = lab[0];
+        a_plane[index] = lab[1];
+        b_plane[index] = lab[2];
+    }
+
+    // Half resolution: chroma is low-frequency.
+    let factor = 2usize;
+    let small_w = width.div_ceil(factor);
+    let small_h = height.div_ceil(factor);
+    let mut a_small = vec![0.0f32; small_w * small_h];
+    let mut b_small = vec![0.0f32; small_w * small_h];
+    for (sy, a_row) in a_small.chunks_mut(small_w).enumerate() {
+        for (sx, a_slot) in a_row.iter_mut().enumerate() {
+            let (mut sum_a, mut sum_b, mut count) = (0.0f32, 0.0f32, 0.0f32);
+            for y in (sy * factor)..((sy + 1) * factor).min(height) {
+                for x in (sx * factor)..((sx + 1) * factor).min(width) {
+                    let index = y * width + x;
+                    sum_a += a_plane[index];
+                    sum_b += b_plane[index];
+                    count += 1.0;
+                }
+            }
+            *a_slot = sum_a / count;
+            b_small[sy * small_w + sx] = sum_b / count;
         }
     }
 
-    for plane in &mut chroma {
-        // The low band: the two-pass box blur reads as a soft gaussian. The
-        // split scale matches the measured blotch (~20 source px), so the
-        // blotch falls into the detail band where the shrink reaches it.
-        let mut low = plane.clone();
+    // Noise sigma per plane: the MAD of each plane's own detail band.
+    let mut noise = [0.0f32; 2];
+    for (plane, sigma) in [&a_small, &b_small].iter().zip(noise.iter_mut()) {
+        let mut low = (*plane).clone();
         for _ in 0..2 {
-            box_blur(&mut low, width, height, 20);
+            box_blur(&mut low, small_w, small_h, 5);
         }
-        for (detail, base) in plane.iter_mut().zip(low.iter()) {
-            *detail -= *base;
-        }
+        let mut detail: Vec<f32> = plane
+            .iter()
+            .zip(low.iter())
+            .map(|(value, base)| (value - base).abs())
+            .collect();
+        *sigma = 2.5 * percentile::value_at(&mut detail, 50.0).unwrap_or(0.0) * 1.4826;
+    }
+    let sigma_mean = f32::midpoint(noise[0], noise[1]);
+    let h = (strength * sigma_mean).max(1e-3);
+    let h_sq_inv = 1.0 / (2.0 * h * h);
 
-        // Robust noise estimate: the median absolute deviation of the detail
-        // band. Speckle dominates it; real edges are the tail the threshold
-        // keeps.
-        let mut magnitudes: Vec<f32> = plane.iter().map(|detail| detail.abs()).collect();
-        let noise = percentile::value_at(&mut magnitudes, 50.0).unwrap_or(0.0) * 1.4826;
-
-        // The noise is signal-dependent: the density transform's gain grows
-        // as the print darkens (measured 2026-11-16: source std ~30 in the
-        // chart's black against ~4 in the midtones). The threshold scales
-        // with the inverse of the local luma, capped so a single dark pixel
-        // cannot open an unbounded gate.
-        let mut luma_sorted = luma.clone();
-        let median_luma = percentile::value_at(&mut luma_sorted, 50.0)
-            .unwrap_or(1.0)
-            .max(1e-3);
-        let base_threshold = strength * noise;
-        for (detail, luma) in plane.iter_mut().zip(luma.iter()) {
-            let scale = (median_luma / luma.max(1e-3)).clamp(1.0, 6.0);
-            let threshold = base_threshold * scale;
-            let magnitude = detail.abs();
-            if magnitude > threshold {
-                // Soft shrink: full signal above the threshold, scaled down
-                // below it, so edges do not ring.
-                let kept = (magnitude - threshold) / magnitude;
-                *detail *= kept;
-            } else {
-                *detail = 0.0;
+    let search_radius = (strength * 2.0).round().clamp(3.0, 12.0) as i32;
+    let patch_radius = 1i32;
+    let mut a_denoised = vec![0.0f32; small_w * small_h];
+    let mut b_denoised = vec![0.0f32; small_w * small_h];
+    for sy in 0..small_h {
+        for sx in 0..small_w {
+            let centre = sy * small_w + sx;
+            // The centre patch's own chroma vector, over the 3x3 patch.
+            let mut sum_a = 0.0f32;
+            let mut sum_b = 0.0f32;
+            let mut weight_sum = 0.0f32;
+            for dy in -search_radius..=search_radius {
+                let qy = (sy as i32 + dy).clamp(0, small_h as i32 - 1);
+                for dx in -search_radius..=search_radius {
+                    let qx = (sx as i32 + dx).clamp(0, small_w as i32 - 1);
+                    // Patch distance: 3x3 of the two chroma planes.
+                    let mut distance_sq = 0.0f32;
+                    for py in -patch_radius..=patch_radius {
+                        for px in -patch_radius..=patch_radius {
+                            let query_y = (qy + py).clamp(0, small_h as i32 - 1) as usize;
+                            let query_x = (qx + px).clamp(0, small_w as i32 - 1) as usize;
+                            let centre_y = (sy as i32 + py).clamp(0, small_h as i32 - 1) as usize;
+                            let centre_x = (sx as i32 + px).clamp(0, small_w as i32 - 1) as usize;
+                            let qi = query_y * small_w + query_x;
+                            let ci = centre_y * small_w + centre_x;
+                            let delta_a = a_small[qi] - a_small[ci];
+                            let delta_b = b_small[qi] - b_small[ci];
+                            distance_sq += delta_a * delta_a + delta_b * delta_b;
+                        }
+                    }
+                    // The noise floor is subtracted out: flat-noisy regions
+                    // average, instead of every neighbour weighing equally.
+                    let excess = (distance_sq - 2.0 * sigma_mean * sigma_mean).max(0.0);
+                    let weight = (-excess * h_sq_inv).exp();
+                    let qi = qy as usize * small_w + qx as usize;
+                    sum_a += weight * a_small[qi];
+                    sum_b += weight * b_small[qi];
+                    weight_sum += weight;
+                }
             }
+            a_denoised[centre] = sum_a / weight_sum;
+            b_denoised[centre] = sum_b / weight_sum;
         }
-        for (value, base) in plane.iter_mut().zip(low.iter()) {
-            *value += *base;
+    }
+
+    // Upsample the smoothed chroma back over the full-resolution luma.
+    let mut a_up = vec![0.0f32; width * height];
+    let mut b_up = vec![0.0f32; width * height];
+    for y in 0..height {
+        for x in 0..width {
+            let sx = (x / factor).min(small_w - 1);
+            let sy = (y / factor).min(small_h - 1);
+            let index = sy * small_w + sx;
+            a_up[y * width + x] = a_denoised[index];
+            b_up[y * width + x] = b_denoised[index];
         }
     }
 
     let mut out = vec![0.0f32; width * height * 3];
     for index in 0..width * height {
+        let rgb = lab_to_rgb([luminance[index], a_up[index], b_up[index]]);
         for channel in 0..3 {
-            out[index * 3 + channel] = (luma[index] + chroma[channel][index]).clamp(0.0, 1.0);
+            out[index * 3 + channel] = rgb[channel].clamp(0.0, 1.0);
         }
     }
     LinearImage::new(image.width, image.height, out).expect("same dimensions")
+}
+
+/// Density beyond which a sample is simply opaque.
+///
+/// A real negative tops out near 3 log10; 10 is safely past anything physical
+/// while keeping the arithmetic finite. Without a bound, a fully opaque sample
+/// (`transmittance == 0`) yields infinity, and the crosstalk step then computes
+/// `0.0 * infinity`, which is NaN and would poison the whole frame.
+pub(crate) const MAX_DENSITY: f32 = 10.0;
+
+/// Linear sRGB (D65) to CIELAB.
+fn rgb_to_lab(rgb: [f32; 3]) -> [f32; 3] {
+    let xyz = srgb_to_xyz(rgb);
+    let f = |t: f32| -> f32 {
+        const DELTA: f32 = 6.0 / 29.0;
+        if t > DELTA * DELTA * DELTA {
+            t.cbrt()
+        } else {
+            t / (3.0 * DELTA * DELTA) + 4.0 / 29.0
+        }
+    };
+    let xn = 0.95047;
+    let yn = 1.0;
+    let zn = 1.08883;
+    let fx = f(xyz[0] / xn);
+    let fy = f(xyz[1] / yn);
+    let fz = f(xyz[2] / zn);
+    [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)]
+}
+
+/// CIELAB to linear sRGB (D65), unclamped.
+fn lab_to_rgb(lab: [f32; 3]) -> [f32; 3] {
+    const DELTA: f32 = 6.0 / 29.0;
+    let fy = (lab[0] + 16.0) / 116.0;
+    let fx = fy + lab[1] / 500.0;
+    let fz = fy - lab[2] / 200.0;
+    let finv = |t: f32| -> f32 {
+        if t > DELTA {
+            t * t * t
+        } else {
+            3.0 * DELTA * DELTA * (t - 4.0 / 29.0)
+        }
+    };
+    let xn = 0.95047;
+    let yn = 1.0;
+    let zn = 1.08883;
+    let xyz = [finv(fx) * xn, finv(fy) * yn, finv(fz) * zn];
+    xyz_to_srgb(xyz)
+}
+
+/// Linear sRGB to XYZ, D65.
+fn srgb_to_xyz(rgb: [f32; 3]) -> [f32; 3] {
+    let matrix = [
+        [0.412_456_4, 0.357_576_1, 0.180_437_5],
+        [0.212_672_9, 0.715_152_2, 0.072_175_0],
+        [0.019_333_9, 0.119_192, 0.950_304],
+    ];
+    let mut out = [0.0f32; 3];
+    for (row, value) in out.iter_mut().enumerate() {
+        *value = matrix[row].iter().zip(rgb.iter()).map(|(m, v)| m * v).sum();
+    }
+    out
+}
+
+/// XYZ (D65) to linear sRGB.
+fn xyz_to_srgb(xyz: [f32; 3]) -> [f32; 3] {
+    let matrix = [
+        [3.240_454_2, -1.537_138_5, -0.498_531_4],
+        [-0.969_266, 1.876_011, 0.041_556],
+        [0.055_643_4, -0.204_025_9, 1.057_225_2],
+    ];
+    let mut out = [0.0f32; 3];
+    for (row, value) in out.iter_mut().enumerate() {
+        *value = matrix[row].iter().zip(xyz.iter()).map(|(m, v)| m * v).sum();
+    }
+    out
 }
 
 /// One separable box-blur pass over a single-plane image.
@@ -433,9 +576,8 @@ fn box_blur(plane: &mut [f32], width: usize, height: usize, radius: usize) {
     let radius = radius.min(width.max(height) - 1);
     let count = (2 * radius + 1) as f32;
     let mut row = vec![0.0f32; width];
-    for (y, out_row) in plane.chunks_mut(width).enumerate() {
+    for out_row in plane.chunks_mut(width) {
         // Horizontal.
-        let _ = y;
         for (x, slot) in row.iter_mut().enumerate() {
             let from = x.saturating_sub(radius);
             let to = (x + radius).min(width - 1);
@@ -456,14 +598,6 @@ fn box_blur(plane: &mut [f32], width: usize, height: usize, radius: usize) {
         }
     }
 }
-
-/// Density beyond which a sample is simply opaque.
-///
-/// A real negative tops out near 3 log10; 10 is safely past anything physical
-/// while keeping the arithmetic finite. Without a bound, a fully opaque sample
-/// (`transmittance == 0`) yields infinity, and the crosstalk step then computes
-/// `0.0 * infinity`, which is NaN and would poison the whole frame.
-pub(crate) const MAX_DENSITY: f32 = 10.0;
 
 /// Optical density of one sample relative to the film base.
 pub(crate) fn density_of(value: f32, base: f32) -> f32 {

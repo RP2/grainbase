@@ -87,6 +87,10 @@ struct Cli {
     #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
     density_floor: Option<[f32; 3]>,
 
+    /// Chroma denoise strength, the Gaussian's sigma in pixels. Zero disables.
+    #[arg(long)]
+    chroma_denoise: Option<f32>,
+
     /// Per-channel print-curve contrast `r,g,b`, overriding a profile's. Above
     /// 1 deepens shadows, below 1 lifts them.
     #[arg(long, value_name = "R,G,B", value_parser = parse_base_rgb)]
@@ -328,6 +332,7 @@ fn main() -> ExitCode {
             density_floor: cli.density_floor.or(settings.density_floor),
             gamma: cli.gamma.or(settings.gamma),
             pivot_density: cli.pivot_density.or(settings.pivot_density),
+            chroma_denoise: cli.chroma_denoise.unwrap_or(settings.chroma_denoise),
             ..settings
         }) {
             Ok(settings) => settings,
