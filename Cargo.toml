@@ -1,4 +1,11 @@
 [workspace]
+
+# Tests decode and process pixel images; an unoptimized debug build turns
+# per-pixel loops into multi-second paths that hide algorithmic problems. Keep
+# debug info, optimize the test profile.
+[profile.test]
+opt-level = 2
+
 resolver = "3"
 members = [
     "crates/grainbase",
