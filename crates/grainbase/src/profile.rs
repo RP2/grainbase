@@ -332,6 +332,7 @@ impl Profile {
                 gamma,
                 pivot_density,
                 crosstalk: crosstalk.ok_or(ParseError::MissingKey { key: "crosstalk" })?,
+                ..Settings::default()
             },
         })
     }
@@ -432,6 +433,7 @@ mod tests {
                 gamma: None,
                 pivot_density: None,
                 crosstalk: [[1.0, 0.05, 0.02], [0.03, 1.0, 0.04], [0.01, 0.02, 1.0]],
+                ..Settings::default()
             },
         }
     }

@@ -648,6 +648,7 @@ pub fn profile(
             gamma: None,
             pivot_density: None,
             crosstalk: crate::pipeline::IDENTITY,
+            ..crate::pipeline::Settings::default()
         },
     })
 }
@@ -706,6 +707,7 @@ pub fn profile_from_neutral(
             gamma: None,
             pivot_density: None,
             crosstalk: crate::pipeline::IDENTITY,
+            ..crate::pipeline::Settings::default()
         },
     })
 }

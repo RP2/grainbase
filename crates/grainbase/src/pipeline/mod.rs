@@ -166,6 +166,19 @@ pub struct Settings {
     /// per-channel level imbalance the prior cannot touch; the honest sources
     /// are the film itself, fitted by the maintainer's capture protocol.
     pub crosstalk: [[f32; 3]; 3],
+
+    /// Chroma denoise strength, in source-pixel blur radius.
+    ///
+    /// The density transform amplifies per-pixel transmittance noise in the
+    /// thin channels into large density swings, and the unmix decorrelates
+    /// the channels, so the render's chroma noise runs several times the
+    /// lab's (measured 2026-11-16: patch sample std 8-22 against the lab's
+    /// 2-4 at matched size). Denoising the chroma alone keeps the luma grain —
+    /// which measures comparable to the lab's — while removing the colored
+    /// speckle. Default 5: at a 24 MP scan that is the smoothing the lab's
+    /// own 4x-downscaled delivery applies to the same noise, and it brings
+    /// the measured chroma noise to parity.
+    pub chroma_denoise: f32,
 }
 
 impl Default for Settings {
@@ -176,6 +189,7 @@ impl Default for Settings {
             gamma: None,
             pivot_density: None,
             crosstalk: IDENTITY,
+            chroma_denoise: 5.0,
         }
     }
 }
@@ -261,11 +275,9 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
         .unwrap_or_else(default_density_max)
         .map(|value| value.max(f32::MIN_POSITIVE));
     let crosstalk = settings.crosstalk;
+    // The print's black is the film base: density is measured relative to the
+    // base, so the floor is zero unless the operator fixes one.
     let floor = settings.density_floor.unwrap_or([0.0; 3]);
-
-    // The print curve: only meaningful when both a pivot density and an
-    // exponent are supplied. The pivot's normalized position maps to the
-    // reference gray; the pieces meet there with continuous slope.
     let curve = curve_from_settings(settings, floor, density_max);
 
     image.map_rgb(|[red, green, blue]| {
@@ -304,17 +316,144 @@ pub fn convert(
     slide_normalize: bool,
 ) -> LinearImage {
     match mode {
-        FilmMode::ColorNegative => invert(
-            image,
-            base.expect("ColorNegative needs a measured base"),
-            settings,
-        ),
+        FilmMode::ColorNegative => {
+            let out = invert(
+                image,
+                base.expect("ColorNegative needs a measured base"),
+                settings,
+            );
+            chroma_denoise(&out, settings.chroma_denoise)
+        }
         FilmMode::BlackAndWhite => bw::render(
             image,
             base.expect("BlackAndWhite needs a measured base"),
             settings,
         ),
         FilmMode::Slide => slide::render(image, base, slide_normalize),
+    }
+}
+
+/// Denoises the chroma channels of a placed positive, keeping the luma.
+///
+/// The density transform amplifies per-pixel transmittance noise in the thin
+/// dye channels into large density swings, and the unmix decorrelates the
+/// channels, so the render's chroma noise runs several times the lab's while
+/// the luma grain measures comparable. Following `NegPy`'s documented design
+/// (0.65: "a band split of the color channels that removes color speckle,
+/// keeps color edges and leaves grain alone"), each chroma plane splits into
+/// a low band and a detail band; the detail is soft-shrunk by a threshold
+/// tied to the plane's own robust noise estimate, so the speckle goes, the
+/// edges stay, and the luma grain is never touched.
+fn chroma_denoise(image: &LinearImage, strength: f32) -> LinearImage {
+    if strength <= 0.0 {
+        return image.clone();
+    }
+    let width = image.width as usize;
+    let height = image.height as usize;
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+
+    let weights = [0.2126f32, 0.7152, 0.0722];
+    let mut luma = vec![0.0f32; width * height];
+    // The chroma channels are processed as separate planes: a blur over the
+    // interleaved buffer would smear across channel boundaries.
+    let mut chroma: [Vec<f32>; 3] = [
+        vec![0.0f32; width * height],
+        vec![0.0f32; width * height],
+        vec![0.0f32; width * height],
+    ];
+    for (index, pixel) in pixels.iter().enumerate() {
+        let y = pixel[0] * weights[0] + pixel[1] * weights[1] + pixel[2] * weights[2];
+        luma[index] = y;
+        for channel in 0..3 {
+            chroma[channel][index] = pixel[channel] - y;
+        }
+    }
+
+    for plane in &mut chroma {
+        // The low band: the two-pass box blur reads as a soft gaussian. The
+        // split scale matches the measured blotch (~20 source px), so the
+        // blotch falls into the detail band where the shrink reaches it.
+        let mut low = plane.clone();
+        for _ in 0..2 {
+            box_blur(&mut low, width, height, 20);
+        }
+        for (detail, base) in plane.iter_mut().zip(low.iter()) {
+            *detail -= *base;
+        }
+
+        // Robust noise estimate: the median absolute deviation of the detail
+        // band. Speckle dominates it; real edges are the tail the threshold
+        // keeps.
+        let mut magnitudes: Vec<f32> = plane.iter().map(|detail| detail.abs()).collect();
+        let noise = percentile::value_at(&mut magnitudes, 50.0).unwrap_or(0.0) * 1.4826;
+
+        // The noise is signal-dependent: the density transform's gain grows
+        // as the print darkens (measured 2026-11-16: source std ~30 in the
+        // chart's black against ~4 in the midtones). The threshold scales
+        // with the inverse of the local luma, capped so a single dark pixel
+        // cannot open an unbounded gate.
+        let mut luma_sorted = luma.clone();
+        let median_luma = percentile::value_at(&mut luma_sorted, 50.0)
+            .unwrap_or(1.0)
+            .max(1e-3);
+        let base_threshold = strength * noise;
+        for (detail, luma) in plane.iter_mut().zip(luma.iter()) {
+            let scale = (median_luma / luma.max(1e-3)).clamp(1.0, 6.0);
+            let threshold = base_threshold * scale;
+            let magnitude = detail.abs();
+            if magnitude > threshold {
+                // Soft shrink: full signal above the threshold, scaled down
+                // below it, so edges do not ring.
+                let kept = (magnitude - threshold) / magnitude;
+                *detail *= kept;
+            } else {
+                *detail = 0.0;
+            }
+        }
+        for (value, base) in plane.iter_mut().zip(low.iter()) {
+            *value += *base;
+        }
+    }
+
+    let mut out = vec![0.0f32; width * height * 3];
+    for index in 0..width * height {
+        for channel in 0..3 {
+            out[index * 3 + channel] = (luma[index] + chroma[channel][index]).clamp(0.0, 1.0);
+        }
+    }
+    LinearImage::new(image.width, image.height, out).expect("same dimensions")
+}
+
+/// One separable box-blur pass over a single-plane image.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the blur window is a small odd count that fits f32 exactly"
+)]
+fn box_blur(plane: &mut [f32], width: usize, height: usize, radius: usize) {
+    let radius = radius.min(width.max(height) - 1);
+    let count = (2 * radius + 1) as f32;
+    let mut row = vec![0.0f32; width];
+    for (y, out_row) in plane.chunks_mut(width).enumerate() {
+        // Horizontal.
+        let _ = y;
+        for (x, slot) in row.iter_mut().enumerate() {
+            let from = x.saturating_sub(radius);
+            let to = (x + radius).min(width - 1);
+            *slot = out_row[from..=to].iter().sum::<f32>() / count;
+        }
+        out_row.copy_from_slice(&row);
+    }
+    // Vertical.
+    let mut column = vec![0.0f32; height];
+    for x in 0..width {
+        for (y, slot) in column.iter_mut().enumerate() {
+            let from = y.saturating_sub(radius);
+            let to = (y + radius).min(height - 1);
+            *slot = (from..=to).map(|yy| plane[yy * width + x]).sum::<f32>() / count;
+        }
+        for (y, slot) in column.iter().enumerate() {
+            plane[y * width + x] = *slot;
+        }
     }
 }
 
@@ -375,6 +514,10 @@ mod tests {
     fn settings() -> Settings {
         Settings {
             density_max: Some([DEFAULT_DENSITY_MAX; 3]),
+            // The placement tests assert exact placed values; chroma denoise
+            // is a smoothing pass the dispatcher adds around the inversion,
+            // tested separately.
+            chroma_denoise: 0.0,
             ..Settings::default()
         }
     }
@@ -738,14 +881,17 @@ mod tests {
     #[test]
     fn dispatcher_color_negative_equals_invert() {
         // The C-41 path must stay byte-identical when reached through the
-        // dispatcher.
+        // dispatcher. Chroma denoise is disabled here: the dispatcher adds it
+        // around the inversion, and the identity check is about the inversion.
         let source = image(&[[0.7, 0.4, 0.2], [0.1, 0.9, 0.3]]);
         let base = base([0.8, 0.5, 0.3]);
-        let direct = invert(&source, &base, &settings());
+        let mut settings = settings();
+        settings.chroma_denoise = 0.0;
+        let direct = invert(&source, &base, &settings);
         let dispatched = convert(
             &source,
             Some(&base),
-            &settings(),
+            &settings,
             FilmMode::ColorNegative,
             false,
         );

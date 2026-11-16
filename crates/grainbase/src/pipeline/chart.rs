@@ -1287,18 +1287,58 @@ pub fn fit_capture(
     film: &str,
     camera: &str,
 ) -> Result<Profile, ChartError> {
+    fit_capture_with_targets(measurements, film, camera, None)
+}
+
+/// Like [`fit_capture`], but the chromatic patches' print targets come from
+/// `patch_srgb` (sRGB 0-1, linearized here) instead of the published values.
+///
+/// A lab-paired look fits the engine to reproduce a lab render's colors: the
+/// lab's own chart render supplies the targets. The first 18 values are the
+/// chromatic patches; the last two are the lab's white and black patches,
+/// whose neutralized means become the print tones the two neutral anchors
+/// land on — the lab's own contrast, without the lab's neutral-row cast.
+/// `None` fits the published chart colors.
+///
+/// # Errors
+///
+/// Both stages' errors propagate.
+pub fn fit_capture_with_targets(
+    measurements: &Measurements,
+    film: &str,
+    camera: &str,
+    patch_srgb: Option<&[[f32; 3]; 20]>,
+) -> Result<Profile, ChartError> {
     let cells = measurements.cells;
-    let dark = cells[23];
     let light = cells[18];
 
-    let targets = chromatic_targets();
+    let published = chromatic_targets();
+    let chosen = patch_srgb.map(|targets| {
+        let mut out = [[0.0f32; 3]; 18];
+        for (out_row, target) in out.iter_mut().zip(targets[..18].iter()) {
+            for (cell, value) in out_row.iter_mut().zip(target.iter()) {
+                *cell = srgb_eotf(*value);
+            }
+        }
+        out
+    });
+    let targets = chosen.as_ref().unwrap_or(&published);
     let patch: Vec<([f32; 3], [f32; 3])> = cells[..18]
         .iter()
         .zip(targets.iter())
         .map(|(&density, &target)| (density, target))
         .collect();
 
-    let settings = fit::fit_profile(dark, light, &patch)?;
+    // The print tone the light neutral lands on: the published encoding's
+    // 90% in the published mode, the lab's own white (neutralized to its
+    // channel mean, so the lab's neutral-row cast does not ride along) in
+    // the lab mode.
+    let light_tone = patch_srgb.map_or([fit::LIGHT_PRINT_TONE; 3], |targets| {
+        let white = targets[18].iter().sum::<f32>() / 3.0;
+        [srgb_eotf(white); 3]
+    });
+
+    let settings = fit::fit_profile(light, light_tone, &patch)?;
 
     Ok(Profile {
         film: film.to_owned(),
@@ -1692,8 +1732,10 @@ mod tests {
     fn synthetic_checker_recovers_known_settings() {
         // Use identity crosstalk so the measured raw densities equal the
         // corrected densities; this lets the anchor fit recover the exact
-        // generating floor and range, matching the fit.rs test idiom.
-        let floor = [0.2f32; 3];
+        // generating ceiling. The print's black is the film base (density
+        // zero) by definition, so the generator builds its densities without
+        // a floor: density = tone * ceiling.
+        let floor = [0.0f32; 3];
         let ceiling = [2.2f32; 3];
         let settings = crate::pipeline::Settings {
             density_max: Some(ceiling),

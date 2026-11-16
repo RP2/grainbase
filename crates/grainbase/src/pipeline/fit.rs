@@ -111,19 +111,12 @@ pub fn fit_anchor(
     })
 }
 
-/// Fits all three channels' anchors from the two neutrals' density vectors.
+/// Fits all three channels' ceilings from the light neutral's density vector.
 ///
 /// # Errors
 ///
-/// [`FitError::DegenerateAnchors`] when any channel is degenerate.
-pub fn fit_anchors(dark: [f32; 3], light: [f32; 3]) -> Result<[Anchors; 3], FitError> {
-    Ok([
-        fit_anchor(dark[0], light[0], DARK_PRINT_TONE, LIGHT_PRINT_TONE)?,
-        fit_anchor(dark[1], light[1], DARK_PRINT_TONE, LIGHT_PRINT_TONE)?,
-        fit_anchor(dark[2], light[2], DARK_PRINT_TONE, LIGHT_PRINT_TONE)?,
-    ])
-}
-
+/// [`FitError::DegenerateAnchors`] when any channel's tone is degenerate.
+///
 /// Fits one crosstalk row's two off-diagonals by least squares.
 ///
 /// For an output channel, the other two dye lines mix toward the target:
@@ -209,32 +202,69 @@ pub fn fit_crosstalk(
 
 /// Composes both stages into the settings a fitted profile carries.
 ///
+/// The print's black is the film base: density is measured relative to the
+/// base, so nothing on the film can be thinner than it and the floor is zero
+/// by definition. Only the white anchor is fitted: the ceiling is where the
+/// light neutral's unmixed density must land to print at `light_tone`. A
+/// floor fitted from the chart's dark patch went below the base whenever
+/// scanning flare lifted the patch above it, and every shadow in the frame
+/// then printed at the floor's offset — the lifted, foggy blacks.
+///
 /// # Errors
 ///
 /// Both stages' errors propagate.
 pub fn fit_profile(
-    dark: [f32; 3],
     light: [f32; 3],
+    light_tone: [f32; 3],
     patch: &[([f32; 3], [f32; 3])],
 ) -> Result<Settings, FitError> {
     // The pipeline applies the crosstalk unmix before it places densities, so
-    // the anchors must hold in unmixed density. The dark and light neutrals
-    // pin the anchors to the matrix: their unmixed densities must land on
-    // their own print tones. Substituting that pin into the chromatic
-    // residuals makes every residual linear in a row's two off-diagonal
-    // unknowns, so the joint system has a closed-form one-pass solve. An
-    // alternating iteration of the two stages does not converge: the anchor
-    // range and the matrix scale are nearly degenerate for the chromatic
-    // patches, and the fixed point is unstable along that direction.
-    let crosstalk = fit_crosstalk_anchored(dark, light, patch)?;
-    let anchors = fit_anchors(mix(crosstalk, dark), mix(crosstalk, light))?;
+    // the anchor must hold in unmixed density. The light neutral pins the
+    // ceiling to the matrix: its unmixed density must land on its own print
+    // tone. Substituting that pin into the chromatic residuals makes every
+    // residual linear in a row's two off-diagonal unknowns, so the joint
+    // system has a closed-form one-pass solve.
+    let crosstalk = fit_crosstalk_anchored(light, light_tone, patch)?;
+    let anchors = fit_anchors(mix(crosstalk, light), light_tone)?;
 
     Ok(Settings {
         density_max: Some(anchors.map(|anchor| anchor.ceiling)),
-        density_floor: Some(anchors.map(|anchor| anchor.floor)),
+        density_floor: Some([0.0; 3]),
         gamma: None,
         pivot_density: None,
         crosstalk,
+        ..Settings::default()
+    })
+}
+
+/// Fits the three channels' ceilings from the light neutral.
+///
+/// `unmixed_light` is the light neutral's density after the crosstalk unmix;
+/// the ceiling is where it must land to print at `light_tone`.
+///
+/// # Errors
+///
+/// [`FitError::DegenerateAnchors`] when any channel's tone is degenerate.
+pub fn fit_anchors(
+    unmixed_light: [f32; 3],
+    light_tone: [f32; 3],
+) -> Result<[Anchors; 3], FitError> {
+    Ok([
+        fit_ceilings(unmixed_light[0], light_tone[0])?,
+        fit_ceilings(unmixed_light[1], light_tone[1])?,
+        fit_ceilings(unmixed_light[2], light_tone[2])?,
+    ])
+}
+
+/// The anchor pair with the floor at the film base and the ceiling from the
+/// light neutral.
+fn fit_ceilings(unmixed_light: f32, light_tone: f32) -> Result<Anchors, FitError> {
+    if unmixed_light <= 0.0 || light_tone <= f32::EPSILON {
+        return Err(FitError::DegenerateAnchors);
+    }
+    Ok(Anchors {
+        floor: 0.0,
+        ceiling: unmixed_light / light_tone,
     })
 }
 
@@ -246,16 +276,20 @@ pub fn fit_profile(
 /// the chromatic residual `corrected - anchor_target` stays linear in them, so
 /// each patch contributes one linear equation and the normal equations close
 /// in one pass.
+/// Fits the crosstalk rows with the ceiling pinned to the light neutral.
+///
+/// The print model after the pin is `corrected = print * ceiling`, where the
+/// ceiling itself is `M * d_light / light_tone` — affine in the row's two
+/// off-diagonal unknowns. The chromatic residual
+/// `corrected - print * ceiling` therefore stays linear in them, and each
+/// patch contributes one linear equation; the normal equations close in one
+/// pass. The dark neutral no longer pins anything: the print's black is the
+/// film base, which the floor already holds.
 fn fit_crosstalk_anchored(
-    dark: [f32; 3],
     light: [f32; 3],
+    light_tone: [f32; 3],
     patch: &[([f32; 3], [f32; 3])],
 ) -> Result<[[f32; 3]; 3], FitError> {
-    let tone_span = LIGHT_PRINT_TONE - DARK_PRINT_TONE;
-    if tone_span.abs() < f32::EPSILON {
-        return Err(FitError::DegenerateAnchors);
-    }
-
     let mut matrix = IDENTITY;
     for output in 0..3 {
         let mut columns = (0..3).filter(|col| *col != output);
@@ -263,13 +297,9 @@ fn fit_crosstalk_anchored(
 
         let mut equations: Vec<(f32, f32, f32)> = Vec::with_capacity(patch.len());
         for (density, print) in patch {
-            let weight = print[output] - DARK_PRINT_TONE;
-            let axis = |col: usize| -> f32 {
-                density[col] - dark[col] - weight * (light[col] - dark[col]) / tone_span
-            };
-            let constant = density[output]
-                - dark[output]
-                - weight * (light[output] - dark[output]) / tone_span;
+            let weight = print[output] / light_tone[output];
+            let axis = |col: usize| -> f32 { density[col] - weight * light[col] };
+            let constant = density[output] - weight * light[output];
             equations.push((axis(a_col), axis(b_col), -constant));
         }
 
@@ -405,37 +435,36 @@ mod tests {
     #[test]
     fn fit_profile_composes_both_stages() {
         let chosen = [[1.0, 0.05, 0.02], [0.03, 1.0, 0.04], [0.01, 0.02, 1.0]];
-        let (floor, range) = (0.25f32, 2.0);
+        // The print's black is the film base (density zero) by definition, so
+        // the generating model has no floor: print = M * d / ceiling.
+        let ceiling = 2.0f32;
         let densities = [[0.50, 0.29, 0.20], [0.29, 0.60, 0.30], [0.21, 0.24, 0.55]];
-        // The two anchors: the dark and light neutrals' measured densities.
-        // The pipeline unmixes before it places, so a neutral's measured
-        // density is the inverse model of its print tone:
-        // M * d = floor + tone * range.
+        // The light anchor: the white neutral's measured density is the
+        // inverse model of its print tone: M * d = tone * ceiling.
         let inv = invert_matrix(chosen);
-        let dark = apply_matrix(inv, [floor + DARK_PRINT_TONE * range; 3]);
-        let light = apply_matrix(inv, [floor + LIGHT_PRINT_TONE * range; 3]);
+        let light = apply_matrix(inv, [LIGHT_PRINT_TONE * ceiling; 3]);
         let patch: Vec<([f32; 3], [f32; 3])> = densities
             .iter()
             .map(|d| {
                 let mut render = [0.0f32; 3];
                 for o in 0..3 {
                     let corrected = chosen[o][0] * d[0] + chosen[o][1] * d[1] + chosen[o][2] * d[2];
-                    render[o] = (corrected - floor) / range;
+                    render[o] = corrected / ceiling;
                 }
                 (*d, render)
             })
             .collect();
 
-        let settings = fit_profile(dark, light, &patch).expect("nondegenerate");
+        let settings = fit_profile(light, [LIGHT_PRINT_TONE; 3], &patch).expect("nondegenerate");
         let floors = settings.density_floor.expect("a fit emits floors");
         let ceilings = settings.density_max.expect("a fit emits ceilings");
         for (i, actual_floor) in floors.iter().enumerate() {
-            close(*actual_floor, floor, &format!("channel {i} black point"));
+            close(*actual_floor, 0.0, &format!("channel {i} black point"));
         }
         for (i, actual_ceiling) in ceilings.iter().enumerate() {
             close(
                 *actual_ceiling,
-                floor + range,
+                ceiling,
                 &format!("channel {i} white point"),
             );
         }

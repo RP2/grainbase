@@ -145,6 +145,14 @@ struct FitArgs {
     #[arg(long)]
     camera: String,
 
+    /// Fit the look to a lab render instead of the published chart colors.
+    /// The file holds 20 lines of `R G B` sRGB byte values in chart order:
+    /// the 18 chromatic patches (top-left to bottom-right), then the lab's
+    /// white patch, then its black patch — sampled from a lab scan of the
+    /// same chart frame.
+    #[arg(long)]
+    targets: Option<PathBuf>,
+
     /// Mirror the capture left to right.
     #[arg(long)]
     flip_h: bool,
@@ -364,6 +372,29 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Reads a lab-targets file: 20 lines of `R G B` sRGB byte values — the 18
+/// chromatic patches in chart order, then the lab render's white and black
+/// patches.
+fn read_targets(path: &Path) -> Result<[[f32; 3]; 20], String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    let mut values = [[0.0f32; 3]; 20];
+    for (line, value) in text.lines().zip(values.iter_mut()) {
+        let parts: Vec<f32> = line
+            .split_whitespace()
+            .map(|part| {
+                part.parse::<f32>()
+                    .unwrap_or_else(|err| panic!("targets: {err}"))
+            })
+            .collect();
+        if parts.len() != 3 {
+            return Err("targets: expected `R G B` per line".to_owned());
+        }
+        *value = [parts[0] / 255.0, parts[1] / 255.0, parts[2] / 255.0];
+    }
+    Ok(values)
+}
+
 /// Fits a profile from a chart capture and writes it to disk.
 #[expect(
     clippy::cast_precision_loss,
@@ -450,14 +481,24 @@ fn run_fit(args: FitArgs) -> ExitCode {
             }
         };
 
-    let profile =
-        match grainbase::pipeline::chart::fit_capture(&measurements, &args.film, &args.camera) {
-            Ok(profile) => profile,
-            Err(err) => {
-                eprintln!("{err}");
-                return ExitCode::FAILURE;
-            }
-        };
+    let targets = args.targets.as_ref().map(|path| {
+        read_targets(path).unwrap_or_else(|message| {
+            eprintln!("{message}");
+            std::process::exit(1);
+        })
+    });
+    let profile = match grainbase::pipeline::chart::fit_capture_with_targets(
+        &measurements,
+        &args.film,
+        &args.camera,
+        targets.as_ref(),
+    ) {
+        Ok(profile) => profile,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let output = match write_profile(&profile, args.out, &args.capture) {
         Ok(output) => output,
