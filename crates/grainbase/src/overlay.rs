@@ -234,6 +234,179 @@ fn put(image: &mut LinearImage, x: usize, y: usize, color: [f32; 3]) {
     image.data[index..index + 3].copy_from_slice(&color);
 }
 
+/// Annotates a chart capture with the detected lattice and sample regions.
+///
+/// The image is box-downsampled so its longest side is at most
+/// `max_dimension`, which keeps the output small enough to view whole while
+/// preserving the coordinate relationship. `vertical` and `horizontal` are the
+/// 7 and 5 separator lines in source pixels; `sample_regions` are the 24 cell
+/// windows in `[x0, y0, x1, y1]` source pixels.
+#[must_use]
+pub fn annotate_chart(
+    image: &LinearImage,
+    vertical: &[f32],
+    horizontal: &[f32],
+    sample_regions: &[[f32; 4]],
+    crosses: &[[f32; 2]; 4],
+    outer_border: &[[f32; 2]; 4],
+    max_dimension: u32,
+) -> LinearImage {
+    let (downscaled, scale) = downsample(image, max_dimension);
+    let mut marked = downscaled.clone();
+
+    let outer_scaled: Vec<_> = outer_border
+        .iter()
+        .map(|&[x, y]| [x / scale, y / scale])
+        .collect();
+    for index in 0..4 {
+        let next = (index + 1) % 4;
+        line(
+            &mut marked,
+            outer_scaled[index],
+            outer_scaled[next],
+            CHART_OUTER_BORDER_COLOR,
+        );
+    }
+
+    let corners = [
+        [vertical[0], horizontal[0]],
+        [vertical[vertical.len() - 1], horizontal[0]],
+        [
+            vertical[vertical.len() - 1],
+            horizontal[horizontal.len() - 1],
+        ],
+        [vertical[0], horizontal[horizontal.len() - 1]],
+    ];
+    let scaled_corners: Vec<_> = corners
+        .iter()
+        .map(|&[x, y]| [x / scale, y / scale])
+        .collect();
+    for index in 0..4 {
+        let next = (index + 1) % 4;
+        line(
+            &mut marked,
+            scaled_corners[index],
+            scaled_corners[next],
+            CHART_FRAME_COLOR,
+        );
+    }
+
+    let marked_height = coordinate(marked.height as usize) - 1.0;
+    let marked_width = coordinate(marked.width as usize) - 1.0;
+
+    for &x in vertical {
+        let x = x / scale;
+        line(
+            &mut marked,
+            [x, 0.0],
+            [x, marked_height],
+            CHART_VERTICAL_COLOR,
+        );
+    }
+
+    for &y in horizontal {
+        let y = y / scale;
+        line(
+            &mut marked,
+            [0.0, y],
+            [marked_width, y],
+            CHART_HORIZONTAL_COLOR,
+        );
+    }
+
+    for region in sample_regions {
+        let [x0, y0, x1, y1] = region.map(|v| v / scale);
+        let corners = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+        for index in 0..4 {
+            let next = (index + 1) % 4;
+            line(
+                &mut marked,
+                corners[index],
+                corners[next],
+                CHART_SAMPLE_COLOR,
+            );
+        }
+    }
+
+    for &[x, y] in crosses {
+        dot(
+            &mut marked,
+            [x / scale, y / scale],
+            (CROSS_MARK / 2).max(1),
+            CHART_CROSS_COLOR,
+        );
+    }
+
+    marked
+}
+
+/// The outer chart boundary drawn in diagnostic overlays.
+const CHART_FRAME_COLOR: [f32; 3] = [1.0, 0.0, 0.0];
+/// The detected outer border rectangle drawn in diagnostic overlays.
+const CHART_OUTER_BORDER_COLOR: [f32; 3] = [1.0, 0.5, 0.0];
+/// Vertical separator lines drawn in diagnostic overlays.
+const CHART_VERTICAL_COLOR: [f32; 3] = [0.0, 1.0, 0.0];
+/// Horizontal separator lines drawn in diagnostic overlays.
+const CHART_HORIZONTAL_COLOR: [f32; 3] = [0.0, 0.0, 1.0];
+/// Per-cell sample windows drawn in diagnostic overlays.
+const CHART_SAMPLE_COLOR: [f32; 3] = [1.0, 1.0, 0.0];
+/// Registration crosses drawn in diagnostic overlays.
+const CHART_CROSS_COLOR: [f32; 3] = [1.0, 0.0, 1.0];
+/// Side of the square drawn at one cross centre, in downsampled pixels.
+const CROSS_MARK: usize = 11;
+
+/// Box-downsamples `image` so its longest side is at most `max_dimension`.
+///
+/// Returns the downscaled image and the source-to-downsample scale factor.
+#[expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "downsample factors and dimensions are small non-negative values"
+)]
+fn downsample(image: &LinearImage, max_dimension: u32) -> (LinearImage, f32) {
+    let max_dim = image.width.max(image.height);
+    if max_dim <= max_dimension {
+        return (image.clone(), 1.0);
+    }
+
+    let factor = max_dim.div_ceil(max_dimension).max(2) as usize;
+    let scale = factor as f32;
+    let out_w = image.width as usize / factor;
+    let out_h = image.height as usize / factor;
+    let mut out = vec![0.0f32; out_w * out_h * 3];
+    let src_w = image.width as usize;
+
+    let (pixels, _remainder) = image.data.as_chunks::<3>();
+    for oy in 0..out_h {
+        let y0 = oy * factor;
+        let y1 = ((oy + 1) * factor).min(image.height as usize);
+        for ox in 0..out_w {
+            let x0 = ox * factor;
+            let x1 = ((ox + 1) * factor).min(image.width as usize);
+            let mut sum = [0.0f32; 3];
+            let mut count = 0usize;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let pixel = pixels[y * src_w + x];
+                    for channel in 0..3 {
+                        sum[channel] += pixel[channel];
+                    }
+                    count += 1;
+                }
+            }
+            let idx = (oy * out_w + ox) * 3;
+            for channel in 0..3 {
+                out[idx + channel] = sum[channel] / coordinate(count);
+            }
+        }
+    }
+
+    (
+        LinearImage::new(out_w as u32, out_h as u32, out).expect("well-formed"),
+        scale,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

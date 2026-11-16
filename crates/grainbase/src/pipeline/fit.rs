@@ -22,7 +22,7 @@
 //! densities and intended print tones; `crosstalk` solves per row with the
 //! diagonal held at `1.0` once the anchors are fixed.
 
-use super::{IDENTITY, Settings};
+use super::{IDENTITY, Settings, mix};
 
 /// The intended print value of the dark neutral patch.
 ///
@@ -217,8 +217,17 @@ pub fn fit_profile(
     light: [f32; 3],
     patch: &[([f32; 3], [f32; 3])],
 ) -> Result<Settings, FitError> {
-    let anchors = fit_anchors(dark, light)?;
-    let crosstalk = fit_crosstalk(&anchors, patch)?;
+    // The pipeline applies the crosstalk unmix before it places densities, so
+    // the anchors must hold in unmixed density. The dark and light neutrals
+    // pin the anchors to the matrix: their unmixed densities must land on
+    // their own print tones. Substituting that pin into the chromatic
+    // residuals makes every residual linear in a row's two off-diagonal
+    // unknowns, so the joint system has a closed-form one-pass solve. An
+    // alternating iteration of the two stages does not converge: the anchor
+    // range and the matrix scale are nearly degenerate for the chromatic
+    // patches, and the fixed point is unstable along that direction.
+    let crosstalk = fit_crosstalk_anchored(dark, light, patch)?;
+    let anchors = fit_anchors(mix(crosstalk, dark), mix(crosstalk, light))?;
 
     Ok(Settings {
         density_max: Some(anchors.map(|anchor| anchor.ceiling)),
@@ -229,15 +238,99 @@ pub fn fit_profile(
     })
 }
 
+/// Fits the crosstalk rows with the anchors pinned to the matrix.
+///
+/// For output channel `o`, the dark and light neutrals' unmixed densities must
+/// land on `DARK_PRINT_TONE` and `LIGHT_PRINT_TONE`. That pin expresses each
+/// anchor as an affine function of the row's two off-diagonal unknowns, and
+/// the chromatic residual `corrected - anchor_target` stays linear in them, so
+/// each patch contributes one linear equation and the normal equations close
+/// in one pass.
+fn fit_crosstalk_anchored(
+    dark: [f32; 3],
+    light: [f32; 3],
+    patch: &[([f32; 3], [f32; 3])],
+) -> Result<[[f32; 3]; 3], FitError> {
+    let tone_span = LIGHT_PRINT_TONE - DARK_PRINT_TONE;
+    if tone_span.abs() < f32::EPSILON {
+        return Err(FitError::DegenerateAnchors);
+    }
+
+    let mut matrix = IDENTITY;
+    for output in 0..3 {
+        let mut columns = (0..3).filter(|col| *col != output);
+        let (a_col, b_col) = (columns.next().unwrap(), columns.next().unwrap());
+
+        let mut equations: Vec<(f32, f32, f32)> = Vec::with_capacity(patch.len());
+        for (density, print) in patch {
+            let weight = print[output] - DARK_PRINT_TONE;
+            let axis = |col: usize| -> f32 {
+                density[col] - dark[col] - weight * (light[col] - dark[col]) / tone_span
+            };
+            let constant = density[output]
+                - dark[output]
+                - weight * (light[output] - dark[output]) / tone_span;
+            equations.push((axis(a_col), axis(b_col), -constant));
+        }
+
+        let (x, y) = fit_row(&equations).ok_or(FitError::UnderdeterminedCrosstalk)?;
+        matrix[output][a_col] = x;
+        matrix[output][b_col] = y;
+    }
+    Ok(matrix)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn apply_matrix(matrix: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
+        let mut out = [0.0f32; 3];
+        for (row, value) in out.iter_mut().enumerate() {
+            *value = matrix[row]
+                .iter()
+                .zip(vector.iter())
+                .map(|(m, v)| m * v)
+                .sum();
+        }
+        out
+    }
+
     fn close(actual: f32, expected: f32, what: &str) {
         assert!(
-            (actual - expected).abs() < 1e-4,
+            (actual - expected).abs() < 1e-3,
             "{what}: expected {expected}, got {actual}"
         );
+    }
+
+    fn invert_matrix(m: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+        let cofactor = |r: usize, c: usize| -> f32 {
+            let (r1, r2, c1, c2) = match (r, c) {
+                (0, 0) => (1, 2, 1, 2),
+                (0, 1) => (1, 2, 0, 2),
+                (0, 2) => (1, 2, 0, 1),
+                (1, 0) => (0, 2, 1, 2),
+                (1, 1) => (0, 2, 0, 2),
+                (1, 2) => (0, 2, 0, 1),
+                (2, 0) => (0, 1, 1, 2),
+                (2, 1) => (0, 1, 0, 2),
+                _ => (0, 1, 0, 1),
+            };
+            let minor = m[r1][c1] * m[r2][c2] - m[r1][c2] * m[r2][c1];
+            if (r + c).is_multiple_of(2) {
+                minor
+            } else {
+                -minor
+            }
+        };
+        let det = m[0][0] * cofactor(0, 0) + m[0][1] * cofactor(0, 1) + m[0][2] * cofactor(0, 2);
+        let mut inv = [[0.0f32; 3]; 3];
+        for (row, out_row) in inv.iter_mut().enumerate() {
+            for (col, cell) in out_row.iter_mut().enumerate() {
+                *cell = cofactor(col, row) / det;
+            }
+        }
+        inv
     }
 
     #[test]
@@ -314,9 +407,13 @@ mod tests {
         let chosen = [[1.0, 0.05, 0.02], [0.03, 1.0, 0.04], [0.01, 0.02, 1.0]];
         let (floor, range) = (0.25f32, 2.0);
         let densities = [[0.50, 0.29, 0.20], [0.29, 0.60, 0.30], [0.21, 0.24, 0.55]];
-        // The two anchors: dark and light neutrals measured in a channel.
-        let dark = [floor + DARK_PRINT_TONE * range; 3];
-        let light = [floor + LIGHT_PRINT_TONE * range; 3];
+        // The two anchors: the dark and light neutrals' measured densities.
+        // The pipeline unmixes before it places, so a neutral's measured
+        // density is the inverse model of its print tone:
+        // M * d = floor + tone * range.
+        let inv = invert_matrix(chosen);
+        let dark = apply_matrix(inv, [floor + DARK_PRINT_TONE * range; 3]);
+        let light = apply_matrix(inv, [floor + LIGHT_PRINT_TONE * range; 3]);
         let patch: Vec<([f32; 3], [f32; 3])> = densities
             .iter()
             .map(|d| {

@@ -165,6 +165,11 @@ struct FitArgs {
     /// uncropped scan. Overrides the automatic rebate-region detector.
     #[arg(long, value_parser = parse_base_sample)]
     base_sample: Option<[f32; 4]>,
+
+    /// Write a diagnostic overlay image showing the detected chart lattice and
+    /// the 24 patch sample windows. Defaults to `<capture stem>-overlay.png`.
+    #[arg(long)]
+    overlay: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -223,6 +228,12 @@ struct CalibrateRigArgs {
     /// tungsten the patch records the lamp and the profile would neutralise it.
     #[arg(long, value_name = "x0,y0,x1,y1", value_parser = parse_base_sample)]
     neutral_rect: Option<[f32; 4]>,
+
+    /// Write a diagnostic overlay image showing the detected chart lattice and
+    /// the patch sample windows, when the rig calibration uses a chart-based
+    /// wedge card. Defaults to `<capture stem>-overlay.png`.
+    #[arg(long)]
+    overlay: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -354,6 +365,10 @@ fn main() -> ExitCode {
 }
 
 /// Fits a profile from a chart capture and writes it to disk.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "image dimensions fit f32 exactly"
+)]
 fn run_fit(args: FitArgs) -> ExitCode {
     let scan = match decode::decode(&args.capture) {
         Ok(scan) => scan,
@@ -389,15 +404,51 @@ fn run_fit(args: FitArgs) -> ExitCode {
         }
     };
 
-    let image = geometry::apply(&uncropped, &frame);
+    // The frame finder supplies the film border for base sampling. Chart
+    // lattice detection runs on the uncropped image so that a content-line
+    // frame fallback cannot lock onto the card's own bright separator lines
+    // and crop away part of the chart. The chart detector's edge margin keeps
+    // the search inside the film frame and away from rebate / bare light-table
+    // edges. This matches the spec's step 5: SilverFast-style
+    // content-independent frame search with a size tolerance, kept independent
+    // of the chart search. See G4 in
+    // `docs/protocol/order-of-operations-audit.md`.
+    let _image = geometry::apply(&uncropped, &frame);
 
-    let measurements = match grainbase::pipeline::chart::measure(&image, &base) {
-        Ok(measurements) => measurements,
-        Err(err) => {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
+    let (geometry, chart_image) =
+        match grainbase::pipeline::chart::detect_geometry(&uncropped, &base) {
+            Ok(result) => result,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
+
+    let size = [uncropped.width as f32, uncropped.height as f32];
+    print_chart_fractions("outer border", &geometry.outer_border, size);
+    print_chart_fractions("crosses", &geometry.crosses, size);
+    print_chart_fractions("patch grid", &geometry.corners(), size);
+    let top_angle = top_edge_angle(&geometry.crosses).to_degrees();
+    println!("chart top edge angle {top_angle:.2} deg");
+
+    if args.overlay {
+        match write_chart_overlay(&args.capture, args.out.as_ref(), &chart_image, &geometry) {
+            Ok(path) => println!("wrote overlay {}", path.display()),
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
         }
-    };
+    }
+
+    let measurements =
+        match grainbase::pipeline::chart::sample_geometry(&chart_image, &base, &geometry) {
+            Ok(measurements) => measurements,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
 
     let profile =
         match grainbase::pipeline::chart::fit_capture(&measurements, &args.film, &args.camera) {
@@ -467,7 +518,9 @@ fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
         }
     };
 
-    let image = geometry::apply(&uncropped, &frame);
+    // The chart locator and the neutral rectangle both work in uncropped
+    // coordinates: the chart locator is independent of the film frame (G4),
+    // and `--neutral-rect` is documented as fractions of the uncropped scan.
 
     // The card decides both the step values and how the card is found, so a
     // registered card is carried as a card rather than flattened to its steps.
@@ -497,7 +550,7 @@ fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
     // and fitted. They differ in what they can say: one patch gives the ratios at
     // its density, a card gives a line.
     let (profile, measurement) = if let WedgeSource::NeutralRect(rect) = &source {
-        let profile = match wedge::profile_from_neutral(&image, &base, *rect, family, &rig) {
+        let profile = match wedge::profile_from_neutral(&uncropped, &base, *rect, family, &rig) {
             Ok(profile) => profile,
             Err(err) => {
                 eprintln!("{err}");
@@ -507,8 +560,8 @@ fn run_calibrate_rig(args: CalibrateRigArgs) -> ExitCode {
         (profile, None)
     } else {
         let measurement = match &source {
-            WedgeSource::Card(card) => wedge::measure_for_card(&image, &base, card),
-            WedgeSource::Steps(steps) => wedge::measure(&image, &base, steps),
+            WedgeSource::Card(card) => wedge::measure_for_card(&uncropped, &base, card),
+            WedgeSource::Steps(steps) => wedge::measure(&uncropped, &base, steps),
             WedgeSource::NeutralRect(_) => unreachable!("handled above"),
         };
         let measurement = match measurement {
@@ -608,6 +661,9 @@ fn calibration_base(
         ));
     }
     if let Some(base) = measured_between_sprockets(image, frame) {
+        if std::env::var_os("GRAINBASE_TRACE").is_some() {
+            eprintln!("trace: measured base {:?}", base.transmittance);
+        }
         return Ok(base);
     }
     Err(
@@ -643,6 +699,77 @@ fn write_profile(
     fs::write(&output, text)
         .map_err(|err| format!("could not write {}: {err}", output.display()))?;
     Ok(output)
+}
+
+/// Writes the chart diagnostic overlay beside the profile.
+fn write_chart_overlay(
+    capture: &Path,
+    out: Option<&PathBuf>,
+    image: &grainbase::LinearImage,
+    geometry: &grainbase::pipeline::chart::ChartGeometry,
+) -> Result<PathBuf, String> {
+    let overlay_path = chart_overlay_path(capture, out);
+    if let Some(parent) = overlay_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            format!(
+                "could not create overlay directory {}: {err}",
+                parent.display()
+            )
+        })?;
+    }
+    let annotated = grainbase::overlay::annotate_chart(
+        image,
+        &geometry.vertical,
+        &geometry.horizontal,
+        &geometry.sample_regions,
+        &geometry.crosses,
+        &geometry.outer_border,
+        2000,
+    );
+    grainbase::encode::encode(&annotated, &overlay_path)
+        .map_err(|err| format!("could not write overlay {}: {err}", overlay_path.display()))?;
+    Ok(overlay_path)
+}
+
+/// Prints four landmark points as fractions of the frame.
+fn print_chart_fractions(label: &str, points: &[[f32; 2]; 4], size: [f32; 2]) {
+    let names = ["TL", "TR", "BR", "BL"];
+    println!(
+        "{label}: {} {:.3},{:.3}  {} {:.3},{:.3}  {} {:.3},{:.3}  {} {:.3},{:.3}",
+        names[0],
+        points[0][0] / size[0],
+        points[0][1] / size[1],
+        names[1],
+        points[1][0] / size[0],
+        points[1][1] / size[1],
+        names[2],
+        points[2][0] / size[0],
+        points[2][1] / size[1],
+        names[3],
+        points[3][0] / size[0],
+        points[3][1] / size[1]
+    );
+}
+
+/// Angle of the chart's top edge relative to the frame x-axis.
+fn top_edge_angle(corners: &[[f32; 2]; 4]) -> f32 {
+    let [x0, y0] = corners[0];
+    let [x1, y1] = corners[1];
+    f32::atan2(y1 - y0, x1 - x0)
+}
+
+/// The diagnostic overlay path: beside the profile, or beside the capture.
+fn chart_overlay_path(capture: &Path, out: Option<&PathBuf>) -> PathBuf {
+    let source: &Path = match out {
+        Some(out) => out,
+        None => capture,
+    };
+    let stem = source
+        .file_stem()
+        .unwrap_or_else(|| std::ffi::OsStr::new("overlay"));
+    let mut path = source.to_path_buf();
+    path.set_file_name(format!("{}-overlay.png", stem.to_string_lossy()));
+    path
 }
 
 /// The base measured from the film between the sprocket holes, or `None` when

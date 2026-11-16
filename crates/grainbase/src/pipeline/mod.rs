@@ -352,7 +352,7 @@ pub(crate) fn density_of(value: f32, base: f32) -> f32 {
 }
 
 /// Applies a 3x3 matrix to a vector: `matrix * vector`, rows dotted with it.
-fn mix(matrix: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
+pub(crate) fn mix(matrix: [[f32; 3]; 3], vector: [f32; 3]) -> [f32; 3] {
     matrix.map(|row| row[0] * vector[0] + row[1] * vector[1] + row[2] * vector[2])
 }
 
