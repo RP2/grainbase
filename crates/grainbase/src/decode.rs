@@ -157,6 +157,16 @@ pub fn decode(path: impl AsRef<Path>) -> Result<Scan, Error> {
         orientation,
     };
 
+    // A unity white balance, for the capture experiments: the camera's own
+    // gains are extreme for a light-table capture (measured 2.77/1.0/1.70 on
+    // the a6000 fixture), and the colour matrix then mixes the gain-scaled
+    // channels. GRAINBASE_UNITY_WB decodes without them; the profile being
+    // applied must be fitted on the same decode.
+    let mut raw = raw;
+    if std::env::var_os("GRAINBASE_UNITY_WB").is_some() {
+        raw.wb_coeffs = [1.0, 1.0, 1.0, f32::NAN];
+    }
+
     let intermediate = catch_unwind(AssertUnwindSafe(|| {
         RawDevelop::new_with(DEVELOP_STEPS).develop_intermediate(&raw)
     }))
