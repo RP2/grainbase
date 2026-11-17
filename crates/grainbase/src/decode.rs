@@ -145,6 +145,10 @@ pub fn decode(path: impl AsRef<Path>) -> Result<Scan, Error> {
         Err(err) => return Err(Error::Failed(err.to_string())),
     };
 
+    if std::env::var_os("GRAINBASE_TRACE").is_some() {
+        eprintln!("trace: wb_coeffs {:?}", raw.wb_coeffs);
+    }
+
     let orientation = exif_orientation(path);
 
     let meta = ScanMeta {

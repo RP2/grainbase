@@ -22,7 +22,7 @@
 //! densities and intended print tones; `crosstalk` solves per row with the
 //! diagonal held at `1.0` once the anchors are fixed.
 
-use super::{IDENTITY, Settings, mix};
+use super::{IDENTITY, REFERENCE_GRAY_POSITIVE, Settings, mix};
 
 /// The intended print value of the dark neutral patch.
 ///
@@ -308,6 +308,158 @@ fn fit_crosstalk_anchored(
         matrix[output][b_col] = y;
     }
     Ok(matrix)
+}
+
+/// Composes the full fit from all 24 chart cells.
+///
+/// The chromatic rows fit the crosstalk matrix against their print targets;
+/// the print's black stays at the film base; the ceiling comes from the light
+/// neutral; and a per-channel print curve (gamma around the reference-gray
+/// pivot) is fitted against every cell's target in display space, so the
+/// render tracks the targets' curvature instead of a straight density line.
+/// The pivot density per channel is the corrected density whose target is the
+/// reference gray, interpolated on the chart's own neutral ramp.
+///
+/// # Errors
+///
+/// Both stages' errors propagate.
+pub fn fit_profile_with_cells(
+    cells: &[[f32; 3]; 24],
+    targets: &[[f32; 3]; 24],
+    light_tone: [f32; 3],
+) -> Result<Settings, FitError> {
+    let light = cells[18];
+    let chromatic: Vec<([f32; 3], [f32; 3])> = cells[..18]
+        .iter()
+        .zip(targets[..18].iter())
+        .map(|(&density, &target)| (density, target))
+        .collect();
+    let crosstalk = fit_crosstalk_anchored(light, light_tone, &chromatic)?;
+    let anchors = fit_anchors(mix(crosstalk, light), light_tone)?;
+    let floor = [0.0f32; 3];
+    let max = anchors.map(|anchor| anchor.ceiling);
+
+    let corrected: Vec<[f32; 3]> = cells
+        .iter()
+        .map(|density| mix(crosstalk, *density))
+        .collect();
+    let pivot = pivot_at_reference_gray(&corrected[18..24], &targets[18..24]);
+    let gamma = [0usize, 1, 2].map(|channel| {
+        fit_gamma_channel(
+            &corrected,
+            targets,
+            channel,
+            floor[channel],
+            max[channel],
+            pivot[channel],
+        )
+    });
+
+    Ok(Settings {
+        density_max: Some(max),
+        density_floor: Some(floor),
+        gamma: Some(gamma),
+        pivot_density: Some(pivot),
+        crosstalk,
+        ..Settings::default()
+    })
+}
+
+/// The corrected density whose target is the reference gray, interpolated
+/// along the chart's own neutral ramp. The ramp runs white (densest) to
+/// black (thinnest), so the densities descend as the targets descend.
+fn pivot_at_reference_gray(
+    neutral_corrected: &[[f32; 3]],
+    neutral_targets: &[[f32; 3]],
+) -> [f32; 3] {
+    let mut pivot = [0.0f32; 3];
+    for channel in 0..3 {
+        pivot[channel] = neutral_corrected[0][channel];
+        for window in neutral_corrected.windows(2).enumerate() {
+            let (index, pair) = window;
+            let (dense_target, thin_target) = (
+                neutral_targets[index][channel],
+                neutral_targets[index + 1][channel],
+            );
+            let (dense_density, thin_density) = (pair[0][channel], pair[1][channel]);
+            if REFERENCE_GRAY_POSITIVE <= dense_target && REFERENCE_GRAY_POSITIVE >= thin_target {
+                let share = (dense_target - REFERENCE_GRAY_POSITIVE)
+                    / (dense_target - thin_target).max(f32::EPSILON);
+                pivot[channel] = dense_density + share * (thin_density - dense_density);
+                break;
+            }
+        }
+    }
+    pivot
+}
+
+/// Fits one channel's gamma by golden-section search, minimizing the squared
+/// display-space error across every chart cell. Display space (not linear)
+/// because that is where the render is seen, and it weights the shadows the
+/// way the eye does.
+fn fit_gamma_channel(
+    corrected: &[[f32; 3]],
+    targets: &[[f32; 3]],
+    channel: usize,
+    floor: f32,
+    max: f32,
+    pivot: f32,
+) -> f32 {
+    let error = |gamma: f32| -> f32 {
+        corrected
+            .iter()
+            .zip(targets.iter())
+            .map(|(density, target)| {
+                let placed = crate::pipeline::render(
+                    density[channel],
+                    floor,
+                    max,
+                    Some(&(
+                        [0.636; 3].map(|_| pivot / (max - floor).max(f32::MIN_POSITIVE)),
+                        [gamma; 3],
+                    )),
+                    channel,
+                );
+                let delta = srgb_encode(placed) - srgb_encode(target[channel]);
+                delta * delta
+            })
+            .sum::<f32>()
+    };
+
+    let (mut low, mut high) = (0.5f32, 2.5f32);
+    let ratio = 0.618_034;
+    let mut left = high - ratio * (high - low);
+    let mut right = low + ratio * (high - low);
+    let (mut f_left, mut f_right) = (error(left), error(right));
+    for _ in 0..40 {
+        if f_left < f_right {
+            high = right;
+            right = left;
+            f_right = f_left;
+            left = high - ratio * (high - low);
+            f_left = error(left);
+        } else {
+            low = left;
+            left = right;
+            f_left = f_right;
+            right = low + ratio * (high - low);
+            f_right = error(right);
+        }
+        if high - low < 1e-3 {
+            break;
+        }
+    }
+    f32::midpoint(low, high)
+}
+
+/// sRGB display encoding, 0-1 linear in.
+#[must_use]
+pub fn srgb_encode(linear: f32) -> f32 {
+    if linear <= 0.003_130_8 {
+        linear * 12.92
+    } else {
+        1.055 * linear.powf(1.0 / 2.4) - 0.055
+    }
 }
 
 #[cfg(test)]

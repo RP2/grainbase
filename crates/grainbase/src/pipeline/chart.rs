@@ -175,11 +175,27 @@ pub(crate) fn neutral_row_densities() -> [f32; COLS] {
 
 /// Linear-light sRGB targets for the 18 chromatic patches.
 #[must_use]
+/// The published chromatic targets for the 18 chromatic patches, linearized.
+#[cfg(test)]
 fn chromatic_targets() -> [[f32; 3]; 18] {
     let mut out = [[0.0f32; 3]; 18];
     for (i, patch) in PATCHES_SRGB[..18].iter().enumerate() {
         for (channel, value) in patch.iter().enumerate() {
             out[i][channel] = srgb_eotf(*value);
+        }
+    }
+    out
+}
+
+/// The published chart targets, all 24 patches, linearized.
+///
+/// The CIELAB-adjacent encoding the fitter consumes: sRGB bytes through the
+/// inverse transfer function.
+fn published_targets() -> [[f32; 3]; 24] {
+    let mut out = [[0.0f32; 3]; 24];
+    for (row, patch) in out.iter_mut().zip(PATCHES_SRGB.iter()) {
+        for (cell, value) in row.iter_mut().zip(patch.iter()) {
+            *cell = srgb_eotf(*value);
         }
     }
     out
@@ -1294,11 +1310,12 @@ pub fn fit_capture(
 /// `patch_srgb` (sRGB 0-1, linearized here) instead of the published values.
 ///
 /// A lab-paired look fits the engine to reproduce a lab render's colors: the
-/// lab's own chart render supplies the targets. The first 18 values are the
-/// chromatic patches; the last two are the lab's white and black patches,
-/// whose neutralized means become the print tones the two neutral anchors
-/// land on — the lab's own contrast, without the lab's neutral-row cast.
-/// `None` fits the published chart colors.
+/// lab's own chart render supplies the targets for all 24 patches — the 18
+/// chromatic patches in chart order, then the neutral row (white, N8, N6.5,
+/// N5, N3.5, black). The neutral row is neutralized to its channel mean, so
+/// the lab's neutral-row cast does not ride along, while its chromatic look
+/// and its print contrast transfer. `None` fits the published chart colors
+/// with no curve term.
 ///
 /// # Errors
 ///
@@ -1307,38 +1324,39 @@ pub fn fit_capture_with_targets(
     measurements: &Measurements,
     film: &str,
     camera: &str,
-    patch_srgb: Option<&[[f32; 3]; 20]>,
+    patch_srgb: Option<&[[f32; 3]; 24]>,
 ) -> Result<Profile, ChartError> {
     let cells = measurements.cells;
-    let light = cells[18];
 
-    let published = chromatic_targets();
-    let chosen = patch_srgb.map(|targets| {
-        let mut out = [[0.0f32; 3]; 18];
-        for (out_row, target) in out.iter_mut().zip(targets[..18].iter()) {
+    let mut lab_targets = patch_srgb.map(|targets| {
+        let mut out = [[0.0f32; 3]; 24];
+        for (out_row, target) in out.iter_mut().zip(targets.iter()) {
             for (cell, value) in out_row.iter_mut().zip(target.iter()) {
                 *cell = srgb_eotf(*value);
             }
         }
+        // The neutral row (the last six) is neutralized: its channel mean,
+        // so the lab's shadow cast does not ride along, and the anchors stay
+        // neutral by construction.
+        for neutral in &mut out[18..24] {
+            let mean = neutral.iter().sum::<f32>() / 3.0;
+            *neutral = [mean; 3];
+        }
         out
     });
-    let targets = chosen.as_ref().unwrap_or(&published);
-    let patch: Vec<([f32; 3], [f32; 3])> = cells[..18]
-        .iter()
-        .zip(targets.iter())
-        .map(|(&density, &target)| (density, target))
-        .collect();
+    let targets = lab_targets.get_or_insert_with(published_targets);
 
     // The print tone the light neutral lands on: the published encoding's
     // 90% in the published mode, the lab's own white (neutralized to its
-    // channel mean, so the lab's neutral-row cast does not ride along) in
-    // the lab mode.
-    let light_tone = patch_srgb.map_or([fit::LIGHT_PRINT_TONE; 3], |targets| {
+    // channel mean) in the lab mode.
+    let light_tone = if patch_srgb.is_some() {
         let white = targets[18].iter().sum::<f32>() / 3.0;
         [srgb_eotf(white); 3]
-    });
+    } else {
+        [fit::LIGHT_PRINT_TONE; 3]
+    };
 
-    let settings = fit::fit_profile(light, light_tone, &patch)?;
+    let settings = fit::fit_profile_with_cells(&cells, targets, light_tone)?;
 
     Ok(Profile {
         film: film.to_owned(),

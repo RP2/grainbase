@@ -81,7 +81,7 @@ const LAD_GRAY_STATUS_M: [f32; 3] = [1.0, 1.45, 1.55];
 /// Cited from Kodak H-387 and the Cineon printing-density convention. Derived
 /// in this repo's arithmetic: ceiling = LAD gray ÷ this value, so a correct
 /// gray lands here and the white point follows from the film's own range.
-const REFERENCE_GRAY_POSITIVE: f32 = 0.636;
+pub(crate) const REFERENCE_GRAY_POSITIVE: f32 = 0.636;
 
 /// Yielding the default per-channel ceilings: LAD aims as density white
 /// points, per channel, so content denser than a Kodak gray renders above the
@@ -268,6 +268,11 @@ pub(crate) fn render(
 ///
 /// Output samples are in `0.0..=1.0`. The transform is pure and deterministic.
 #[must_use]
+/// # Panics
+///
+/// Panics when called for [`FilmMode::ColorNegative`] or
+/// [`FilmMode::BlackAndWhite`] without a measured base, through
+/// `base.expect(...)`: the dispatcher's documented contract.
 pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> LinearImage {
     // A zero or negative setting would divide by zero or invert the contrast.
     let density_max = settings
@@ -279,6 +284,61 @@ pub fn invert(image: &LinearImage, base: &FilmBase, settings: &Settings) -> Line
     // base, so the floor is zero unless the operator fixes one.
     let floor = settings.density_floor.unwrap_or([0.0; 3]);
     let curve = curve_from_settings(settings, floor, density_max);
+
+    if std::env::var_os("GRAINBASE_STAGE_DUMP").is_some() {
+        // Stage -1: the decoded linear input itself, before density.
+        let _ = std::fs::create_dir_all("/tmp/opencode/stages");
+        let mut input_copy = image.data.clone();
+        for value in &mut input_copy {
+            *value = value.clamp(0.0, 1.0);
+        }
+        let image = LinearImage::new(image.width, image.height, input_copy).expect("same dims");
+        if let Err(err) = crate::encode::encode(&image, "/tmp/opencode/stages/stage--1.png") {
+            eprintln!("stage dump failed: {err}");
+        }
+    }
+
+    if std::env::var_os("GRAINBASE_STAGE_DUMP").is_some() {
+        let width = image.width as usize;
+        let height = image.height as usize;
+        let (pixels, _remainder) = image.data.as_chunks::<3>();
+        let _ = std::fs::create_dir_all("/tmp/opencode/stages");
+        for stage in 0..3 {
+            let mut out = vec![0.0f32; width * height * 3];
+            for (index, pixel) in pixels.iter().enumerate() {
+                let density = [
+                    density_of(pixel[0], base.transmittance[0]),
+                    density_of(pixel[1], base.transmittance[1]),
+                    density_of(pixel[2], base.transmittance[2]),
+                ];
+                let corrected = mix(crosstalk, density);
+                let value = match stage {
+                    0 => [
+                        density[0].clamp(0.0, 1.0),
+                        density[1].clamp(0.0, 1.0),
+                        density[2].clamp(0.0, 1.0),
+                    ],
+                    1 => [
+                        corrected[0].clamp(0.0, 1.0),
+                        corrected[1].clamp(0.0, 1.0),
+                        corrected[2].clamp(0.0, 1.0),
+                    ],
+                    _ => [
+                        render(corrected[0], floor[0], density_max[0], curve.as_ref(), 0),
+                        render(corrected[1], floor[1], density_max[1], curve.as_ref(), 1),
+                        render(corrected[2], floor[2], density_max[2], curve.as_ref(), 2),
+                    ],
+                };
+                out[index * 3..index * 3 + 3].copy_from_slice(&value);
+            }
+            let image = LinearImage::new(image.width, image.height, out).expect("same dims");
+            if let Err(err) =
+                crate::encode::encode(&image, format!("/tmp/opencode/stages/stage-{stage}.png"))
+            {
+                eprintln!("stage dump failed: {err}");
+            }
+        }
+    }
 
     image.map_rgb(|[red, green, blue]| {
         let density = [
@@ -383,8 +443,9 @@ fn chroma_denoise(image: &LinearImage, strength: f32) -> LinearImage {
         b_plane[index] = lab[2];
     }
 
-    // Half resolution: chroma is low-frequency.
-    let factor = 2usize;
+    // Quarter resolution: chroma is low-frequency, and the measured chroma
+    // blotches live at 12-20 source pixels, which is the scale this reaches.
+    let factor = 4usize;
     let small_w = width.div_ceil(factor);
     let small_h = height.div_ceil(factor);
     let mut a_small = vec![0.0f32; small_w * small_h];
@@ -421,7 +482,28 @@ fn chroma_denoise(image: &LinearImage, strength: f32) -> LinearImage {
     }
     let sigma_mean = f32::midpoint(noise[0], noise[1]);
     let h = (strength * sigma_mean).max(1e-3);
-    let h_sq_inv = 1.0 / (2.0 * h * h);
+
+    // The luma at half resolution, for the signal-dependent filter strength:
+    // the density transform's noise gain grows as the print darkens (the
+    // per-channel ceilings amplify the thin dye layers' noise the most), so
+    // dark pixels average with a wider gate than bright ones.
+    let mut luma_small = vec![0.0f32; small_w * small_h];
+    for sy in 0..small_h {
+        for sx in 0..small_w {
+            let (mut sum, mut count) = (0.0f32, 0.0f32);
+            for y in (sy * factor)..((sy + 1) * factor).min(height) {
+                for x in (sx * factor)..((sx + 1) * factor).min(width) {
+                    sum += luminance[y * width + x];
+                    count += 1.0;
+                }
+            }
+            luma_small[sy * small_w + sx] = sum / count;
+        }
+    }
+    let mut luma_sorted = luma_small.clone();
+    let median_luma = percentile::value_at(&mut luma_sorted, 50.0)
+        .unwrap_or(1.0)
+        .max(1e-3);
 
     let search_radius = (strength * 2.0).round().clamp(3.0, 12.0) as i32;
     let patch_radius = 1i32;
@@ -455,7 +537,15 @@ fn chroma_denoise(image: &LinearImage, strength: f32) -> LinearImage {
                     }
                     // The noise floor is subtracted out: flat-noisy regions
                     // average, instead of every neighbour weighing equally.
-                    let excess = (distance_sq - 2.0 * sigma_mean * sigma_mean).max(0.0);
+                    // The filter width follows the local luma: dark pixels
+                    // carry the amplified thin-layer noise and average
+                    // harder.
+                    let scale = (median_luma / luma_small[centre].max(1e-3)).clamp(1.0, 6.0);
+                    let h_sq_inv =
+                        1.0 / (2.0 * (h * scale).powi(2) * noise[0] * noise[0]).max(1e-9);
+                    let excess = (distance_sq
+                        - 9.0 * 2.0 * (noise[0] * noise[0] + noise[1] * noise[1]))
+                        .max(0.0);
                     let weight = (-excess * h_sq_inv).exp();
                     let qi = qy as usize * small_w + qx as usize;
                     sum_a += weight * a_small[qi];

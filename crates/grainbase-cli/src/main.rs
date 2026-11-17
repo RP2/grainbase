@@ -150,10 +150,10 @@ struct FitArgs {
     camera: String,
 
     /// Fit the look to a lab render instead of the published chart colors.
-    /// The file holds 20 lines of `R G B` sRGB byte values in chart order:
-    /// the 18 chromatic patches (top-left to bottom-right), then the lab's
-    /// white patch, then its black patch — sampled from a lab scan of the
-    /// same chart frame.
+    /// The file holds 24 lines of `R G B` sRGB byte values in chart order:
+    /// the 18 chromatic patches (top-left to bottom-right), then the neutral
+    /// row (white, N8, N6.5, N5, N3.5, black) — sampled from a lab scan of
+    /// the same chart frame.
     #[arg(long)]
     targets: Option<PathBuf>,
 
@@ -377,13 +377,13 @@ fn main() -> ExitCode {
     ExitCode::FAILURE
 }
 
-/// Reads a lab-targets file: 20 lines of `R G B` sRGB byte values — the 18
-/// chromatic patches in chart order, then the lab render's white and black
-/// patches.
-fn read_targets(path: &Path) -> Result<[[f32; 3]; 20], String> {
+/// Reads a lab-targets file: 24 lines of `R G B` sRGB byte values — the 18
+/// chromatic patches in chart order, then the neutral row (white, N8, N6.5,
+/// N5, N3.5, black).
+fn read_targets(path: &Path) -> Result<[[f32; 3]; 24], String> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| format!("could not read {}: {err}", path.display()))?;
-    let mut values = [[0.0f32; 3]; 20];
+    let mut values = [[0.0f32; 3]; 24];
     for (line, value) in text.lines().zip(values.iter_mut()) {
         let parts: Vec<f32> = line
             .split_whitespace()
